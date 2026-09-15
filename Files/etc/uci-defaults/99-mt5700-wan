@@ -1,0 +1,116 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# H5000M + MT5700 5G 模组：首次开机补齐「上网所需且固件模板没带」的两件事。
+# 由 uci-defaults 执行一次，成功后自动删除。
+#
+# 背景（2026-09-15 刷机实测，两个都是「刷完立刻不能用」的级别）：
+#
+#   ① 没网：固件模板生成的 /etc/config/network 里只有 loopback / lan / wan(eth1) / wan6，
+#      **没有 MT5700M 接口**。netifd 不接管 eth2 → 没人把它 up → cdc_ncm 拿不到
+#      carrier → 没人发 DHCP → 路由表里一条 default 都没有 → 全部 Network unreachable。
+#      而模组侧完全正常（AT+CGACT? → 1,1；AT^NDISSTATQRY? → 1,1），看门狗日志里
+#      那句「已重启 MT5700M」其实每次都是对空气挥拳。
+#
+#   ② AT 服务不自启：/etc/rc.d/S99at-webserver 链接是有的（构建时已 enable），
+#      但 /etc/init.d/at-webserver 丢了可执行位（仓库里是 100644），rc 调用时直接
+#      Permission denied，于是每次开机都起不来，只能手动 `sh /etc/init.d/... start`。
+#
+# 这里只做幂等的补齐：已存在就不动，用户改过的值不覆盖。
+
+# 只在本机型上生效，避免同一份 Files/ 被别的机型复用时凭空建接口
+BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+case "$BOARD" in
+	*h5000m*) ;;
+	*)
+		echo "99-mt5700-wan: board='$BOARD' 非 H5000M，跳过"
+		exit 0
+		;;
+esac
+
+# ---------------------------------------------------------------------------
+# 1. 确保 MT5700M 接口存在（eth2 + DHCP）
+# ---------------------------------------------------------------------------
+# 不检查 /sys/class/net/eth2 是否已出现：boot 早期 USB 可能还没完成枚举
+#（usbmode 在 S20，本脚本跑在 S10boot）。netifd 支持 device 后到，
+# 接口建好后会一直等到网口出现再 DHCP。
+if ! uci -q get network.MT5700M >/dev/null 2>&1; then
+	uci -q set network.MT5700M=interface
+	uci -q set network.MT5700M.device='eth2'
+	uci -q set network.MT5700M.proto='dhcp'
+	uci -q set network.MT5700M.auto='1'
+	uci -q set network.MT5700M.defaultroute='1'
+	uci -q set network.MT5700M.peerdns='1'
+	# metric 20：低于 eth1 有线 WAN 的优先级之外，留一条备用默认路由。
+	# 有线 WAN 插上时走 eth1，拔掉后自动落到 5G。
+	uci -q set network.MT5700M.metric='20'
+	uci -q commit network
+	logger -t mt5700-wan "已创建 MT5700M 接口（eth2 + dhcp, metric 20）"
+else
+	# 接口已存在但没有 auto=1 时，netifd 不会自启它（老版本定制包就是这样）
+	[ "$(uci -q get network.MT5700M.auto)" = "1" ] || {
+		uci -q set network.MT5700M.auto='1'
+		uci -q commit network
+		logger -t mt5700-wan "已把 MT5700M 设为开机自启（auto=1）"
+	}
+fi
+
+# ---------------------------------------------------------------------------
+# 2. 确保 MT5700M 在防火墙 wan 区（不做 NAT 的话 LAN 侧出不去）
+# ---------------------------------------------------------------------------
+# 症状：路由器自己能 ping 通公网，手机电脑全断 —— nft 的 srcnat 链只匹配 eth1。
+WAN_ZONE=$(uci show firewall 2>/dev/null \
+	| grep -E "@zone\[[0-9]+\]\.name='wan'$" | head -n1 \
+	| sed "s/.*@zone\[\([0-9]*\)\].*/\1/")
+
+if [ -n "$WAN_ZONE" ]; then
+	ZONE_NET=$(uci -q get "firewall.@zone[$WAN_ZONE].network")
+	case " $ZONE_NET " in
+		*" MT5700M "*) ;;
+		*)
+			uci -q add_list "firewall.@zone[$WAN_ZONE].network=MT5700M"
+			uci -q commit firewall
+			logger -t mt5700-wan "已将 MT5700M 加入防火墙 wan 区（否则出口流量不做 NAT）"
+			;;
+	esac
+else
+	logger -t mt5700-wan "警告：未找到防火墙 wan 区，MT5700M 不会做 NAT"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. 确保 AT 服务开机自启
+# ---------------------------------------------------------------------------
+# 根因已在 MT5700-Console 仓库修掉（init 脚本标成 100755），这里兜底：
+# 老固件或手工拷贝部署仍可能丢 +x，补一次再 enable，避免换个环境复发。
+for SVC in at-webserver mt5700-watchdog; do
+	[ -f "/etc/init.d/$SVC" ] || continue
+	chmod 0755 "/etc/init.d/$SVC" 2>/dev/null
+	if [ -x "/etc/init.d/$SVC" ]; then
+		"/etc/init.d/$SVC" enable 2>/dev/null
+	else
+		logger -t mt5700-wan "警告：/etc/init.d/$SVC 不可执行，开机将无法自启"
+	fi
+done
+
+# ---------------------------------------------------------------------------
+# 4. 关掉 USB 自动挂起（autosuspend）
+# ---------------------------------------------------------------------------
+# 模组自身（1-1）的 power/control 通常是 on，但它挂的**父 hub 是 auto**。
+# 父 hub 一旦进入 autosuspend，子设备 cdc_ncm 会停止收发 —— 接口看着还在、
+# IP 也在，但流量全断，且不会留下任何 disconnect 日志，是 5G CPE 掉线的典型
+# 假死形态。这里把整棵 USB 树都设成 on，并挂 hotplug 保证重插后仍然生效。
+for D in /sys/bus/usb/devices/*/power/control; do
+	echo on > "$D" 2>/dev/null
+done
+
+mkdir -p /etc/hotplug.d/usb
+cat > /etc/hotplug.d/usb/99-no-autosuspend <<'EOF'
+#!/bin/sh
+# USB 自动挂起会让 5G 模组假死（接口在、流量断、无日志），一律关掉。
+for D in /sys/bus/usb/devices/*/power/control; do
+	echo on > "$D" 2>/dev/null
+done
+EOF
+chmod 0755 /etc/hotplug.d/usb/99-no-autosuspend 2>/dev/null
+logger -t mt5700-wan "已关闭 USB autosuspend 并写入 hotplug 规则"
+
+exit 0
