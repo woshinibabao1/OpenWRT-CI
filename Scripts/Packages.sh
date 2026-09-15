@@ -289,11 +289,13 @@ SETUP_RUST_FOR_MT5700() {
 			| sh -s -- -y --profile minimal --default-toolchain stable
 	fi
 	export PATH="$HOME/.cargo/bin:$PATH"
-	rustup target add "$RUST_TARGET" >/dev/null 2>&1 || true
+	rustup target add "$RUST_TARGET" || true
+	# rust-lld 是自包含 musl 静态链接的必需组件，minimal profile 不自带，
+	# 缺失会导致 "-C linker=rust-lld" 找不到链接器而编译失败。
+	rustup component add rust-lld || true
 	echo "luci-app-mt5700: rustup ready, target=$RUST_TARGET"
 
-	# 让后续 GitHub Actions 步骤（尤其 Compile Firmware）能找到 cargo，
-	# 并带上与 MT5700M FOLD 相同的 rust-lld 交叉链接参数。
+	# 让后续 GitHub Actions 步骤（尤其 Compile Firmware）能找到 cargo。
 	# PATH 只能通过 GITHUB_PATH 追加；不要写入 GITHUB_ENV 的 PATH（会整段覆盖）。
 	if [ -n "${GITHUB_PATH:-}" ]; then
 		echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -301,8 +303,34 @@ SETUP_RUST_FOR_MT5700() {
 	if [ -n "${GITHUB_ENV:-}" ]; then
 		echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
 		echo "RUSTUP_HOME=$HOME/.rustup" >> "$GITHUB_ENV"
-		echo "RUSTFLAGS=-C link-self-contained=yes -C linker=rust-lld" >> "$GITHUB_ENV"
+
+		# ⚠️ 关键：链接参数必须只作用于「目标架构」，不能用全局 RUSTFLAGS。
+		# MT5700 Console 的后端依赖 tokio / serde / chrono / ureq，编译过程会先编
+		# host 端的 proc-macro（serde_derive、tokio-macros 等）。全局 RUSTFLAGS 会
+		# 一并作用于 host 编译，强制用 rust-lld 链接宿主程序，极易失败。
+		# CARGO_TARGET_<TRIPLE>_* 只对交叉目标生效，host 仍用系统 cc，两者互不干扰
+		#（cargo 优先级：CARGO_TARGET_<TRIPLE>_RUSTFLAGS > RUSTFLAGS）。
+		local ENV_PREFIX
+		ENV_PREFIX="$(echo "$RUST_TARGET" | tr '[:lower:]-' '[:upper:]_')"
+		echo "CARGO_TARGET_${ENV_PREFIX}_LINKER=rust-lld" >> "$GITHUB_ENV"
+		echo "CARGO_TARGET_${ENV_PREFIX}_RUSTFLAGS=-C link-self-contained=yes" >> "$GITHUB_ENV"
+		echo "luci-app-mt5700: cross env CARGO_TARGET_${ENV_PREFIX}_LINKER=rust-lld"
 	fi
+}
+
+# ===== 网络调优：注入首次开机 uci-defaults 与 sysctl =====
+# 把 Files/ 下的文件原样铺进固件 files 覆盖层（wrt/files/），随固件一起打包。
+# 内容与 H5000M 5G CPE 的实测调优一致（见 Files/etc/uci-defaults/99-mt5700-net）。
+INSTALL_NET_TUNING() {
+	local SRC_DIR="${GITHUB_WORKSPACE:-$(pwd)/../..}/Files"
+	local DST_DIR="${GITHUB_WORKSPACE:-$(pwd)/../..}/wrt/files"
+
+	[ -d "$SRC_DIR" ] || { echo "net-tuning: $SRC_DIR 不存在，跳过"; return 0; }
+
+	mkdir -p "$DST_DIR/etc/uci-defaults" "$DST_DIR/etc/sysctl.d"
+	cp -rf "$SRC_DIR/etc/." "$DST_DIR/etc/"
+	chmod 0755 "$DST_DIR/etc/uci-defaults/"* 2>/dev/null || true
+	echo "net-tuning: 已注入 Files/etc → wrt/files/etc"
 }
 
 case "$MT_MODE" in
@@ -315,7 +343,11 @@ case "$MT_MODE" in
 		;;
 	MT5700)
 		echo "MT_MODE=MT5700：克隆 luci-app-mt5700（不安装 mt5700m / sms-tool_q / ubus-at-daemon）"
-		UPDATE_PACKAGE "luci-app-mt5700" "LianXia233/luci-app-mt5700" "main"
+		# 源：woshinibabao1/MT5700-Console（本项目自己维护的 MT5700 Console，单包自含
+		# LuCI 前端 + Rust 后端 at-webserver-rust，PKG_NAME=luci-app-mt5700）。
+		# 注意：仓库名与包名不同，故用第 4 参数 "name" 把克隆目录重命名为包名，
+		# 保证 OpenWrt 扫描 package/ 时目录与 PKG_NAME 一致。
+		UPDATE_PACKAGE "luci-app-mt5700" "woshinibabao1/MT5700-Console" "main" "name"
 		SETUP_RUST_FOR_MT5700
 		# 防污染：若工作区意外出现 mt5700m 相关目录，主动移除
 		rm -rf ./luci-app-mt5700m ./luci-app-mt5700m_shell
@@ -326,7 +358,8 @@ case "$MT_MODE" in
 		;;
 esac
 
-UPDATE_PACKAGE "luci-app-h5000m-netmode" "LianXia233/luci-app-h5000m-netmode" "main"
+# H5000M 网络模式切换到 FAN789 原版（与风扇控制同源，避免不同 fork 之间行为不一致）
+UPDATE_PACKAGE "luci-app-h5000m-netmode" "FAN789/luci-app-h5000m-netmode" "main"
 
 #安装 Honk 预编译 APK（避免从源码编译 Rust/eBPF 导致超过 6 小时上限）
 # 流程：
@@ -449,6 +482,9 @@ UPDATE_VERSION() {
 
 #UPDATE_VERSION "软件包名" "测试版，true，可选，默认为否"
 #UPDATE_VERSION "sing-box"
+
+# 网络调优：注入 Files/etc 下的 sysctl 与 uci-defaults（随固件打包，首次开机生效）
+INSTALL_NET_TUNING
 
 #引入私有扩展脚本
 if [ -f "$GITHUB_WORKSPACE/Scripts/PRIVATE.sh" ]; then

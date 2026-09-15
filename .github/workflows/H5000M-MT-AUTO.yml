@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 VIKINGYFY
 
-# 定时自动编译：Auto-Clean 清理完成后同时构建 H5000M 的两种 MT 配置
-# （原 H5000M-AUTO，重命名并改为 MT5700 / MT5700M 双矩阵并行）
-#   MT5700  —— 仅 luci-app-mt5700
-#   MT5700M —— luci-app-mt5700m + sms-tool_q + ubus-at-daemon
+# 定时自动编译：Auto-Clean 清理完成后构建 H5000M 的 MT5700 配置
+# （原 H5000M-AUTO，重命名并改为 MT5700 / MT5700M 双矩阵并行；
+#   2026-09-15 起只保留 MT5700 —— 只出 H5000M-WIFI-YES-MT5700-immortalwrt-master 这一套产物）
+#   MT5700 —— luci-app-mt5700（woshinibabao1/MT5700-Console，单包自含 Rust 后端）
+#   （MT5700M 方案已停用：其依赖 sms-tool_q 版本号 "3.4.0-rc.3" 对 apk 非法，
+#     会让整个 world 打包失败；且它与 MT5700 Console 功能重复）
 # 产物文件名与 Release Tag 均嵌入 MT 模式，可并存区分。
 name: H5000M-MT-AUTO
 
@@ -33,8 +35,10 @@ jobs:
         CONFIG: [H5000M-WIFI-YES]
         SOURCE: [immortalwrt/immortalwrt]
         BRANCH: [master]
-        # 同时编译两种 MT 配置（严格互斥，由 Apply/VerifyMTMode 保证）
-        MT_MODE: [MT5700, MT5700M]
+        # 只编译 MT5700（woshinibabao1/MT5700-Console）。
+        # 不再并行 MT5700M：其依赖 sms-tool_q 的版本号对 apk 非法会导致 world 打包失败，
+        # 且双套产物会让 Release 体积翻倍、编译机时翻倍。
+        MT_MODE: [MT5700]
 
     uses: ./.github/workflows/WRT-CORE.yml
     with:

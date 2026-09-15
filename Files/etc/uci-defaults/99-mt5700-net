@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# H5000M 5G CPE 网络调优 —— 首次开机由 uci-defaults 执行一次，执行后自动删除。
+#
+# 只做「低风险且可回滚」的项。SQM/CAKE 的限速速率需要真实上下行带宽，
+# 固件里不预设，刷机后请到「网络 → SQM QoS」按实测值填写（建议填带宽的 90%）。
+
+# ---------- 1. 关闭 flow offload（硬件 + 软件）----------
+# 被卸载的连接走快速转发，完全绕过 qdisc，CAKE/HTB 一律失效。
+# 这是做队列整形的前置条件。代价是纯软件转发、CPU 占用上升；
+# 若发现峰值速率明显下降，可在「网络 → 防火墙 → 常规设置」重新勾选分载。
+uci -q set firewall.@defaults[0].flow_offloading='0'
+uci -q set firewall.@defaults[0].flow_offloading_hw='0'
+uci -q commit firewall
+
+# ---------- 2. 应用 TCP / 拥塞控制参数 ----------
+# 参数文件随固件提供（/etc/sysctl.d/99-mt5700-tcp.conf），
+# 开机由 sysctl 服务加载；这里立即应用一次，保证本次开机就生效。
+if [ -f /etc/sysctl.d/99-mt5700-tcp.conf ]; then
+	# BBR 模块若未自动加载，先显式载入（失败不影响其余参数）
+	modprobe tcp_bbr 2>/dev/null || true
+	sysctl -p /etc/sysctl.d/99-mt5700-tcp.conf 2>/dev/null || true
+fi
+
+# ---------- 3. 中断均衡 ----------
+# 实测 mt7996e 与 USB 5G 模组的中断默认全压 CPU0，其余三核为 0。
+if [ -f /etc/config/irqbalance ]; then
+	uci -q set irqbalance.@irqbalance[0].enabled='1'
+	uci -q commit irqbalance
+	/etc/init.d/irqbalance enable 2>/dev/null || true
+fi
+
+# ---------- 4. 5G 无线：锁定 36 信道 + 80MHz ----------
+# CN 监管域下 5.8G（149~165）只批 80MHz，配 160MHz 时 hostapd 报
+#   "Could not select hw_mode and channel. (-3)"，AP 直接起不来；
+# 5.2G 唯一的 160MHz 块跨 DFS 区（52~64），开机要先做 1~10 分钟雷达静默检测。
+# 36 + HE80 非 DFS、保存即起，是高密度环境最稳的组合。
+if [ "$(uci -q get wireless.radio1.band)" = "5g" ]; then
+	uci -q set wireless.radio1.channel='36'
+	uci -q set wireless.radio1.htmode='HE80'
+	uci -q set wireless.radio1.country='CN'
+	uci -q commit wireless
+fi
+
+exit 0

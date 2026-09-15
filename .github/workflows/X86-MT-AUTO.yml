@@ -9,11 +9,12 @@
 name: X86-MT-AUTO
 
 on:
-  # Auto-Clean 完成后自动触发
-  workflow_run:
-    workflows: ["Auto-Clean"]
-    types:
-      - completed
+  # 2026-09-15：当前只用 H5000M，X86 的定时自动构建停用（自动触发会白白吃掉
+  # Actions 机时与 Release 存储）。需要时在本页手动 Run workflow 即可。
+  # workflow_run:
+  #   workflows: ["Auto-Clean"]
+  #   types:
+  #     - completed
   # 手动编译
   workflow_dispatch:
     inputs:

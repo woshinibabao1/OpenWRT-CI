@@ -22,9 +22,15 @@ if [ -f "$WIFI_SH" ]; then
 	sed -i "s/encryption='.*'/encryption='psk-mixed'/g" $WIFI_SH
 	#设置国家码为 CN
 	sed -i "s/country='.*'/country='CN'/g" $WIFI_SH
-	#修改2.4G默认频宽为 40MHz, 5G 默认频宽为 160MHz
+	#修改2.4G默认频宽为 40MHz
 	sed -i "s/htmode='HT20'/htmode='HT40'/g" $WIFI_SH
-	sed -i "s/htmode='VHT80'/htmode='VHT160'/g" $WIFI_SH
+	#5G 固定 80MHz（HE80），不再拉到 160MHz。原因（真机实测）：
+	#   1) CN 监管域 (5725 - 5850 @ 80)，5.8G（149~165）只批 80MHz；配 160MHz 时
+	#      hostapd 报 "Frequency 5845 is not allowed (seg0)" →
+	#      "Could not select hw_mode and channel. (-3)"，AP 直接起不来；
+	#   2) 5.2G 唯一的 160MHz 块（36~64）跨 DFS 区，开机要先做 1~10 分钟雷达静默检测；
+	#   3) 城中村高密度环境 160MHz 干扰重，80MHz 实际更稳、协商速率几乎无损。
+	sed -i "s/htmode='VHT80'/htmode='HE80'/g" $WIFI_SH
 elif [ -f "$WIFI_UC" ]; then
 	#修改WIFI名称
 	sed -i "s/ssid='.*'/ssid='$WRT_SSID'/g" $WIFI_UC
@@ -38,9 +44,9 @@ elif [ -f "$WIFI_UC" ]; then
 	sed -i "s/} else {/} else {\\n\\t\\tcountry = 'CN';/" $WIFI_UC
 	#修改2.4G默认频宽为 40MHz
 	sed -i 's/width = 20;/width = 40;/g' $WIFI_UC
-	#修改5G默认频宽为 160MHz（移除 80MHz 上限）
-	sed -i 's/width > 80)/width > 160)/g' $WIFI_UC
-	sed -i 's/width = 80;/width = 160;/g' $WIFI_UC
+	#5G 保持 80MHz 上限（原因同上：CN 5.8G 限 80MHz；5.2G 的 160MHz 必然跨 DFS）
+	#sed -i 's/width > 80)/width > 160)/g' $WIFI_UC
+	#sed -i 's/width = 80;/width = 160;/g' $WIFI_UC
 fi
 
 CFG_FILE="./package/base-files/files/bin/config_generate"

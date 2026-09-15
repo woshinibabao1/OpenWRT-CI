@@ -1,0 +1,9 @@
+# 私有扩展配置：由 Scripts/Settings.sh 在「机型配置 → GENERAL」之后叠加，
+# 是最后写入 .config 的一层，因此可以覆盖 GENERAL 中的同名项（后写覆盖）。
+
+# 只编译 Hiveton H5000M 单 profile：
+# Config/H5000M-WIFI-YES.txt 里写了 CONFIG_TARGET_MULTI_PROFILE=n，
+# 但 Config/GENERAL.txt 在其后写入 CONFIG_TARGET_MULTI_PROFILE=y 会把它覆盖掉，
+# 这里再写一次 =n 改回来，避免多 profile 带来的额外构建时间与冗余产物。
+# 只选中的 DEVICE（hiveton_h5000m）会被构建，ALL_PROFILES 仍为 n。
+CONFIG_TARGET_MULTI_PROFILE=n

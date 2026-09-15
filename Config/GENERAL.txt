@@ -88,6 +88,22 @@ CONFIG_PACKAGE_kmod-veth=y
 CONFIG_PACKAGE_kmod-wireguard=y
 CONFIG_PACKAGE_kmod-tun=y
 
+# 内核模块 - 队列调度与拥塞控制（5G CPE 缓冲膨胀治理）
+# 说明：这些能力在原厂定制内核上装不了（内核 hash 不匹配 kmods 源），自编译才能补齐。
+# kmod-sched-core：队列调度基础（fq_codel/htb 等，自动随下列项带入）
+CONFIG_PACKAGE_kmod-sched-core=y
+# kmod-sched：额外调度器，含 sch_fq —— BBR 的 pacing 依赖它
+CONFIG_PACKAGE_kmod-sched=y
+# CAKE：AQM + 整形一体，SQM 的首选（依赖 kmod-sched-core）
+CONFIG_PACKAGE_kmod-sched-cake=y
+# FQ-PIE / PIE：CAKE 之外的备选 AQM
+CONFIG_PACKAGE_kmod-sched-pie=y
+CONFIG_PACKAGE_kmod-sched-fq-pie=y
+# IFB：入向（下载）整形必需的虚拟设备；没有它只能把队列加在 br-lan 出口
+CONFIG_PACKAGE_kmod-ifb=y
+# BBR 拥塞控制（KCONFIG=CONFIG_TCP_CONG_BBR，AUTOLOAD 会自动载入 tcp_bbr）
+CONFIG_PACKAGE_kmod-tcp-bbr=y
+
 # 内核模块 - NFT 防火墙
 CONFIG_PACKAGE_kmod-nft-core=y
 CONFIG_PACKAGE_kmod-nft-nat=y
@@ -161,6 +177,19 @@ CONFIG_PACKAGE_dmesg=y
 CONFIG_PACKAGE_htop=y
 CONFIG_PACKAGE_iperf3=y
 CONFIG_PACKAGE_ip-full=y
+
+# 网络调优工具
+# tc：原固件里 /sbin/tc 是指向 busybox 的符号链接且 applet 未启用（tc: applet not found），
+#     必须装真正的 tc，否则 CAKE/HTB/fq_codel 一个都配不上。
+CONFIG_PACKAGE_tc-full=y
+# ethtool：查看/调整网卡参数（驱动队列、offload 等），排查 5G 网卡问题的必备工具
+CONFIG_PACKAGE_ethtool=y
+# irqbalance：实测 mt7996e 与 USB 5G 模组中断全压 CPU0（590 万次），其余三核为 0
+CONFIG_PACKAGE_irqbalance=y
+CONFIG_PACKAGE_luci-app-irqbalance=y
+# SQM：CAKE / HTB 整形的前端脚本（依赖上面的 tc 与 kmod，均已启用）
+#      注意：SQM 的限速速率需要真实带宽，固件不预设，刷机后到「网络 → SQM QoS」填写。
+CONFIG_PACKAGE_sqm-scripts=y
 CONFIG_PACKAGE_coremark=y
 CONFIG_PACKAGE_exfat-fsck=y
 CONFIG_PACKAGE_exfat-mkfs=y
