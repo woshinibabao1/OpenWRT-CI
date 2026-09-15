@@ -1,9 +1,14 @@
 # 私有扩展配置：由 Scripts/Settings.sh 在「机型配置 → GENERAL」之后叠加，
 # 是最后写入 .config 的一层，因此可以覆盖 GENERAL 中的同名项（后写覆盖）。
 
-# 只编译 Hiveton H5000M 单 profile：
-# Config/H5000M-WIFI-YES.txt 里写了 CONFIG_TARGET_MULTI_PROFILE=n，
-# 但 Config/GENERAL.txt 在其后写入 CONFIG_TARGET_MULTI_PROFILE=y 会把它覆盖掉，
-# 这里再写一次 =n 改回来，避免多 profile 带来的额外构建时间与冗余产物。
-# 只选中的 DEVICE（hiveton_h5000m）会被构建，ALL_PROFILES 仍为 n。
+# 意图：只编译 Hiveton H5000M 单 profile。
+# Config/H5000M-WIFI-YES.txt 写了 CONFIG_TARGET_MULTI_PROFILE=n，
+# 但 Config/GENERAL.txt 在其后写入 =y 会把它覆盖（后写覆盖），这里再写一次 =n 改回来。
+#
+# ⚠️ 实测 2026-09-15（TEST run）：这一条**没能生效**，`make defconfig` 之后
+#    .config 里仍是 CONFIG_TARGET_MULTI_PROFILE=y（defconfig 会把它改回 y）。
+#    影响可忽略：CONFIG_TARGET_ALL_PROFILES 未选中（=n），且显式选中的 DEVICE
+#    只有 mediatek_filogic_DEVICE_hiveton_h5000m 一个，产物仍是 H5000M 单设备一套镜像。
+#    保留此行是为了记录意图；若将来只想出单一镜像，可改用
+#    Config/H5000M-WIFI-YES.txt 之外的方式（如直接在机型配置里加 TARGET_SUBTARGET 限制）。
 CONFIG_TARGET_MULTI_PROFILE=n
