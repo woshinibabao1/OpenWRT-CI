@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 VIKINGYFY
 
-# 云编译公用核心（被 WRT-BUILD / H5000M-MT-AUTO / AP3000M-MT-AUTO / X86-MT-AUTO 调用）
+# 云编译公用核心（被 WRT-BUILD / H5000M-MT-AUTO 调用）
+# 2026-09-18 收敛：只保留 Hiveton H5000M 一套产物
+#   （H5000M-WIFI-YES + MT5700 + immortalwrt/master），
+#   AP3000M / X86 的工作流、配置与专用脚本已删除。
 name: WRT-CORE
 
 on:
@@ -43,6 +46,12 @@ on:
       WRT_TEST:
         required: false
         type: string
+      # 固件版本尾缀标记：状态页显示 "<LuCI 版本> / <WRT_MARK>-<日期>"。
+      # 默认 OWrt（原为仓库所属者名 woshinibabao1，用户要求改掉）。
+      WRT_MARK:
+        required: false
+        type: string
+        default: OWrt
       # MT 插件模式（独立配置层，全机型复用）：
       #   ""      —— 不安装任何 MT 插件（默认，保持普通 CI 行为）
       #   MT5700  —— 仅 luci-app-mt5700（方案 B）
@@ -67,6 +76,7 @@ env:
   WRT_SOURCE: ${{inputs.WRT_SOURCE}}
   WRT_PACKAGE: ${{inputs.WRT_PACKAGE}}
   WRT_TEST: ${{inputs.WRT_TEST}}
+  WRT_MARK: ${{inputs.WRT_MARK}}
   MT_MODE: ${{inputs.MT_MODE}}
 
 jobs:
@@ -108,7 +118,7 @@ jobs:
       - name: Initialization Values
         run: |
           echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
-          echo "WRT_MARK=${GITHUB_REPOSITORY%%/*}" >> $GITHUB_ENV
+          echo "WRT_MARK=${WRT_MARK:-${GITHUB_REPOSITORY%%/*}}" >> $GITHUB_ENV
           echo "WRT_INFO=${WRT_SOURCE%%/*}" >> $GITHUB_ENV
           echo "WRT_TARGET=$(grep -m 1 -oP '^CONFIG_TARGET_\K[\w]+(?=\=y)' ./Config/$WRT_CONFIG.txt)" >> $GITHUB_ENV
           echo "WRT_WIFI=wifi-yes" >> $GITHUB_ENV
@@ -260,77 +270,6 @@ jobs:
 
           # 只在并行下载失败时才做串行兜底，不再每次都跑两遍全量校验
           make download -j$(nproc) || make download -j1
-
-      # 关键改动 3：AP3000M 跳过 rust/host 源码构建
-      #   luci-app-airpi-fancontrol 的守护进程 airpi-fanctl 是 Rust 写的，
-      #   默认路径会让 OpenWrt 从源码构建整套 rust/host（rustc + cargo + LLVM），
-      #   约 1.5~3 小时。这里用 runner 自带的 rustup 配合已构建好的 aarch64 musl
-      #   交叉链接器直接 cargo，再通过 AIRPI_PREBUILT=1 交给包 Makefile。
-      - name: Prebuild AirPi Rust Binary (AP3000M)
-        if: contains(env.WRT_CONFIG, 'AP3000M') && env.WRT_TEST != 'true'
-        run: |
-          cd ./wrt/
-
-          PKG_DIR="$(pwd)/package/luci-app-airpi-fancontrol"
-          PREBUILT_DIR="$(pwd)/airpi-prebuilt"
-
-          if [ ! -f "$PKG_DIR/src/Cargo.toml" ]; then
-            echo "::warning::未找到 $PKG_DIR/src/Cargo.toml，跳过预编译（将由源码构建 rust/host）"
-            exit 0
-          fi
-
-          # 失败即回退的正确写法：先在父 shell 关闭 errexit（GHA 的 run 默认是
-          # bash -e），再把受保护子 shell 当作普通语句执行并取回退出码。
-          set +e
-          (
-            set -euxo pipefail
-
-            # 命中缓存时秒过，冷编译才会真正构建工具链
-            make toolchain/install -j$(nproc)
-
-            LINKER="$(find "$(pwd)/staging_dir" -type f -name 'aarch64-openwrt-linux-musl-gcc' -perm -111 | head -1)"
-            [ -n "$LINKER" ] || LINKER="$(find "$(pwd)/staging_dir" -type f -name 'aarch64-*linux-musl-gcc' -perm -111 | head -1)"
-            [ -n "$LINKER" ] || { echo "未找到 aarch64 musl 交叉链接器"; exit 1; }
-            LINKER="$(readlink -f "$LINKER")"
-            echo "使用交叉链接器: $LINKER"
-
-            if ! command -v rustup >/dev/null 2>&1; then
-              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal --default-toolchain stable
-            fi
-            export PATH="$HOME/.cargo/bin:$PATH"
-            rustup target add aarch64-unknown-linux-musl
-
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$LINKER"
-
-            cd "$PKG_DIR/src"
-            cargo build --locked --release --target aarch64-unknown-linux-musl
-
-            # 产物自检：cargo 退出 0 但产物缺失同样按失败处理
-            BIN="target/aarch64-unknown-linux-musl/release/airpi-fanctl"
-            [ -f "$BIN" ] || { echo "cargo 未产出 $BIN"; exit 1; }
-
-            mkdir -p "$PREBUILT_DIR"
-            cp -f "$BIN" "$PREBUILT_DIR/airpi-fanctl"
-
-            python3 "$GITHUB_WORKSPACE/Scripts/inject_airpi_prebuilt.py" "$PKG_DIR/Makefile"
-          )
-          RC=$?
-          set -e
-
-          if [ "$RC" -eq 0 ]; then
-            echo "airpi-fanctl 预编译完成，本次将跳过 rust/host 构建"
-          else
-            echo "::warning::airpi-fanctl 预编译失败（rc=$RC），回退到源码构建 rust/host（本次编译将额外增加约 1.5~3 小时）"
-            rm -rf "$PREBUILT_DIR"
-          fi
-
-          # 一致性兜底：标记存在但二进制缺失时主动撤销注入
-          if grep -q '^AIRPI_PREBUILT:=1$' "$PKG_DIR/Makefile" && [ ! -f "$PREBUILT_DIR/airpi-fanctl" ]; then
-            echo "::warning::预编译标记与二进制不一致，撤销注入并回退源码构建"
-            sed -i '/^AIRPI_PREBUILT:=1$/d; /^AIRPI_PREBUILT_BIN:=/d' "$PKG_DIR/Makefile"
-            rm -rf "$PREBUILT_DIR"
-          fi
 
       - name: Compile Firmware
         if: env.WRT_TEST != 'true'

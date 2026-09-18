@@ -14,17 +14,13 @@ on:
         type: choice
         options:
           - H5000M-WIFI-YES
-          - AP3000M
-          - X86
       SOURCE:
         description: '源码仓库'
         default: 'immortalwrt/immortalwrt'
         required: true
         type: choice
         options:
-          - VIKINGYFY/immortalwrt
           - immortalwrt/immortalwrt
-          - LiBwrt/openwrt-6.x
       BRANCH:
         description: '源码分支'
         default: 'master'
@@ -35,14 +31,12 @@ on:
         required: false
         type: string
       MT_MODE:
-        description: 'MT 插件模式（二选一，留空则不安装任何 MT 插件）'
+        description: 'MT 插件模式'
         default: 'MT5700'
         required: true
         type: choice
         options:
           - MT5700
-          - MT5700M
-          - NONE
       TEST:
         description: '仅生成配置文件，不编译固件。'
         default: 'true'
@@ -57,7 +51,8 @@ jobs:
     uses: ./.github/workflows/WRT-CORE.yml
     with:
       WRT_CONFIG: ${{inputs.CONFIG}}
-      WRT_THEME: aurora
+      WRT_THEME: argon
+      WRT_MARK: OWrt
       WRT_NAME: OWRT
       WRT_SSID: OWRT
       WRT_WORD: 12345678
@@ -68,7 +63,6 @@ jobs:
       WRT_SOURCE: ${{inputs.SOURCE}}
       WRT_PACKAGE: ${{inputs.PACKAGE}}
       WRT_TEST: ${{inputs.TEST}}
-      # NONE / 其他 → 空字符串（不安装任何 MT 插件）
-      # 注意：GHA 表达式中空字符串为 falsy，不能写成 `cond && '' || x`，
-      # 必须用显式三元链保证 NONE 时最终得到空值。
-      MT_MODE: ${{ inputs.MT_MODE == 'MT5700' && 'MT5700' || (inputs.MT_MODE == 'MT5700M' && 'MT5700M' || '') }}
+      # 唯一保留的 MT 模式：MT5700（woshinibabao1/MT5700-Console 单包方案）。
+      # MT5700M 已停用（依赖 sms-tool_q 版本号对 apk 非法，且功能重复）。
+      MT_MODE: MT5700

@@ -50,10 +50,9 @@ UPDATE_PACKAGE() {
 # UPDATE_PACKAGE "open-app-filter" "destan19/OpenAppFilter" "master" "" "luci-app-appfilter oaf" 这样会把原有的open-app-filter，luci-app-appfilter，oaf相关组件删除，不会出现coremark错误。
 
 # UPDATE_PACKAGE "包名" "项目地址" "项目分支" "pkg/name/all，可选，pkg为提取匹配包；name为重命名；all为提取全部一级包"
-# 主题：保留 aurora（默认）与 argon（含配套修复），其余精简
+# 主题：只保留 argon（用户指定）。aurora 及其配置页已按用户要求移除；
+# 主题由工作流的 WRT_THEME=argon 决定，Settings.sh 会写入 luci-theme-argon 与 luci-app-argon-config。
 UPDATE_PACKAGE "argon" "sbwml/luci-theme-argon" "openwrt-25.12"
-UPDATE_PACKAGE "aurora" "eamonxg/luci-theme-aurora" "master"
-UPDATE_PACKAGE "aurora-config" "eamonxg/luci-app-aurora-config" "master"
 
 UPDATE_PACKAGE "momo" "nikkinikki-org/OpenWrt-momo" "main"
 UPDATE_PACKAGE "nikki" "nikkinikki-org/OpenWrt-nikki" "main"
@@ -119,77 +118,14 @@ if [ "$MT_MODE" = "MT5700M" ]; then
 fi
 UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
 UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"
+# viking feed：仍克隆（其余包可能用到），但把已停用的包目录一并清掉，
+# 避免它们出现在 package/ 里被意外选中或拖慢 feeds 扫描。
 UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-box luci-app-homeproxy luci-app-timewol luci-app-wolplus luci-app-wolultra"
 
-# luci-app-homeproxy（viking feed）20260914-r2 起把 LUCI_EXTRA_DEPENDS 提升为
-#   sing-box (>=1.15.0)
-# 但同一 feed 的 sing-box 仅有 1.15.0_alpha3；apk 版本比较中 `_alpha3` 属
-# pre-release 后缀（_alpha 排在「无后缀」之前），故 1.15.0_alpha3 不满足 >=1.15.0：
-#   ERROR: unable to select packages:
-#     sing-box-1.15.0_alpha3-r1:
-#       breaks: luci-app-homeproxy-20260914-r2[sing-box>=1.15.0]
-# 构建在 world 阶段的 package/install 整体失败（2026-09-15 三机型全灭即此因）。
-#
-# 不能用「删掉版本约束」的写法：OpenWrt 的 apk 打包器 include/package-pack.mk
-# 要求 EXTRA_DEPENDS 每一项都必须是「包名 + 空格 + 版本约束」，去掉约束会直接报
-#   *** "Extra dependencies must have version constraints. sing-box seems to be unversioned."
-#
-# 因此这里把约束下限对齐为同一 feed 中 sing-box 的实际 PKG_VERSION（动态读取，
-# 上游升版/降版均自洽）：约束合法，且一定被实际构建出的版本满足。
-# 若上游要求高于 feed 实际版本，本规则以降级方式放行——以「可构建」优先，
-# sing-box 实际能力由 feed 版本决定。上游发布正式版 1.15.0 后，规则自动改写为
-# 相同下限，无需人工介入（此依赖也不会再阻塞构建）。
-FIX_HOMEPROXY_SINGBOX() {
-	local HP_MK SBOX_MK SBOX_VER CUR_VER CUR_MAIN SBOX_MAIN NEEDS_ADJUST
-	HP_MK=$(find . -maxdepth 3 -type f -path "*luci-app-homeproxy/Makefile" 2>/dev/null | head -1)
-	[ -n "$HP_MK" ] || { echo "homeproxy: Makefile not found, skip"; return 0; }
-
-	if ! grep -qE '^LUCI_EXTRA_DEPENDS:=sing-box \(>=' "$HP_MK"; then
-		echo "homeproxy: no '>= sing-box' EXTRA_DEPENDS constraint, no change"
-		return 0
-	fi
-
-	# 约束下限取同一 feed 内 sing-box 的实际版本
-	SBOX_MK=$(find . -maxdepth 3 -type f -path "*/sing-box/Makefile" 2>/dev/null | head -1)
-	if [ -n "$SBOX_MK" ]; then
-		SBOX_VER=$(grep -m1 -oP '^PKG_VERSION:=\K.*' "$SBOX_MK" | tr -d '[:space:]')
-	fi
-	# 版本串白名单：只允许数字/字母/点/下划线/连字符，避免脏数据进入 sed 表达式
-	case "$SBOX_VER" in
-		""|*[!0-9A-Za-z._-]*) SBOX_VER="1.15.0_alpha3" ;;
-	esac
-
-	CUR_VER=$(grep -m1 -oP '^LUCI_EXTRA_DEPENDS:=sing-box \(>=\K[^)]*' "$HP_MK")
-	CUR_MAIN=${CUR_VER%%[!0-9.]*}
-	SBOX_MAIN=${SBOX_VER%%[!0-9.]*}
-
-	# 判定「约束下限在 apk 语义下高于 feed 实际版本」——只有这种情况才需要下调，
-	# 其余一律不动，避免把已满足的约束收紧、或把语义写反。
-	NEEDS_ADJUST=""
-	if [ "$CUR_MAIN" = "$SBOX_MAIN" ]; then
-		# 主版本段相同：feed 版本带 pre-release 后缀（_alpha/_beta/_rc 等）而约束
-		# 要求正式版时，apk 判定为不满足（pre-release < 正式版）。
-		case "$SBOX_VER" in
-			*_*) case "$CUR_VER" in *_*) ;; *) NEEDS_ADJUST=1 ;; esac ;;
-		esac
-	elif [ "$(printf '%s\n%s\n' "$CUR_MAIN" "$SBOX_MAIN" | sort -V | tail -1)" = "$CUR_MAIN" ]; then
-		NEEDS_ADJUST=1
-	fi
-
-	if [ -z "$NEEDS_ADJUST" ]; then
-		echo "homeproxy: constraint (>= $CUR_VER) already satisfiable by feed sing-box $SBOX_VER, no change"
-		return 0
-	fi
-
-	sed -i -E "s/^(LUCI_EXTRA_DEPENDS:=sing-box \(>=)[^)]*(\))/\1${SBOX_VER}\2/" "$HP_MK"
-	echo "homeproxy: sing-box constraint (>= ${CUR_VER}) -> (>= ${SBOX_VER}) to match feed version"
-}
-FIX_HOMEPROXY_SINGBOX
 UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
 
 # FAN789 插件及其他专用硬件插件
 UPDATE_PACKAGE "luci-app-h5000m-fancontrol" "FAN789/luci-app-h5000m-fancontrol" "main"
-UPDATE_PACKAGE "luci-app-airpi-fancontrol" "LianXia233/luci-app-airpi3000m-fancontrol" "main" "all" "luci-app-airpi-fancontrol kmod-airpi-gpio-fan"
 
 # ===== MT5700M（方案 A）：luci-app-mt5700m monorepo 折叠 =====
 # luci-app-mt5700m 是两层 monorepo：仓库根没有 Makefile，真正可编译的包是

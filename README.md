@@ -1,8 +1,13 @@
 <div align="center">
 
-# 🚀 H5000M / AP3000M / X86_64 定制固件说明书
+# 🚀 Hiveton H5000M 定制固件说明书
 
-*基于 ImmortalWrt 主线源码，为 Hiveton H5000M 5G CPE、Airpi AP3000M 与 X86_64 设备提供的定制化编译配置*
+> **2026-09-18 起本仓库只编译一套产物**：`H5000M-WIFI-YES-MT5700-immortalwrt-master`。
+> AP3000M / X86 的工作流、配置与专用脚本已删除；MT5700M 方案停用。
+> 加速与稳定性优化的取舍（含未采纳项及理由）见
+> [`FIRMWARE_OPTIMIZATION_REPORT.md`](FIRMWARE_OPTIMIZATION_REPORT.md)。
+
+*基于 ImmortalWrt 主线源码，为 Hiveton H5000M 5G CPE（MT7987A + MT5700 5G 模组）提供的定制化编译配置*
 
 </div>
 
@@ -15,9 +20,7 @@
 | 工作流 | 触发方式 | 作用 |
 | :--- | :--- | :--- |
 | **WRT-BUILD** | 手动 `workflow_dispatch` | 手动编译 / 预览配置。可选机型、源码、MT 模式（`MT5700` / `MT5700M` / `NONE`），默认仅生成配置不编译（`TEST=true`） |
-| **H5000M-MT-AUTO** | 每天随 `Auto-Clean` 完成后自动触发，亦可手动 | 自动并行编译 H5000M 的 **MT5700 + MT5700M** 双配置并分别发布 |
-| **AP3000M-MT-AUTO** | 每天随 `Auto-Clean` 完成后自动触发，亦可手动 | 自动并行编译 AP3000M 的 **MT5700 + MT5700M** 双配置并分别发布 |
-| **X86-MT-AUTO** | 每天随 `Auto-Clean` 完成后自动触发，亦可手动 | 自动并行编译 X86 的 **MT5700 + MT5700M** 双配置并分别发布 |
+| **H5000M-MT-AUTO** | 每天随 `Auto-Clean` 完成后自动触发，亦可手动 | 自动并行编译 H5000M 的 **MT5700** 单配置并发布 |
 | **Auto-Clean** | 每天定时 + 手动 | 清理旧 Release 与 Workflow 运行记录（保留最近 1 个 Release、30 天运行记录） |
 | **Cache-Clean** | 仅手动触发 | 清理 GitHub Actions 编译缓存（已移除每周定时清空：那会让本周第一次构建必然冷启动，配额交由 GitHub 按 LRU 自动回收） |
 
@@ -45,18 +48,13 @@ OpenWRT-CI/
 ├── .github/workflows/        # 云编译工作流
 │   ├── WRT-CORE.yml          # 公用编译核心（被调用）
 │   ├── WRT-BUILD.yml         # 手动编译入口（机型 × MT 模式）
-│   ├── H5000M-MT-AUTO.yml    # 自动双配置编译 H5000M（MT5700 + MT5700M）
-│   ├── AP3000M-MT-AUTO.yml   # 自动双配置编译 AP3000M（MT5700 + MT5700M）
-│   ├── X86-MT-AUTO.yml       # 自动双配置编译 X86（MT5700 + MT5700M）
+│   ├── H5000M-MT-AUTO.yml    # 自动双配置编译 H5000M（MT5700）
 │   ├── Auto-Clean.yml        # 清理旧 Release / 运行记录
 │   └── Cache-Clean.yml       # 清理编译缓存
 ├── Config/                   # 编译配置
 │   ├── GENERAL.txt           # 全设备通用插件与内核配置（不含 MT 插件）
 │   ├── MT5700.txt            # MT5700 独立插件层（方案 B）
-│   ├── MT5700M.txt           # MT5700M 独立插件层（方案 A）
 │   ├── H5000M-WIFI-YES.txt   # Hiveton H5000M（带 Wi-Fi）
-│   ├── AP3000M.txt           # AirPi AP3000M（Wi-Fi）
-│   └── X86.txt               # X86_64 通用设备
 ├── AP3000M-EEPROM/           # AP3000M EEPROM 自动初始化
 │   ├── mt7981_eeprom_mt7976_dbdc.bin  # iPAiLNA EEPROM 模板（已校准）
 │   └── 99-ap3000m-eeprom            # uci-defaults 首次启动脚本
@@ -77,8 +75,6 @@ OpenWRT-CI/
 | 配置 | 目标平台 | 设备 | Wi-Fi |
 | :--- | :--- | :--- | :--- |
 | `H5000M-WIFI-YES` | MediaTek Filogic | Hiveton H5000M | ✅ 开启 |
-| `AP3000M` | MediaTek Filogic | Airpi AP3000M (MT7981B) | ✅ 开启 |
-| `X86` | x86_64 | 标准 X86_64 设备 | 不适用 |
 
 > `X86` 配置生成 64 位 x86 镜像，包含 ISO、EFI、GRUB 与 VMDK 格式，可用于支持 x86_64 的标准 BIOS 或 UEFI 设备。32 位 x86 设备不适用该配置。
 >

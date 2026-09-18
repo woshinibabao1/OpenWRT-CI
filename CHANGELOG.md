@@ -1,4 +1,42 @@
 # 更新日志
+## [2026-09-18] 收敛为 H5000M 单产物 + 网络加速 / 稳定性优化
+
+只保留 `H5000M-WIFI-YES-MT5700-immortalwrt-master` 一套产物，并按真机实测重排加速策略。
+完整取舍与未采纳项见 `FIRMWARE_OPTIMIZATION_REPORT.md`。
+
+### 产物收敛
+- 删除 `AP3000M-MT-AUTO.yml` / `X86-MT-AUTO.yml` 及 `Config/AP3000M.txt`、`Config/X86.txt`、`Config/MT5700M.txt`
+- 删除 `AP3000M-EEPROM/`、`Scripts/inject_airpi_prebuilt.py`、`Scripts/homeproxy/`、`Scripts/patches/dockerd/`
+- `WRT-CORE.yml` 删除 AP3000M 专用的 Rust 预编译步骤（省 1.5~3 小时机时）
+- `WRT-BUILD.yml` 机型/源码/MT 模式选项各收敛为一项
+- `Handles.sh` 删除四段死代码：HomeProxy 资源预置 + ucode 修复、aurora 样式、AP3000M EEPROM、dockerd 修补
+- `Packages.sh` 去掉 aurora 克隆、HomeProxy 版本约束改写、airpi 克隆
+- MT5700M 分支在 ApplyMTMode / VerifyMTMode 中保留为守卫：配置已删，误选会明确报错终止
+
+### 版本标识
+- 新增 `WRT_MARK`（默认 `OWrt`），状态页尾缀由 `woshinibabao1-…` 改为 `OWrt-…`
+
+### 插件
+- 装：`luci-theme-argon` + `luci-app-argon-config` + 中文包、`luci-app-openclash` + 中文包
+- 装：`dnsmasq-full`（OpenClash 的 nftset/ipset 分流依赖它，替换默认 dnsmasq）
+- **补回** `luci-app-mosdns`：真机在用但配方已丢，不补回来下次刷机即功能回退
+- 卸：homeproxy / easytier / gecoosac / wolultra / samba4 / upnp / aurora（主题 + 配置页）
+- 卸：`sing-box`（HomeProxy 走后成孤儿，只剩内核无界面）
+
+### 加速与稳定性（真机实测依据，见报告第一节）
+- **默认开启软件 flow offload**：原先无条件关闭。改为「SQM 未启用则开、启用则关」，
+  二者互斥（被卸载的连接绕过 qdisc，CAKE/HTB 会失效）
+- 硬件卸载（`flow_offloading_hw`）保持关闭：本基线无 `mtk_wed`，5G WAN 又是 USB CDC-NCM，
+  PPE 管不到，开了命中率≈0 且会让 nft 计数器看不到流量
+- 首次开机脚本显式兜底 packet steering
+- sysctl 补三项：TCP Fast Open、`somaxconn`/`tcp_max_syn_backlog` 1024、`rp_filter=0`（双出口非对称路由）
+- `Config/GENERAL.txt` 显式声明 `kmod-nf-flow`、`kmod-crypto-hw-safexcel`
+
+### 未采纳（避免负优化，理由详见报告第三节）
+- turboacc / SFE / shortcut-fe：与 nf_flow_table 抢 hook，6.18 + Filogic 上编不过或随机断流
+- `mtk_hnat`：mtk-openwrt-feeds 树外驱动，本基线无此 .ko，且与主线 PPE 抢同一张硬件表
+- WED / zram / backlog 放大 / 锁频：均需真机验证或有明确负收益
+
 ## [2026-09-15] 修复 luci-app-homeproxy 的 sing-box 版本约束导致的构建失败
 
 ### 故障现象

@@ -44,7 +44,9 @@ jobs:
     with:
       WRT_CONFIG: ${{ matrix.CONFIG }}
 
-      WRT_THEME: aurora
+      WRT_THEME: argon
+      # 固件版本尾缀：状态页显示 "… / OWrt-26.09.15-17.00.22"
+      WRT_MARK: OWrt
       WRT_NAME: OWRT
       WRT_SSID: OWRT
       WRT_WORD: 12345678
