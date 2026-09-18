@@ -19,14 +19,14 @@
 
 | 工作流 | 触发方式 | 作用 |
 | :--- | :--- | :--- |
-| **WRT-BUILD** | 手动 `workflow_dispatch` | 手动编译 / 预览配置。可选机型、源码、MT 模式（`MT5700` / `MT5700M` / `NONE`），默认仅生成配置不编译（`TEST=true`） |
+| **WRT-BUILD** | 手动 `workflow_dispatch` | 手动编译 / 预览配置。可选机型、源码、MT 模式（`MT5700` / `MT5700M` / `NONE`），默认完整编译并发布固件（`TEST=false`） |
 | **H5000M-MT-AUTO** | 每天随 `Auto-Clean` 完成后自动触发，亦可手动 | 自动并行编译 H5000M 的 **MT5700** 单配置并发布 |
 | **Auto-Clean** | 每天定时 + 手动 | 清理旧 Release 与 Workflow 运行记录（保留最近 1 个 Release、30 天运行记录） |
 | **Cache-Clean** | 仅手动触发 | 清理 GitHub Actions 编译缓存（已移除每周定时清空：那会让本周第一次构建必然冷启动，配额交由 GitHub 按 LRU 自动回收） |
 
-**手动编译步骤：** 仓库页面 → `Actions` → 选择 `WRT-BUILD` → `Run workflow` → 选择机型与 MT 模式 → 如需真正编译请把 `TEST` 设为 `false`。
+**手动编译步骤：** 仓库页面 → `Actions` → 选择 `WRT-BUILD` → `Run workflow` → 选择机型与 MT 模式 → 直接运行即完整编译；只想校验配置时把 `TEST` 设为 `true`。
 
-**说明：** `TEST=true`（默认）只生成 `.config` 配置用于校验，不会消耗资源编译；`TEST=false` 才会完整编译并发布固件。
+**说明：** `TEST=false`（默认）会完整编译并发布固件；`TEST=true` 只生成 `.config` 配置用于校验，不消耗编译资源。
 
 **产物区分：** 同一机型的两种 MT 配置产物在文件名与 Release Tag 中均嵌入模式标签，例如：
 
