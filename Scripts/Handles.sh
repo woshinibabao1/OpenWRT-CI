@@ -73,3 +73,31 @@ if [ -f "$HONK_FILE" ]; then
 	fi
 fi
 
+#安装默认允许未签名包（--allow-untrusted）
+# 自编译出来的 apk（本机 CI 打的 luci-app-*、第三方包等）不带仓库签名，
+# apk 默认会因签名校验失败拒绝安装，LuCI「系统 → 软件」页表现为安装失败、
+# 错误信息里只有一句 untrusted。
+#
+# ★ 必须改后端 package-manager-call，改前端 package-manager.js 没用：
+#   脚本解析参数时 `-*)` 分支会把未知选项直接 shift 丢弃（apk 分支只认
+#   --force-removal-of-dependent-packages 与 --force-overwrite），前端传什么都进不来。
+#
+# ★ 追加到 cmd 而不是 $@：最终拼成 "apk --allow-untrusted add <pkg>" ——
+#   --allow-untrusted 是 apk 的全局选项，放在子命令之前才一定生效。
+#
+# ★ 只对 apk 的 add（= 用户点的 install）生效：
+#   opkg 默认不校验包签名，加了反而可能不被识别；update / upgrade / remove 保持原样。
+PMC_FILE="$(find "$PKG_PATH/../feeds/luci" "$PKG_PATH/feeds/luci" -type f \
+	-path '*/luci-app-package-manager/root/usr/libexec/package-manager-call' -print -quit 2>/dev/null)"
+if [ -f "$PMC_FILE" ]; then
+	echo " "
+
+	if grep -q 'allow-untrusted' "$PMC_FILE"; then
+		echo "package-manager: untrusted already allowed; skipping!"
+	elif sed -i 's|^\t*if flock -x 200; then|\t\t\t# install 默认允许未签名包（自编译 apk 无签名，否则装不上）\n\t\t\tif [ "$action" = "add" ] \&\& [ "$ipkg_bin" = "apk" ]; then\n\t\t\t\tcmd="$cmd --allow-untrusted"\n\t\t\tfi\n\t\t\tif flock -x 200; then|' "$PMC_FILE"; then
+		echo "package-manager: install now defaults to --allow-untrusted!"
+	else
+		echo "package-manager fix failed; continuing!"
+	fi
+fi
+

@@ -1,4 +1,21 @@
 # 更新日志
+## [2026-09-19] 软件页安装默认允许未签名包
+
+- `Handles.sh` 新增一段：给 `luci-app-package-manager` 的 `/usr/libexec/package-manager-call`
+  在 **install**（apk 下映射为 `add`）时默认追加 `--allow-untrusted`，
+  最终命令形如 `apk --allow-untrusted add <pkg>`
+- 动机：自编译出来的 apk 不带仓库签名，原先在「系统 → 软件」页点安装会被签名校验挡下，
+  错误信息只有一句 untrusted
+- **只改后端脚本**：前端 `package-manager.js` 不管传什么参数都会被脚本参数解析的
+  `-*)` 分支 shift 丢弃（apk 分支只认 `--force-removal-of-dependent-packages` 与
+  `--force-overwrite`），改前端无效
+- 追加到 `cmd` 而非 `$@`：`--allow-untrusted` 是 apk 的全局选项，放在子命令前才一定生效
+- 仅作用于 apk 的 `add`：opkg 默认不校验包签名故不加；`update` / `upgrade` / `remove` 保持原样
+- 幂等：文件已含 `allow-untrusted` 时跳过，重复执行不会叠加
+
+### 其它
+- `WRT-BUILD` 的 `TEST` 默认值由 `true` 改为 `false`：手动触发通常就是要出固件，
+  默认的 `true` 只生成 `.config`，跑完没产物容易误以为失败（README 同步）
 ## [2026-09-18] 收敛为 H5000M 单产物 + 网络加速 / 稳定性优化
 
 只保留 `H5000M-WIFI-YES-MT5700-immortalwrt-master` 一套产物，并按真机实测重排加速策略。

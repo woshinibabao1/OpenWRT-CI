@@ -62,7 +62,7 @@ OpenWRT-CI/
 │   ├── Packages.sh           # 拉取第三方插件与主题（含 MT 模式条件克隆/折叠）
 │   ├── ApplyMTMode.sh        # 按 MT_MODE 叠加配置层并写入互斥保护
 │   ├── VerifyMTMode.sh       # make defconfig 后校验 MT 包互斥
-│   ├── Handles.sh            # HomeProxy 资源预置与主题 / 组件修复
+│   ├── Handles.sh            # feeds 源码修补（主题配色 / 组件冲突 / 软件页安装行为）
 │   └── Settings.sh           # 默认 IP / 主机名 / Wi-Fi / 主题
 ├── LICENSE
 └── README.md
