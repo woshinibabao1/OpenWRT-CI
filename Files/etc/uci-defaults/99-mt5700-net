@@ -5,7 +5,10 @@
 # 只做「低风险且可回滚」的项。SQM/CAKE 的限速速率需要真实上下行带宽，
 # 固件里不预设，刷机后请到「网络 → SQM QoS」按实测值填写（建议填带宽的 90%）。
 
-# ---------- 1. flow offload：默认开软件卸载，硬件卸载留给有 WED 的固件 ----------
+# ---------- 1. flow offload：编译期选型（/etc/mt5700/flow-offload）+ 运行期与 SQM 互斥 ----------
+# 选型来源：构建期由 Scripts/ApplyFlowOffload.sh 写入固件 files 覆盖层
+#   /etc/mt5700/flow-offload（一行 MODE=<auto|off|on|on-hw>，默认 auto）。
+#   也可刷机后在「网络 → 防火墙 → 常规设置」或 uci 改 firewall.@defaults[0].flow_offloading。
 # 实测依据（2026-09-18 真机只读体检，固件 r0-3e24625 / kernel 6.18.44）：
 #   · /sys/kernel/debug/ppe0 与 ppe1 存在 → MediaTek PPE 硬件转发表在；
 #   · eth0 / eth1 的 `ethtool -k` 显示 hw-tc-offload: on → mtk_soc_eth 支持
@@ -14,30 +17,67 @@
 #   · 上网出口是 eth2（5G 模组，USB CDC-NCM），PPE 只挂在 SoC 以太网口上，
 #     管不到 USB 口。
 # 结论：软件卸载（nf_flow_table 快转路径）对**所有**接口都有效，包括 USB 5G WAN，
-#       是本机型唯一确定拿得到的加速，默认打开；
+#       是本机型唯一确定拿得到的加速，默认打开（MODE=auto 且 SQM 未启用时）；
 #       硬件卸载在这台机器上只可能命中「有线 LAN↔有线 LAN」这一类流量，
-#       命中率≈0，开了还会让 nft 计数器看不到流量（排障变难），故默认关闭。
-#       等固件带上 mtk_wed（WiFi 硬件转发）后再打开才有意义。
+#       命中率≈0，开了还会让 nft 计数器看不到流量（排障变难），故 on-hw 也仅在有线场景有意义。
+#       等固件带上 mtk_wed（WiFi 硬件转发）后再把默认改为 on-hw 才有意义。
 #
 # 与 SQM/CAKE 互斥：被卸载的连接完全绕过 qdisc，CAKE/HTB 一律失效。
-# 所以先查 SQM：已启用就保持 offload 关闭（保住整形），两者只能二选一。
+#   故 auto 模式下先查 SQM：已启用就保持 offload 关闭（保住整形），两者只能二选一；
+#   on/on-hw 模式用户显式要卸载，则按显式值执行，但 SQM 启用时记一条警告（SQM 会失效）。
 #
 # 回滚：网络 → 防火墙 → 常规设置，取消「Flow Offloading」；或
 #       uci set firewall.@defaults[0].flow_offloading=0 && uci commit firewall
+
+# 读取编译期选型（文件缺失 / 为空 / 非法值一律回退 auto，绝不因配置错而中断开机）
+MODE=auto
+if [ -f /etc/mt5700/flow-offload ]; then
+	. /etc/mt5700/flow-offload 2>/dev/null || MODE=auto
+	case "$MODE" in
+		auto|off|on|on-hw) ;;
+		*) MODE=auto; logger -t mt5700-net "flow-offload: 非法 MODE，回退 auto" ;;
+	esac
+else
+	MODE=auto
+fi
+
+# SQM 扫描：永远执行、结果永远记录（红线2：offload/SQM 互斥判定无论 MODE 都跑）
 SQM_ON=0
 for S in $(uci -q show sqm 2>/dev/null | grep -E "\.enabled='1'"); do
 	SQM_ON=1
 done
 
-if [ "$SQM_ON" -eq 1 ]; then
-	uci -q set firewall.@defaults[0].flow_offloading='0'
-	uci -q set firewall.@defaults[0].flow_offloading_hw='0'
-	logger -t mt5700-net "SQM 已启用，保持 flow offload 关闭（二者互斥：offload 绕过 qdisc）"
-else
-	uci -q set firewall.@defaults[0].flow_offloading='1'
-	uci -q set firewall.@defaults[0].flow_offloading_hw='0'
-	logger -t mt5700-net "已开启软件 flow offload（SQM 未启用，无冲突）；硬件卸载留待 mtk_wed 就位"
-fi
+# 决策矩阵（P02）
+flow_offloading=0
+flow_offloading_hw=0
+case "$MODE" in
+	auto)
+		if [ "$SQM_ON" -eq 1 ]; then
+			flow_offloading=0; flow_offloading_hw=0
+			logger -t mt5700-net "SQM 已启用，保持 flow offload 关闭（二者互斥：offload 绕过 qdisc）"
+		else
+			flow_offloading=1; flow_offloading_hw=0
+			logger -t mt5700-net "已开启软件 flow offload（auto 且 SQM 未启用，无冲突）；硬件卸载留待 mtk_wed 就位"
+		fi
+		;;
+	off)
+		flow_offloading=0; flow_offloading_hw=0
+		;;
+	on)
+		flow_offloading=1; flow_offloading_hw=0
+		if [ "$SQM_ON" -eq 1 ]; then
+			logger -t mt5700-net "警告：MODE=on 但 SQM 已启用，offload 会绕过 qdisc 使 SQM 失效"
+		fi
+		;;
+	on-hw)
+		flow_offloading=1; flow_offloading_hw=1
+		if [ "$SQM_ON" -eq 1 ]; then
+			logger -t mt5700-net "警告：MODE=on-hw 但 SQM 已启用，offload 会绕过 qdisc 使 SQM 失效"
+		fi
+		;;
+esac
+uci -q set firewall.@defaults[0].flow_offloading="$flow_offloading"
+uci -q set firewall.@defaults[0].flow_offloading_hw="$flow_offloading_hw"
 uci -q commit firewall
 
 # ---------- 2. 应用 TCP / 拥塞控制参数 ----------
@@ -57,14 +97,14 @@ if [ -f /etc/config/irqbalance ]; then
 	/etc/init.d/irqbalance enable 2>/dev/null || true
 fi
 
-# ---------- 3b. 数据包引导（packet steering）----------
+# ---------- 4. 数据包引导（packet steering）----------
 # 把收包软中断按流散列到多个核，配合上面的 irqbalance 一起打破
 # 「中断全压 CPU0」的格局。真机已默认启用，这里显式兜底，避免换配置后丢失。
 if [ -f /etc/init.d/packet_steering ]; then
 	/etc/init.d/packet_steering enable 2>/dev/null || true
 fi
 
-# ---------- 4. 5G 无线：锁定 36 信道 + 80MHz ----------
+# ---------- 5. 5G 无线：锁定 36 信道 + 80MHz ----------
 # CN 监管域下 5.8G（149~165）只批 80MHz，配 160MHz 时 hostapd 报
 #   "Could not select hw_mode and channel. (-3)"，AP 直接起不来；
 # 5.2G 唯一的 160MHz 块跨 DFS 区（52~64），开机要先做 1~10 分钟雷达静默检测。

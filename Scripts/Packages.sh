@@ -31,7 +31,10 @@ UPDATE_PACKAGE() {
 	done
 
 	# 克隆 GitHub 仓库
-	git clone --depth=1 --single-branch --branch $PKG_BRANCH "https://github.com/$PKG_REPO.git"
+	# P07：克隆失败（分支改名 / 仓库私有 / 限流）必须立即终止，
+	# 否则会静默缺包，最终表现为「插件莫名没了」而不是构建失败。
+	git clone --depth=1 --single-branch --branch $PKG_BRANCH "https://github.com/$PKG_REPO.git" \
+		|| { echo "::error::克隆 $PKG_REPO@$PKG_BRANCH 失败（分支改名/仓库私有/限流）"; exit 1; }
 
 	# 处理克隆的仓库
 	if [[ "$PKG_SPECIAL" == "pkg" ]]; then
@@ -76,7 +79,9 @@ UPDATE_PACKAGE "netspeedtest" "sirpdboy/netspeedtest" "main" "" "homebox ookla-s
 UPDATE_PACKAGE "netwizard" "sirpdboy/luci-app-netwizard" "main"
 UPDATE_PACKAGE "openlist2" "sbwml/luci-app-openlist2" "main"
 UPDATE_PACKAGE "partexp" "sirpdboy/luci-app-partexp" "main"
-UPDATE_PACKAGE "qbittorrent" "sbwml/luci-app-qbittorrent" "master" "" "qt6base qt6tools rblibtorrent"
+# P17：qbittorrent 未出现在 Config/GENERAL.txt 任何 =y 里，克隆与删 qt6 都是净损失；
+# 且其第 5 参数会顺手从 feeds 删掉 qt6base/qt6tools（可能被其它包需要）。故整行禁用。
+# UPDATE_PACKAGE "qbittorrent" "sbwml/luci-app-qbittorrent" "master" "" "qt6base qt6tools rblibtorrent"
 
 # ===== MT 模式（MT_MODE）：独立插件配置层 =====
 # 允许值：空 / MT5700 / MT5700M；非法值直接终止。
@@ -121,6 +126,13 @@ UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"
 # viking feed：仍克隆（其余包可能用到），但把已停用的包目录一并清掉，
 # 避免它们出现在 package/ 里被意外选中或拖慢 feeds 扫描。
 UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-box luci-app-homeproxy luci-app-timewol luci-app-wolplus luci-app-wolultra"
+
+# P06（加固，非必需）：viking feed 克隆到 ./packages/（git clone 的目录名取 URL 仓库名
+# VIKINGYFY/packages → packages；第 4 参数为空故无 pkg/name/all 整理，原样保留），
+# 其内仍含 sing-box / luci-app-homeproxy 子目录，会被 OpenWrt 的 package/ 扫描拾起。
+# 纵深防御式删掉这两个子目录（cwd 为 wrt/package/，见 WRT-CORE.yml:242）。
+# 真正防线仍是 Config/GENERAL.txt 的 =n + VerifyNoSingBox.sh 双重断言。
+rm -rf ./packages/sing-box ./packages/luci-app-homeproxy
 
 UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
 
@@ -267,6 +279,11 @@ INSTALL_NET_TUNING() {
 	cp -rf "$SRC_DIR/etc/." "$DST_DIR/etc/"
 	chmod 0755 "$DST_DIR/etc/uci-defaults/"* 2>/dev/null || true
 	echo "net-tuning: 已注入 Files/etc → wrt/files/etc"
+
+	# P08：复制后无断言，调优脚本丢了没人知道（直接后果：刷完没网）。
+	# 缺失即明确失败，而不是静默带着不完整的覆盖层出固件。
+	[ -f "$DST_DIR/etc/uci-defaults/99-mt5700-net" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/uci-defaults/99-mt5700-net"; exit 1; }
+	[ -f "$DST_DIR/etc/uci-defaults/99-mt5700-wan" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/uci-defaults/99-mt5700-wan"; exit 1; }
 }
 
 case "$MT_MODE" in

@@ -61,6 +61,17 @@ on:
         required: false
         type: string
         default: ""
+      # Flow Offload 选型（独立配置层，全机型复用）：
+      #   auto —— 默认：SQM 未启用时开软件卸载，启用时关（二者互斥）
+      #   off  —— 始终关闭
+      #   on   —— 强制开软件卸载（SQM 启用时仍执行，但记一条警告：offload 会让 SQM 失效）
+      #   on-hw —— 强制开软件 + 硬件卸载
+      # 非法值在编译期即 ::error:: + exit 1（见 Scripts/ApplyFlowOffload.sh），绝不带进固件。
+      # 默认值 auto 保证老调用方（WRT-BUILD / H5000M-MT-AUTO）不传也能跑（红线1）。
+      WRT_FLOW_OFFLOAD:
+        required: false
+        type: string
+        default: 'auto'
 
 env:
   GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
@@ -78,6 +89,7 @@ env:
   WRT_TEST: ${{inputs.WRT_TEST}}
   WRT_MARK: ${{inputs.WRT_MARK}}
   MT_MODE: ${{inputs.MT_MODE}}
+  WRT_FLOW_OFFLOAD: ${{inputs.WRT_FLOW_OFFLOAD}}
 
 jobs:
   core:
@@ -107,7 +119,9 @@ jobs:
           sudo -E apt -yqq autoclean
           sudo -E apt -yqq clean
           sudo -E apt -yqq install dos2unix libfuse-dev ccache
-          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+          # P15：原 `bash <(curl ...)` 在 curl 失败时喂空脚本给 bash → 退出 0 → 缺编译依赖，
+          # 几小时后才以莫名其妙的编译错误暴露。改为先下载到文件、失败即终止（GHA run 以 bash -e 执行）。
+          curl -fsSL --retry 5 --retry-all-errors https://build-scripts.immortalwrt.org/init_build_environment.sh -o /tmp/init_env.sh && sudo bash /tmp/init_env.sh
           sudo -E systemctl daemon-reload
           sudo -E timedatectl set-timezone "Asia/Shanghai"
 
@@ -120,7 +134,13 @@ jobs:
           echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
           echo "WRT_MARK=${WRT_MARK:-${GITHUB_REPOSITORY%%/*}}" >> $GITHUB_ENV
           echo "WRT_INFO=${WRT_SOURCE%%/*}" >> $GITHUB_ENV
-          echo "WRT_TARGET=$(grep -m 1 -oP '^CONFIG_TARGET_\K[\w]+(?=\=y)' ./Config/$WRT_CONFIG.txt)" >> $GITHUB_ENV
+          # P09：grep 无匹配时 exit 1（文件缺失 exit 2），故必须 || true 吸收，
+          # 否则在 bash -e 下赋值语句本身即触发 errexit，下面的 ::error:: 永远打不出来。
+          WRT_TARGET_VAL="$(grep -m 1 -oP '^CONFIG_TARGET_\K[\w]+(?=\=y)' ./Config/$WRT_CONFIG.txt || true)"
+          # 取不到目标平台时后续全部静默错乱（缓存 key 退化、产物改名成一串横杠），
+          # 故在最早能发现处直接失败，而不是带着空值跑完全程。
+          [ -n "$WRT_TARGET_VAL" ] || { echo "::error::无法从 Config/$WRT_CONFIG.txt 解析 CONFIG_TARGET_*=y"; exit 1; }
+          echo "WRT_TARGET=$WRT_TARGET_VAL" >> $GITHUB_ENV
           echo "WRT_WIFI=wifi-yes" >> $GITHUB_ENV
           echo "WRT_KVER=none" >> $GITHUB_ENV
           echo "WRT_LIST=none" >> $GITHUB_ENV
@@ -246,15 +266,27 @@ jobs:
           # 必须在 Settings.sh 之后、make defconfig 之前执行
           $GITHUB_WORKSPACE/Scripts/ApplyMTMode.sh
 
+          # Flow Offload 选型（P01）：把 WRT_FLOW_OFFLOAD 写入固件 files 覆盖层
+          # （wrt/files/etc/mt5700/flow-offload），开机由 uci-defaults 读取决策。
+          # 必须在 make defconfig 之前执行（与 MT 配置层同属「配置前」阶段）。
+          # ★ 用 bash 显式调用而不是直接执行：本仓 Scripts/*.sh 在 git 索引里是 100644
+          # （无 exec 位），直接 $PATH 调用在 runner 上有 Permission denied 的风险，
+          # `bash <file>` 不依赖文件自身的执行位。
+          bash $GITHUB_WORKSPACE/Scripts/ApplyFlowOffload.sh
+
           make defconfig && make clean
 
           # 关键包选择自检：kconfig 对不存在的包会静默丢弃（不报错），
           # 所以光看“defconfig 成功”不能证明包名有效，这里把新增项打印出来核对。
           echo "===== 关键包选择自检（缺失即代表包名无效，会被静默丢弃）====="
-          grep -E '^CONFIG_PACKAGE_(kmod-sched-core|kmod-sched|kmod-sched-cake|kmod-sched-pie|kmod-sched-fq-pie|kmod-ifb|kmod-tcp-bbr|tc-full|ethtool|irqbalance|luci-app-irqbalance|sqm-scripts|luci-app-mt5700|luci-app-mt5700m|sms-tool_q|ubus-at-daemon)=' .config || true
+          grep -E '^CONFIG_PACKAGE_(kmod-sched-core|kmod-sched|kmod-sched-cake|kmod-sched-pie|kmod-sched-fq-pie|kmod-ifb|kmod-tcp-bbr|tc-full|ethtool|irqbalance|luci-app-irqbalance|sqm-scripts|luci-app-mt5700|luci-app-mt5700m|sms-tool_q|ubus-at-daemon|luci-app-firewall)=' .config || true
           echo "----- 目标与内核选项 -----"
           grep -E '^(CONFIG_TARGET_MULTI_PROFILE|CONFIG_TARGET_ALL_PROFILES|CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_hiveton_h5000m)=' .config || true
           grep -E '^CONFIG_(DEFAULT_TCP_CONG|TCP_CONG_BBR|KERNEL_TCP_CONG_BBR|KERNEL_NET_SCH_CAKE|KERNEL_NET_SCH_FQ)=' .config || true
+
+          # R04（P03 收口）：luci-app-firewall 是「页面上改 flow offload」的前提（网络→防火墙→常规设置页）。
+          # 这条不是 || true：包名无效（被 kconfig 静默丢弃）时 CI 必须红掉，而不是带着缺页的固件发版。
+          grep -q '^CONFIG_PACKAGE_luci-app-firewall=y' .config || { echo "::error::luci-app-firewall 未进入 .config，「页面上改 flow offload」不可用"; exit 1; }
 
       # 配置生成后、编译前：验证 MT 模式包选择互斥（双重验证之一）
       - name: Verify MT Mode
@@ -262,6 +294,13 @@ jobs:
           cd ./wrt/
 
           $GITHUB_WORKSPACE/Scripts/VerifyMTMode.sh
+
+      # 配置生成后、编译前：断言未意外选中 sing-box / homeproxy（P05 双校验之一）
+      - name: Verify No SingBox (pre)
+        run: |
+          cd ./wrt/
+
+          PHASE=pre bash $GITHUB_WORKSPACE/Scripts/VerifyNoSingBox.sh
 
       - name: Download Packages
         if: env.WRT_TEST != 'true'
@@ -341,11 +380,25 @@ jobs:
             echo "WRT_KVER=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^kernel - \K[\d\.]+' {} \;)" >> $GITHUB_ENV
             echo "WRT_LIST=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^luci-(app|theme)[^ ]*' {} \; | tr '\n' ' ')" >> $GITHUB_ENV
 
-            find ./bin/targets/ -iregex ".*\(buildinfo\|json\|sha256sums\|packages\)$" -exec rm -rf {} +
+            # P05（双校验之二）：编译后断言产物 manifest 不含 sing-box / homeproxy。
+            # 必须在下面的 iregex 删除动作之前执行——该规则会清掉 packages 目录，
+            # 但 *.manifest 保留，故此处仍可读到完整 manifest。
+            PHASE=post bash $GITHUB_WORKSPACE/Scripts/VerifyNoSingBox.sh
+
+            # P10：保留 sha256sums（仅几 KB），让用户能校验固件完整性；
+            # packages/ 目录仍删（那是 ipk 仓库，不影响刷机）。
+            find ./bin/targets/ -iregex ".*\(buildinfo\|json\|packages\)$" -exec rm -rf {} +
 
             for FILE in $(find ./bin/targets/ -type f -iname "*$WRT_TARGET*") ; do
               EXT=$(basename $FILE | cut -d '.' -f 2-)
-              NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*")
+              # P09：grep 无匹配 exit 1，须 || true 吸收，否则 bash -e 下 errexit 让诊断打不出来。
+              NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*" || true)
+              # R06：NAME 为空时回退 basename 并告警，不 exit——避免 `CONFIG_VERSION_FILENAMES=y`
+              # 等正常构建（文件名里无 WRT_TARGET 串）被误杀；只有 WRT_TARGET 那条才硬失败。
+              if [ -z "$NAME" ]; then
+                NAME="$(basename $FILE | cut -d '.' -f 1)"
+                echo "::warning::产物改名未匹配到 WRT_TARGET=$WRT_TARGET，回退用 basename: $NAME"
+              fi
               # 文件名嵌入 MT_MODE：同一机型的 MT5700 / MT5700M 产物可并存于同一 Release
               NEW_FILE="$NAME"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_MT"-"$WRT_WIFI"-"$WRT_DATE"."$EXT"
               mv -f $FILE ./upload/$NEW_FILE

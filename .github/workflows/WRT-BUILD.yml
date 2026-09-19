@@ -37,6 +37,16 @@ on:
         type: choice
         options:
           - MT5700
+      FLOW_OFFLOAD:
+        description: 'Flow Offload 选型（auto 默认：SQM 未启用时开软件卸载）'
+        default: 'auto'
+        required: false
+        type: choice
+        options:
+          - auto
+          - off
+          - on
+          - on-hw
       TEST:
         description: '仅生成配置文件，不编译固件。'
         # 2026-09-19 改为默认 false：手动触发本工作流的意图通常就是要出固件，
@@ -46,7 +56,8 @@ on:
         required: true
         type: boolean
 
-permissions: write-all
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -66,6 +77,8 @@ jobs:
       WRT_SOURCE: ${{inputs.SOURCE}}
       WRT_PACKAGE: ${{inputs.PACKAGE}}
       WRT_TEST: ${{inputs.TEST}}
+      # Flow Offload 选型透传（默认 auto，与 H5000M-MT-AUTO 的 workflow_run 路径行为一致）
+      WRT_FLOW_OFFLOAD: ${{inputs.FLOW_OFFLOAD}}
       # 唯一保留的 MT 模式：MT5700（woshinibabao1/MT5700-Console 单包方案）。
       # MT5700M 已停用（依赖 sms-tool_q 版本号对 apk 非法，且功能重复）。
       MT_MODE: MT5700

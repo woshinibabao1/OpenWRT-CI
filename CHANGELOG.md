@@ -1,4 +1,31 @@
 # 更新日志
+## [2026-09-19] 三条硬需求落地（flow offload 可见配置 / sing-box 断言 / 产物保留 sha256sums）
+
+对应 Orchestrator 提案（proposer）P01–P20。取舍与未采纳项见 `FIRMWARE_OPTIMIZATION_REPORT.md`。
+
+### flow offload 可见配置（P01/P02/P03）
+- 新增 `Scripts/ApplyFlowOffload.sh`：构建期把 `WRT_FLOW_OFFLOAD`（auto/off/on/on-hw，默认 auto）写入固件覆盖层
+  `wrt/files/etc/mt5700/flow-offload`；非法值编译期 `::error::` + `exit 1`。
+- `WRT-CORE.yml` 新增 `WRT_FLOW_OFFLOAD` input（默认 auto，保证老调用方不传也能跑）+ env；`WRT-BUILD.yml` /
+  `H5000M-MT-AUTO.yml` 增加 `FLOW_OFFLOAD` 选项并透传。
+- `Files/etc/uci-defaults/99-mt5700-net` 读取 `/etc/mt5700/flow-offload` 决策矩阵（auto+SQM关→软卸载；
+  auto+SQM开→关；off→关；on→软；on-hw→软+硬），SQM 扫描永远执行（红线2 互斥判定保留）。
+- 默认文件 `Files/etc/mt5700/flow-offload`（MODE=auto）保证脚本不跑时也是 auto。
+- `Config/GENERAL.txt` 显式 `CONFIG_PACKAGE_luci-app-firewall=y`，确保「页面上改」的防火墙页存在。
+
+### sing-box 彻底不编（P04/P05）
+- `Config/GENERAL.txt` 显式写死 `CONFIG_PACKAGE_sing-box=n` / `luci-app-homeproxy=n` / `luci-i18n-homeproxy-zh-cn=n`
+  （沿用既有 =n 风格，而非只留注释），防将来被别的包反向依赖拉回。
+- 新增 `Scripts/VerifyNoSingBox.sh` 做编译前（.config）+ 编译后（manifest）两道硬断言；`WRT-CORE.yml` 在
+  `make defconfig` 后加 `pre` 步骤、在产物 manifest 读取后（iregex 删除前）加 `post` 步骤。
+- 口径：硬需求「sing-box 内核彻底不编」指的是**不进固件**；`VerifyNoSingBox(post)` 只查 `bin/targets/*/*.manifest`
+  （最终进固件的包清单），`bin/packages` 下的 ipk 仓库不在断言范围内（pre 阶段的 `viking` 克隆树清理见 `Packages.sh` P06）。
+
+### 产物与健壮性（P09/P10/P15/P16 等）
+- 产物保留 `sha256sums`（P10）：`WRT-CORE.yml` 的 iregex 删除规则去掉 `sha256sums`。
+- `WRT_TARGET` / 产物改名 `NAME` 取值失败即 `::error::` + `exit 1`（P09）。
+- 初始化脚本 `curl` 失败不再静默成功（P15）。
+
 ## [2026-09-19] 软件页安装默认允许未签名包
 
 - `Handles.sh` 新增一段：给 `luci-app-package-manager` 的 `/usr/libexec/package-manager-call`

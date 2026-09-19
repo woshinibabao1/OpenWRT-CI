@@ -121,7 +121,10 @@
    我可以把它写进 `/etc/config/firewall` 并在 Release 说明里标注。
 
 3. **sing-box 内核彻底不编，你 OK 吗？**
-   HomeProxy 走后它没用了。若你之后还想装别的 sing-box 系界面（比如 passwall2），我再把它加回来。
+   已确认并落地：用户本次已回答「要」。`Config/GENERAL.txt` 显式写死 `CONFIG_PACKAGE_sing-box=n` /
+   `luci-app-homeproxy=n` / `luci-i18n-homeproxy-zh-cn=n`（见 P04），并由 `Scripts/VerifyNoSingBox.sh`
+   在编译前（查 `.config`）+ 编译后（查 `*.manifest`）做双重断言（见 P05）。即便将来某包 DEPENDS 反向
+   拉回 sing-box，`=n` + 两道断言也会拦下，不会静默编入。
 
 ---
 
