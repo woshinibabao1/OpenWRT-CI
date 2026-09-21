@@ -1,5 +1,75 @@
 # 更新日志
 
+## [2026-09-22 · 第二轮] 软件转发收包路径与 NAT 端口段补齐（4 项）
+
+基准同上一轮（`好用的固件V0.18.bin`）。本轮把它的 `/etc` 全部摊开逐文件比对：
+`sysctl.d`(5)、`init.d`(47)、`uci-defaults`(44)、`hotplug.d`(11)、`modules.d`(89)、
+`board.d`(8)、`rc.d`、`config`(21)、`nftables.d`，外加 `/sbin/smp*.sh`、`/sbin/flowtable.sh`
+与 `/lib/apk/db/installed`(361 包)。**结论：基线里已没有新的可搬优化项**，本轮的 4 项
+来自"我方已有调优自身没做完的部分"（见下）。基线的 11 项差异判定附在文末。
+
+### 改动（4 项）
+
+1. **`net.ipv4.ip_local_port_range`：`32768 60999` → `10240 65535`**
+   （`Files/etc/sysctl.d/99-mt5700-conntrack.conf`）
+
+   这是**我们自己上一轮优化的未收尾处**。上一轮把 `nf_conntrack_max` 提到 100000，
+   但 SNAT 可用的源端口区间仍是内核默认的 32768-60999 —— **只有 28232 个**。
+   一条出站连接占一个源端口，所以单出口的并发 NAT 连接数被这个区间封顶：
+   不改这里，10 万只是账面数字，实际到 2.8 万条就不再建新连接。
+   本机是单 5G 出口（eth2，CGNAT 段 100.76.8.240/8），所有客户端的出站连接挤一个端口池。
+
+   真机实测默认值：`net.ipv4.ip_local_port_range = 32768	60999`（68231 个端口区间，
+   可用 28232 个）。下限特意取 10240 而非 1024，避开"<1024 为特权端口"的惯例认知
+   与部分中间盒对低源端口的过滤。
+
+2. **`net.core.netdev_max_backlog`：默认 1000 → 5000**（`Files/etc/sysctl.d/99-mt5700-tcp.conf`）
+
+   前提三条都是本机已成立的事实：① flow offload 必须关闭（否则 TTL 规则零命中）→
+   转发全走软件路径；② 收包靠 RPS 分摊到四核；③ **eth2 真机 ethtool 实测协商
+   `Speed: 1280Mb/s`**。
+
+   1280Mb/s 按 1500B 满载约 106kpps，RPS 分到四核后每核约 26kpps ——
+   每 CPU 1000 包的积压只够缓冲约 38ms。5G 突发一旦超过它，内核**直接丢包且不打日志**，
+   表现为"测速忽高忽低、重传涨了却查不到原因"。提到 5000（约 190ms）代价极小：
+   队列里存 skb 指针，不复制数据。
+
+3. **`net.core.netdev_budget`：默认 300 → 600**（同上）
+
+   RPS 把包分散到四核后，每核单轮 300 包成为瓶颈：包没处理完就被下一轮抢占，
+   CPU 时间耗在反复进出软中断上。有 `netdev_budget_usecs`(2000μs) 兜底，不会无界占 CPU。
+
+4. **修正 `99-mt5700-conntrack.conf` 里一个错误数字**（注释，非功能）
+
+   原文写"`nf_conntrack_buckets = 65536`（本机默认即 65536，两边一致）" ——
+   **真机读回是 63488**（`0xF800`）。来由已查明：buckets 在 `nf_conntrack` 模块加载
+   那一刻由当时的 `conntrack_max` 推导，之后再 sysctl 抬高 `conntrack_max` **不会**让它重算。
+   结论不变（63488 vs 65536 差 3%，不值得在开机阶段重建哈希表），但数字必须写准 ——
+   整段推理只依赖这一个数字成立，写错等于把后续判断全部带偏。
+
+### 本轮"判定为不做"的 11 项（附证据，防止以后重复挖）
+
+| 项 | 基线做法 | 本机/本仓库 | 判定 |
+| :-- | :-- | :-- | :-- |
+| **WED**（无线硬件卸载） | `/etc/modules.d/mt7996e` 写 `wed_enable=0`（自己也关） | 无该文件，默认 `N`；`mt7996e.ko` 里 17 处 wed 符号齐全 | ❌ **不可用**：平台设备 `15010000.wed`/`15104800.wdma` 在设备树里，但 `/sys/bus/platform/drivers/` 下**无驱动**、`modules.builtin` 无 wed → 上游未完成，写了也不生效 |
+| **MTK `smp_util` / `smp-dispatch.sh`** | `smp-mt76.sh` 在 MT7987 上走 MT7988 分支 → 结果**把所有接口 rps 置 0**，并按硬编码 IRQ `221-224/229` 绑核 | 自写 `mt5700-rps`（实测 e/f 分档）+ `mt5700-smp`（贪心均衡） | ✅ **我方更优**：本机以太网**只有 2 个 IRQ**（`GICv3 229/230`），基线假设的 4 个 RSS ring 不存在 → 它在本机等于"关掉 RPS"；而我方实测 RPS 分摊把 CPU0 的 NET_RX 从 42% 压到 15% |
+| `disable_gro_fraglist`（rx-gro-list off） | 有 | **已在 `mt5700-smp` 内** | ✅ 等价（真机 `ethtool -k` 各口均 `rx-gro-list: off`） |
+| 风扇温控 | 闭源 `/usr/bin/fancontrol` + uci 曲线 | `luci-app-h5000m-fancontrol 2.1.0` 已装；真机 `cooling_device0=pwm-fan cur=1/3`、`hwmon2 pwm1=128` | ✅ 已有 |
+| `10-default.conf` / `11-nf-conntrack.conf`（上游） | 标准内容 | 真机逐行一致（含 `arp_ignore=1`、`kernel.panic=3`、`bpf_jit_enable=1`） | ✅ 一致，不必动 |
+| `99-h5000m-network.conf`（BBR/fq/16M） | 8 行 | 我方是**超集**（+`tcp_fastopen`/`somaxconn`/`max_syn_backlog`/`rp_filter`/`no_metrics_save`/`mtu_probing`/`slow_start_after_idle`） | ✅ 已超越 |
+| conntrack | 用上游默认（**无 `max` 行**） | 我方 `max=100000` + `expect_max=16384` | ✅ 已超越 |
+| 桥接 netfilter（`11-br-netfilter.conf`/`12-br-netfilter-ip.conf`） | 默认关、为 docker 开 iptables | 本机内核**无** `/proc/sys/net/bridge/`（`kmod-br-netfilter` 未编入） | ⚪ 不适用：我们用 nft `inet fw4`，不依赖 iptables 桥接兼容层 |
+| **LAN/WAN 物理口定义** | `board.d/02_network` 写 `ucidef_set_interfaces_lan_wan eth1 eth0`（lan=eth1, wan=eth0） | 我方 `lan=eth0(br-lan)`、`wan=eth1` | ✅ **我方对**：真机 `eth1` 的 `phydev` == `mdio-bus:0f`，而该 LED 的名字就是 **`mdio-bus:0f:red:wan`** → eth1 是被 DTS 标注为 WAN 的口。基线与本机 DTS 标注相反 |
+| `luci-app-package-manager` + `--allow-untrusted` 补丁 | 有该包 | 包已在（269 依赖链带入），补丁**真的进了固件**：真机 `grep -c allow-untrusted /usr/libexec/package-manager-call` = 1 | ✅ 一致，补丁不是死代码（这是本轮专门去验的一条"CI 补丁会不会静默落空"） |
+| `mtk-puncture`（Wi-Fi 7 打孔） | 有 LuCI 包 | 驱动 `mt76*.ko`/`mt7996e.ko` 中 `punctur` **零命中**、netifd 脚本层零命中 | ❌ 不可搬（上一轮已定案） |
+
+### 明确**不采纳**的（那不是优化，是补功能）
+
+基线有、我方没有且本轮判定不做的：UPnP(`miniupnpd-nftables`)、`docker` 全家桶、
+`nikki`/`mihomo-alpha`（我方用 openclash）、QModem 全家桶、`bind-dig`/`lsof`/`jq`/`bc` 等
+命令行工具、WAN 口 `red:wan` 指示灯（我方 LED 资源已存在但未启用 —— 属新增可见行为，
+与本轮"实打实优化"不同类，如需启用另议）。
+
 ## [2026-09-22] 以基线镜像为基准的三项实打实优化（qdisc / socket 缓冲 / 停用 packet steering）
 
 基准：`好用的固件V0.18.bin`（OpenWrt 25.12-SNAPSHOT，kernel 6.12.94，MT7987）。
@@ -276,6 +346,11 @@ S95 那一刻必然还不存在。
     且 auto 分支里的 TTL 探测只在显式选 auto 时才走到；
   - `99-mt5700-conntrack.conf` 说 buckets "本机默认 63488"，与该文件自己第 41 行
     （也是实测值 65536）自相矛盾 → 已更正为 65536；
+    🔴 **2026-09-22 第二次更正：这次改反了。** 当时是"以文件里的另一句话为准"来消矛盾，
+    没有回真机复核。真机读回确实是 **63488**（`0xF800`），第一次写的才是对的 ——
+    来由是 buckets 在 `nf_conntrack` 模块加载那一刻由当时的 `conntrack_max` 推导，
+    之后再用 sysctl 抬高 `conntrack_max` **不会**让它重算。现已改回 63488 并写明机制。
+    **教训：同一份文件里两处数字冲突时，必须回真机量一次，不能靠"哪句话更可信"来裁决。**
   - `mt5700-rps` 里 IRQ 累计次数写 140 万、另两个文件写 186 万 → 统一改为"百万次量级"，
     避免三个文件三个数字；
   - `Packages.sh` 的 viking 注释说"避免它们出现在 package/ 里"，实际删除循环只 find

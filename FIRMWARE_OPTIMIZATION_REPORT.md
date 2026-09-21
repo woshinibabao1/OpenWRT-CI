@@ -131,7 +131,7 @@
 | **`mtk_hnat`（联发科 HNAT 驱动）** | 这是 **mtk-openwrt-feeds 的树外驱动**，immortalwrt master（你现在的基线）没收录 —— 真机 `/lib/modules` 里根本没这个 .ko。主线用的是新一代 **PPE**（就是 `/sys/kernel/debug/ppe0`、ppe1 那个）。再叠一套 tree 外 HNAT 会和 PPE **抢同一张硬件转发表**，属于教科书级负优化 |
 | **WED（Wi-Fi 硬件转发）** | 本基线没有 `mtk_wed.ko`。要拿到需要引入 mtk-openwrt-feeds 的 WED 补丁（你这仓库 2026-08 曾注入过 `999-mtk7987-wed-v31.patch`，后来被移除了），且**必须真机验证 Wi-Fi 起得来**。盲加的风险是 AP 直接起不来 —— 属于「需人工决策 + 真机验证」项，见第四节 |
 | **zram / swap** | 1GB DDR4，实测 free 477MB、buff/cache 265MB，没有内存压力。加 zram 是拿 CPU 换内存，在这台机器上净亏 |
-| **netdev_max_backlog / TCP 缓冲区放大** | 有 fq_codel 与（可选的）CAKE 兜底，盲目放大 backlog 会加重 bufferbloat，反而更卡。保持默认 |
+| **netdev_max_backlog / TCP 缓冲区放大** | ⚠️ **2026-09-22 已撤销此结论**（原判据有两处错，详见第七节）：① 范畴错 —— `netdev_max_backlog` 是**每 CPU 的收包积压**（NAPI 与协议栈之间的 skb 指针队列），不是出口 qdisc 队列，fq_codel/CAKE 作用的不是这里；② 前提反转 —— 当时假设「flow offload 默认开、转发走快路」，而现在默认已是 `off`（TTL 统一规则要求），软件转发路径成为常态。已按新前提重新取值 |
 | **改 CPU 调度器 / 锁定高频** | 实测 governor 已是 `schedutil`，档位 0.5/1.3/1.6/2.0 GHz 正常。锁 `performance` 只增加发热（这台机器还有温控风扇） |
 
 ---
@@ -157,8 +157,9 @@
 ## 五、刷机后怎么验证（建议顺序）
 
 ```sh
-# 1. flow offload 是否真的生效
-uci get firewall.@defaults[0].flow_offloading          # 期望 1
+# 1. flow offload 当前模式（默认应为 off —— TTL 统一规则要求）
+cat /etc/mt5700/flow-offload                            # 期望 MODE=off
+uci get firewall.@defaults[0].flow_offloading          # 期望 0（选 on/on-hw 时才为 1）
 nft list ruleset | grep -i flow                        # 期望出现 flowtable / flow add
 
 # 2. 硬件引擎在不在（确认基线没变）
@@ -196,3 +197,69 @@ cat /proc/interrupts | head -20                        # 对比 CPU0..CPU3 是�
 | `Scripts/Handles.sh` | 改：删 homeproxy / aurora / AP3000M EEPROM / dockerd 四段 |
 | `Scripts/inject_airpi_prebuilt.py`、`Scripts/homeproxy/`、`Scripts/patches/dockerd/` | 删 |
 | `AP3000M-EEPROM/` | 删 |
+
+---
+
+## 七、2026-09-22 第二轮：软件转发收包路径 + NAT 端口段（基准：`好用的固件V0.18.bin`）
+
+### 7.1 为什么会有这一轮
+
+上一轮以基线镜像为基准筛出 3 项（qdisc/缓冲/packet steering）。本轮把基线固件的
+`/etc` **全部摊开逐文件比对**（`sysctl.d`5、`init.d`47、`uci-defaults`44、`hotplug.d`11、
+`modules.d`89、`board.d`8、`rc.d`、`config`21、`nftables.d`，外加 `/sbin/smp*.sh`、
+`/sbin/flowtable.sh` 与 `/lib/apk/db/installed` 的 361 个包），结论是
+**基线里已没有新的可搬优化项**（11 项差异的逐条判定见 `CHANGELOG.md` 同日期条目，
+含 WED、MTK smp 派发、风扇、LAN/WAN 口定义、`--allow-untrusted` 补丁是否真进固件等）。
+
+所以本轮的 4 项改动**来自我方已有调优自身没做完的部分**，不是基线差异。
+
+### 7.2 四项改动
+
+| # | 项 | 原值 | 新值 | 依据 |
+| :-- | :-- | :-- | :-- | :-- |
+| 1 | `net.ipv4.ip_local_port_range` | `32768 60999`（可用 28232） | `10240 65535`（55296） | **上一轮优化的收尾**：`nf_conntrack_max` 提到了 100000，但 SNAT 可用端口仍被默认区间封顶 → 瓶颈从"表容量"转移到"端口段"，实际到 2.8 万条就不再建新连接 |
+| 2 | `net.core.netdev_max_backlog` | 1000（内核默认） | 5000 | eth2 **真机实测 1280Mb/s**；flow offload 必须关 → 全软件转发；RPS 分四核后每核 ~26kpps，1000 包只够缓冲 ~38ms，溢出即**静默丢包** |
+| 3 | `net.core.netdev_budget` | 300（内核默认） | 600 | 同上场景：每核单轮 300 包成为瓶颈，CPU 时间耗在反复进出软中断。有 `netdev_budget_usecs`(2000μs) 兜底，单核不会被长期霸占 |
+| 4 | `99-mt5700-conntrack.conf` 注释 | 写"`nf_conntrack_buckets` 本机默认即 65536" | 改为真机实测 **63488** | 这是**错数字**不是错决策：buckets 在模块加载那刻由 `conntrack_max` 推导，之后抬高 max 不会重算。63488 vs 65536 的取舍结论不变，但数字必须写准 |
+
+**回滚**（任一项都独立，互不影响）：
+
+```sh
+sysctl -w net.ipv4.ip_local_port_range="32768 60999"
+sysctl -w net.core.netdev_max_backlog=1000
+sysctl -w net.core.netdev_budget=300
+# 或直接删掉 Files/etc/sysctl.d/99-mt5700-*.conf 里对应行后重启
+```
+
+### 7.3 与第三节旧结论的冲突处理
+
+第七节第 2 项直接推翻了第三节"`netdev_max_backlog` 保持默认"的旧结论，故该行已就地标注撤销，
+两步原因（① 把 `netdev_max_backlog` 当成出口 qdisc 队列是范畴错误；② 前提从"offload 开"
+反转为"offload 关"）写在第三节那行里，不留矛盾表述。
+
+### 7.4 本轮确认**不能做**的两项（附硬证据，避免以后再挖）
+
+- **WED**：与第三节结论一致，并补齐了证据链 —— 本机 `15010000.wed` / `15104800.wdma`
+  两个平台设备**在设备树里**、`mt7996e.ko` 里 17 处 wed 符号（含 `_wed_offload_enable`、
+  `mtk_soc_wed_ops`）也都在，但 `/sys/bus/platform/drivers/` 下**没有 wed 驱动**、
+  `modules.builtin` 里无 wed → 属"上游还没做完"，不是"拿不到"。
+  基线固件同样把 `wed_enable` 写成 0（`/etc/modules.d/mt7996e`）。
+- **`luci-app-mtk-puncture`（Wi-Fi 7 前导码打孔）**：驱动 `mt76.ko`/`mt76-connac-lib.ko`/
+  `mt7996e.ko` 中 `punctur` **零命中**；`/lib/netifd/`、`/usr/share/hostap/`、`hostapd.uc`
+  也零命中 → 即使装了 LuCI 包写进 UCI，**没有任何链路把值传给 hostapd**（hostapd v2.12
+  本身有 `puncturing_bitmap`，但没人喂它）。本机无线是 **MT7992E** 且 2.4G 已禁用。
+
+### 7.5 刷机后验证
+
+```sh
+# 1. 端口段
+cat /proc/sys/net/ipv4/ip_local_port_range        # 期望 10240	65535
+# 2. 收包积压 / 单轮预算
+cat /proc/sys/net/core/netdev_max_backlog         # 期望 5000
+cat /proc/sys/net/core/netdev_budget              # 期望 600
+# 3. 积压溢出计数（若持续增长说明 backlog 还不够，见 /proc/net/softnet_stat 第 10 列）
+awk '{print $1, $10}' /proc/net/softnet_stat
+# 4. NAT 端口是否真的用起来了（并发高时抽样）
+cat /proc/net/nf_conntrack | wc -l
+```
+
