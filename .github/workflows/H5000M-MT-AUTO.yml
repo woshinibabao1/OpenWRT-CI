@@ -23,8 +23,19 @@ on:
         description: '手动追加插件包（多行请用换行隔开）'
         required: false
         type: string
+      FLOW_OFFLOAD:
+        description: 'Flow Offload 选型（默认 auto；workflow_run 触发时取空，走默认 auto）'
+        default: 'auto'
+        required: false
+        type: choice
+        options:
+          - auto
+          - off
+          - on
+          - on-hw
 
-permissions: write-all
+permissions:
+  contents: write
 
 jobs:
   config:
@@ -44,7 +55,9 @@ jobs:
     with:
       WRT_CONFIG: ${{ matrix.CONFIG }}
 
-      WRT_THEME: aurora
+      WRT_THEME: argon
+      # 固件版本尾缀：状态页显示 "… / OWrt-26.09.15-17.00.22"
+      WRT_MARK: OWrt
       WRT_NAME: OWRT
       WRT_SSID: OWRT
       WRT_WORD: 12345678
@@ -57,4 +70,7 @@ jobs:
 
       WRT_PACKAGE: ${{ inputs.PACKAGE }}
       WRT_TEST: 'false'
+      # Flow Offload 选型透传：workflow_dispatch 时取输入；workflow_run 触发时 inputs 为空，
+      # 取值为空字符串，CORE 侧 default 'auto' 兜底（满足红线1：老调用方不传也能跑）。
+      WRT_FLOW_OFFLOAD: ${{ inputs.FLOW_OFFLOAD }}
       MT_MODE: ${{ matrix.MT_MODE }}

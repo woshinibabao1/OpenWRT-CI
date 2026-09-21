@@ -31,7 +31,10 @@ UPDATE_PACKAGE() {
 	done
 
 	# 克隆 GitHub 仓库
-	git clone --depth=1 --single-branch --branch $PKG_BRANCH "https://github.com/$PKG_REPO.git"
+	# P07：克隆失败（分支改名 / 仓库私有 / 限流）必须立即终止，
+	# 否则会静默缺包，最终表现为「插件莫名没了」而不是构建失败。
+	git clone --depth=1 --single-branch --branch $PKG_BRANCH "https://github.com/$PKG_REPO.git" \
+		|| { echo "::error::克隆 $PKG_REPO@$PKG_BRANCH 失败（分支改名/仓库私有/限流）"; exit 1; }
 
 	# 处理克隆的仓库
 	if [[ "$PKG_SPECIAL" == "pkg" ]]; then
@@ -50,10 +53,9 @@ UPDATE_PACKAGE() {
 # UPDATE_PACKAGE "open-app-filter" "destan19/OpenAppFilter" "master" "" "luci-app-appfilter oaf" 这样会把原有的open-app-filter，luci-app-appfilter，oaf相关组件删除，不会出现coremark错误。
 
 # UPDATE_PACKAGE "包名" "项目地址" "项目分支" "pkg/name/all，可选，pkg为提取匹配包；name为重命名；all为提取全部一级包"
-# 主题：保留 aurora（默认）与 argon（含配套修复），其余精简
+# 主题：只保留 argon（用户指定）。aurora 及其配置页已按用户要求移除；
+# 主题由工作流的 WRT_THEME=argon 决定，Settings.sh 会写入 luci-theme-argon 与 luci-app-argon-config。
 UPDATE_PACKAGE "argon" "sbwml/luci-theme-argon" "openwrt-25.12"
-UPDATE_PACKAGE "aurora" "eamonxg/luci-theme-aurora" "master"
-UPDATE_PACKAGE "aurora-config" "eamonxg/luci-app-aurora-config" "master"
 
 UPDATE_PACKAGE "momo" "nikkinikki-org/OpenWrt-momo" "main"
 UPDATE_PACKAGE "nikki" "nikkinikki-org/OpenWrt-nikki" "main"
@@ -77,7 +79,9 @@ UPDATE_PACKAGE "netspeedtest" "sirpdboy/netspeedtest" "main" "" "homebox ookla-s
 UPDATE_PACKAGE "netwizard" "sirpdboy/luci-app-netwizard" "main"
 UPDATE_PACKAGE "openlist2" "sbwml/luci-app-openlist2" "main"
 UPDATE_PACKAGE "partexp" "sirpdboy/luci-app-partexp" "main"
-UPDATE_PACKAGE "qbittorrent" "sbwml/luci-app-qbittorrent" "master" "" "qt6base qt6tools rblibtorrent"
+# P17：qbittorrent 未出现在 Config/GENERAL.txt 任何 =y 里，克隆与删 qt6 都是净损失；
+# 且其第 5 参数会顺手从 feeds 删掉 qt6base/qt6tools（可能被其它包需要）。故整行禁用。
+# UPDATE_PACKAGE "qbittorrent" "sbwml/luci-app-qbittorrent" "master" "" "qt6base qt6tools rblibtorrent"
 
 # ===== MT 模式（MT_MODE）：独立插件配置层 =====
 # 允许值：空 / MT5700 / MT5700M；非法值直接终止。
@@ -119,77 +123,21 @@ if [ "$MT_MODE" = "MT5700M" ]; then
 fi
 UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
 UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"
+# viking feed：仍克隆（其余包可能用到），但把已停用的包目录一并清掉，
+# 避免它们出现在 package/ 里被意外选中或拖慢 feeds 扫描。
 UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-box luci-app-homeproxy luci-app-timewol luci-app-wolplus luci-app-wolultra"
 
-# luci-app-homeproxy（viking feed）20260914-r2 起把 LUCI_EXTRA_DEPENDS 提升为
-#   sing-box (>=1.15.0)
-# 但同一 feed 的 sing-box 仅有 1.15.0_alpha3；apk 版本比较中 `_alpha3` 属
-# pre-release 后缀（_alpha 排在「无后缀」之前），故 1.15.0_alpha3 不满足 >=1.15.0：
-#   ERROR: unable to select packages:
-#     sing-box-1.15.0_alpha3-r1:
-#       breaks: luci-app-homeproxy-20260914-r2[sing-box>=1.15.0]
-# 构建在 world 阶段的 package/install 整体失败（2026-09-15 三机型全灭即此因）。
-#
-# 不能用「删掉版本约束」的写法：OpenWrt 的 apk 打包器 include/package-pack.mk
-# 要求 EXTRA_DEPENDS 每一项都必须是「包名 + 空格 + 版本约束」，去掉约束会直接报
-#   *** "Extra dependencies must have version constraints. sing-box seems to be unversioned."
-#
-# 因此这里把约束下限对齐为同一 feed 中 sing-box 的实际 PKG_VERSION（动态读取，
-# 上游升版/降版均自洽）：约束合法，且一定被实际构建出的版本满足。
-# 若上游要求高于 feed 实际版本，本规则以降级方式放行——以「可构建」优先，
-# sing-box 实际能力由 feed 版本决定。上游发布正式版 1.15.0 后，规则自动改写为
-# 相同下限，无需人工介入（此依赖也不会再阻塞构建）。
-FIX_HOMEPROXY_SINGBOX() {
-	local HP_MK SBOX_MK SBOX_VER CUR_VER CUR_MAIN SBOX_MAIN NEEDS_ADJUST
-	HP_MK=$(find . -maxdepth 3 -type f -path "*luci-app-homeproxy/Makefile" 2>/dev/null | head -1)
-	[ -n "$HP_MK" ] || { echo "homeproxy: Makefile not found, skip"; return 0; }
+# P06（加固，非必需）：viking feed 克隆到 ./packages/（git clone 的目录名取 URL 仓库名
+# VIKINGYFY/packages → packages；第 4 参数为空故无 pkg/name/all 整理，原样保留），
+# 其内仍含 sing-box / luci-app-homeproxy 子目录，会被 OpenWrt 的 package/ 扫描拾起。
+# 纵深防御式删掉这两个子目录（cwd 为 wrt/package/，见 WRT-CORE.yml:242）。
+# 真正防线仍是 Config/GENERAL.txt 的 =n + VerifyNoSingBox.sh 双重断言。
+rm -rf ./packages/sing-box ./packages/luci-app-homeproxy
 
-	if ! grep -qE '^LUCI_EXTRA_DEPENDS:=sing-box \(>=' "$HP_MK"; then
-		echo "homeproxy: no '>= sing-box' EXTRA_DEPENDS constraint, no change"
-		return 0
-	fi
-
-	# 约束下限取同一 feed 内 sing-box 的实际版本
-	SBOX_MK=$(find . -maxdepth 3 -type f -path "*/sing-box/Makefile" 2>/dev/null | head -1)
-	if [ -n "$SBOX_MK" ]; then
-		SBOX_VER=$(grep -m1 -oP '^PKG_VERSION:=\K.*' "$SBOX_MK" | tr -d '[:space:]')
-	fi
-	# 版本串白名单：只允许数字/字母/点/下划线/连字符，避免脏数据进入 sed 表达式
-	case "$SBOX_VER" in
-		""|*[!0-9A-Za-z._-]*) SBOX_VER="1.15.0_alpha3" ;;
-	esac
-
-	CUR_VER=$(grep -m1 -oP '^LUCI_EXTRA_DEPENDS:=sing-box \(>=\K[^)]*' "$HP_MK")
-	CUR_MAIN=${CUR_VER%%[!0-9.]*}
-	SBOX_MAIN=${SBOX_VER%%[!0-9.]*}
-
-	# 判定「约束下限在 apk 语义下高于 feed 实际版本」——只有这种情况才需要下调，
-	# 其余一律不动，避免把已满足的约束收紧、或把语义写反。
-	NEEDS_ADJUST=""
-	if [ "$CUR_MAIN" = "$SBOX_MAIN" ]; then
-		# 主版本段相同：feed 版本带 pre-release 后缀（_alpha/_beta/_rc 等）而约束
-		# 要求正式版时，apk 判定为不满足（pre-release < 正式版）。
-		case "$SBOX_VER" in
-			*_*) case "$CUR_VER" in *_*) ;; *) NEEDS_ADJUST=1 ;; esac ;;
-		esac
-	elif [ "$(printf '%s\n%s\n' "$CUR_MAIN" "$SBOX_MAIN" | sort -V | tail -1)" = "$CUR_MAIN" ]; then
-		NEEDS_ADJUST=1
-	fi
-
-	if [ -z "$NEEDS_ADJUST" ]; then
-		echo "homeproxy: constraint (>= $CUR_VER) already satisfiable by feed sing-box $SBOX_VER, no change"
-		return 0
-	fi
-
-	sed -i -E "s/^(LUCI_EXTRA_DEPENDS:=sing-box \(>=)[^)]*(\))/\1${SBOX_VER}\2/" "$HP_MK"
-	echo "homeproxy: sing-box constraint (>= ${CUR_VER}) -> (>= ${SBOX_VER}) to match feed version"
-}
-FIX_HOMEPROXY_SINGBOX
 UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
 
 # FAN789 插件及其他专用硬件插件
 UPDATE_PACKAGE "luci-app-h5000m-fancontrol" "FAN789/luci-app-h5000m-fancontrol" "main"
-UPDATE_PACKAGE "luci-app-airpi-fancontrol" "LianXia233/luci-app-airpi3000m-fancontrol" "main" "all" "luci-app-airpi-fancontrol kmod-airpi-gpio-fan"
 
 # ===== MT5700M（方案 A）：luci-app-mt5700m monorepo 折叠 =====
 # luci-app-mt5700m 是两层 monorepo：仓库根没有 Makefile，真正可编译的包是
@@ -327,13 +275,20 @@ INSTALL_NET_TUNING() {
 
 	[ -d "$SRC_DIR" ] || { echo "net-tuning: $SRC_DIR 不存在，跳过"; return 0; }
 
-	mkdir -p "$DST_DIR/etc/uci-defaults" "$DST_DIR/etc/sysctl.d"
+	mkdir -p "$DST_DIR/etc/uci-defaults" "$DST_DIR/etc/sysctl.d" "$DST_DIR/etc/nftables.d"
 	cp -rf "$SRC_DIR/etc/." "$DST_DIR/etc/"
 	chmod 0755 "$DST_DIR/etc/uci-defaults/"* 2>/dev/null || true
 	# init.d 脚本必须带可执行位，否则 rc.common 不会执行它（git 不保存 exec 位，
 	# 所以必须在这一步补，不能依赖仓库里的文件权限）。
 	chmod 0755 "$DST_DIR/etc/init.d/"* 2>/dev/null || true
 	echo "net-tuning: 已注入 Files/etc → wrt/files/etc"
+
+	# P08：复制后无断言，调优脚本丢了没人知道（直接后果：刷完没网）。
+	# 缺失即明确失败，而不是静默带着不完整的覆盖层出固件。
+	[ -f "$DST_DIR/etc/uci-defaults/99-mt5700-net" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/uci-defaults/99-mt5700-net"; exit 1; }
+	[ -f "$DST_DIR/etc/uci-defaults/99-mt5700-wan" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/uci-defaults/99-mt5700-wan"; exit 1; }
+	# nft 规则文件缺失/损坏会让 fw4 加载失败 —— 后果是刷完直接没网，必须硬断言。
+	[ -f "$DST_DIR/etc/nftables.d/12-mangle-ttl-128.nft" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/nftables.d/12-mangle-ttl-128.nft"; exit 1; }
 }
 
 case "$MT_MODE" in
@@ -485,6 +440,15 @@ UPDATE_VERSION() {
 
 #UPDATE_VERSION "软件包名" "测试版，true，可选，默认为否"
 #UPDATE_VERSION "sing-box"
+
+# 防共享上网检测：kmod-rkp-ipid（改写 IP 头 ID 字段）
+# 来源 CHN-beta/rkp-ipid —— 仓库根目录本身就是 OpenWrt 内核包
+#   （KernelPackage/rkp-ipid，SUBMENU=Other modules），故不加 special 参数，
+#   克隆后目录名保持 rkp-ipid，配置符号为 CONFIG_PACKAGE_kmod-rkp-ipid。
+# ⚠️ 上游已 archived（最后提交 2020-10-21）。源码用的是 nf_register_net_hook /
+#   skb_ensure_writable / ip_fast_csum，6.x 内核仍在，但树外模块没有兼容性保证：
+#   若将来编不过，删掉本行与 GENERAL.txt 里的 CONFIG_PACKAGE_kmod-rkp-ipid=y 即可回退。
+UPDATE_PACKAGE "rkp-ipid" "CHN-beta/rkp-ipid" "master"
 
 # 网络调优：注入 Files/etc 下的 sysctl 与 uci-defaults（随固件打包，首次开机生效）
 INSTALL_NET_TUNING

@@ -16,21 +16,26 @@
 
 ### 新增
 
-1. **`Files/etc/init.d/mt5700-smp`** —— 四核均衡调度服务（每次开机运行）
+1. **`Files/etc/init.d/mt5700-smp`** —— 四核均衡调度服务（**备选方案，默认不启用**）
    - 中断轮询绑定到 CPU0..CPU3；RPS/XPS 摊到全核；关闭 GRO fraglist
    - **不硬编码 IRQ 号**：按 `/proc/interrupts` 的设备名动态匹配。
      mtk 闭源驱动常见 237/245，主线 mt76 是另一套，写死必然失效
 2. **`Files/etc/uci-defaults/99-mt5700-sys`** —— 首次开机配置
-   - zram 512M + 算法 `lzo`；无线 `isolate=0`；启用 `mt5700-smp`；NTP 换国内
+   - zram 512M + 算法 `lzo`；无线 `isolate=0`；**保持 irqbalance**、`mt5700-smp` 不启用（备选）；NTP 换国内
 3. **`Files/etc/sysctl.d/99-mt5700-lan.conf`** —— `proxy_arp_pvlan=1`
+4. **`Files/etc/nftables.d/12-mangle-ttl-128.nft`** —— WAN 侧出包 TTL / Hop Limit 统一为 128
+   （防共享上网检测，见文末专节）
 
 ### 变更
 
-- `Files/etc/uci-defaults/99-mt5700-net`：irqbalance 由**启用改为停用**（与静态亲和互斥，两者只能留一个）
+- `Files/etc/uci-defaults/99-mt5700-net`：irqbalance **保持启用**（与 packet steering 配套＝四核均摊）；
+  静态中断绑定的 `mt5700-smp` 作备选、**默认不启用**（两者都写 `smp_affinity`，互斥）
 - `Scripts/Packages.sh`：`INSTALL_NET_TUNING()` 补 `chmod 0755 etc/init.d/*`
   （git 不保存 exec 位，不补则 init 脚本开机不会被执行）
 - `Config/GENERAL.txt`：`CONFIG_PACKAGE_zram-swap=y`
 - `.github/workflows/WRT-CORE.yml`：关键包自检加入 `zram-swap`
+- `Scripts/Packages.sh`：`INSTALL_NET_TUNING()` 注入后新增 `.nft` 缺失硬断言
+  （`.nft` 语法错 → fw4 加载失败 → 刷完没网，不能静默放过）
 
 ### 两个易踩的坑（已规避，勿改回）
 
@@ -42,6 +47,48 @@
 2. **压缩算法固定 `lzo`** —— OpenWrt 的 `zram.init` 注释明写
    "default to lzo, which is always available"，这是唯一保证存在的算法。
    `lzo-rle` / `zstd` 需先 `cat /sys/block/zram0/comp_algorithm` 确认内核支持。
+
+### 新增：WAN 侧出包 TTL 统一（防共享上网检测）
+
+来源：[《OpenWrt 预防校园网多设备检测配置》](https://www.cnblogs.com/z-addone/p/19855795)。
+不同系统的初始 TTL 不同（Windows 128 / Linux·Android 64），逐跳递减后出口侧会同时出现
+63/64/127/128 等多种值，DPI 据此判定「出口后面挂了多台设备」。5G CPE 共享上网属同一类检测。
+
+新增 `Files/etc/nftables.d/12-mangle-ttl-128.nft`：
+`type filter hook postrouting priority 300` + `oifname $wan_devices ip ttl set 128`。
+
+**没有照抄原方案的两处**：
+
+1. **接口名不能用 `"wan"`** —— 原方案是 x86 软路由的习惯命名。本机 `fw4 print` 实测
+   `define wan_devices = { "eth1", "eth2" }`（eth1 有线 WAN、eth2 5G 模组），写死 `"wan"`
+   一条都匹配不上、规则会静默失效，故改用 fw4 生成的 `$wan_devices` 宏。
+   宏可见是因为 `include "/etc/nftables.d/*.nft"` 位于 `table inet fw4` 内且在 define 之后；
+   已在真机 `fw4 print | nft -c -f -` 校验通过（只检查语法，未加载、未重启防火墙）。
+   ⚠️ `nft list ruleset` **看不到** define（宏已展开），验证宏必须用 `fw4 print`。
+2. **128 这个值没有厂家参考值可抄** —— 参考固件的 `/etc/config/firewall` 里有
+   `config include 'qmodem_ttl'` 指向 `/etc/firewall.d/qmodem_ttl`，但该文件不存在
+   （`fw4 print` 报 `unreachable path ... ignoring`），厂家的 TTL 功能实际未生效。
+
+**两个已知前提（待拍板，未擅自处理）**：
+
+- 与默认开启的**软件 flow offload 冲突**：快转连接绕过 nftables（与 UA2F 必须关卸载同理）。
+  要 TTL 稳定生效需关 `flow_offloading`，代价是失去软件卸载加速，二者只能选一个。
+- **5G 侧（eth2）效果未验证**：参考固件 `wan_subnets = 100.0.0.0/8` 是 CGNAT，模组自身还做一层
+  NAT；路由器改完的 TTL 会不会被模组重建 IP 头时重置，需抓包确认。eth1 有线 WAN 一定生效。
+
+**顺带加的编译项**：`kmod-rkp-ipid`（IPID 改写）——
+`Config/GENERAL.txt` 加 `CONFIG_PACKAGE_kmod-rkp-ipid=y`，
+`Scripts/Packages.sh` 加 `UPDATE_PACKAGE "rkp-ipid" "CHN-beta/rkp-ipid" "master"`。
+来源仓库 `CHN-beta/rkp-ipid` 根目录就是 OpenWrt 内核包（菜单位置
+Kernel modules → Other modules），符号为 `CONFIG_PACKAGE_kmod-rkp-ipid`。
+
+⚠️ 两条如实说明：
+- 该模块只处理带 `mark 0x10`（`mark_capture` 模块参数）的包，**装上默认不改写任何流量**，
+  要生效还需一条给出方向包打 mark 的防火墙规则，本仓库未加。
+- 上游已 archived（最后提交 2020-10-21）。源码用的是 `nf_register_net_hook` /
+  `skb_ensure_writable` / `ip_fast_csum`，6.x 内核仍在，但树外模块无兼容性保证。
+
+UA2F 按「只加编译项」的要求**未加**。
 
 ### 未做：mtkhnat 的 s2s（内网到内网转发）
 
@@ -77,6 +124,87 @@ zram init 探测命中 /etc/init.d/zram
 ```
 
 `sh -n` 语法检查：`mt5700-smp`、`99-mt5700-sys`、`99-mt5700-net` 全部通过。
+## [2026-09-19] 三条硬需求落地（flow offload 可见配置 / sing-box 断言 / 产物保留 sha256sums）
+
+对应 Orchestrator 提案（proposer）P01–P20。取舍与未采纳项见 `FIRMWARE_OPTIMIZATION_REPORT.md`。
+
+### flow offload 可见配置（P01/P02/P03）
+- 新增 `Scripts/ApplyFlowOffload.sh`：构建期把 `WRT_FLOW_OFFLOAD`（auto/off/on/on-hw，默认 auto）写入固件覆盖层
+  `wrt/files/etc/mt5700/flow-offload`；非法值编译期 `::error::` + `exit 1`。
+- `WRT-CORE.yml` 新增 `WRT_FLOW_OFFLOAD` input（默认 auto，保证老调用方不传也能跑）+ env；`WRT-BUILD.yml` /
+  `H5000M-MT-AUTO.yml` 增加 `FLOW_OFFLOAD` 选项并透传。
+- `Files/etc/uci-defaults/99-mt5700-net` 读取 `/etc/mt5700/flow-offload` 决策矩阵（auto+SQM关→软卸载；
+  auto+SQM开→关；off→关；on→软；on-hw→软+硬），SQM 扫描永远执行（红线2 互斥判定保留）。
+- 默认文件 `Files/etc/mt5700/flow-offload`（MODE=auto）保证脚本不跑时也是 auto。
+- `Config/GENERAL.txt` 显式 `CONFIG_PACKAGE_luci-app-firewall=y`，确保「页面上改」的防火墙页存在。
+
+### sing-box 彻底不编（P04/P05）
+- `Config/GENERAL.txt` 显式写死 `CONFIG_PACKAGE_sing-box=n` / `luci-app-homeproxy=n` / `luci-i18n-homeproxy-zh-cn=n`
+  （沿用既有 =n 风格，而非只留注释），防将来被别的包反向依赖拉回。
+- 新增 `Scripts/VerifyNoSingBox.sh` 做编译前（.config）+ 编译后（manifest）两道硬断言；`WRT-CORE.yml` 在
+  `make defconfig` 后加 `pre` 步骤、在产物 manifest 读取后（iregex 删除前）加 `post` 步骤。
+- 口径：硬需求「sing-box 内核彻底不编」指的是**不进固件**；`VerifyNoSingBox(post)` 只查 `bin/targets/*/*.manifest`
+  （最终进固件的包清单），`bin/packages` 下的 ipk 仓库不在断言范围内（pre 阶段的 `viking` 克隆树清理见 `Packages.sh` P06）。
+
+### 产物与健壮性（P09/P10/P15/P16 等）
+- 产物保留 `sha256sums`（P10）：`WRT-CORE.yml` 的 iregex 删除规则去掉 `sha256sums`。
+- `WRT_TARGET` / 产物改名 `NAME` 取值失败即 `::error::` + `exit 1`（P09）。
+- 初始化脚本 `curl` 失败不再静默成功（P15）。
+
+## [2026-09-19] 软件页安装默认允许未签名包
+
+- `Handles.sh` 新增一段：给 `luci-app-package-manager` 的 `/usr/libexec/package-manager-call`
+  在 **install**（apk 下映射为 `add`）时默认追加 `--allow-untrusted`，
+  最终命令形如 `apk --allow-untrusted add <pkg>`
+- 动机：自编译出来的 apk 不带仓库签名，原先在「系统 → 软件」页点安装会被签名校验挡下，
+  错误信息只有一句 untrusted
+- **只改后端脚本**：前端 `package-manager.js` 不管传什么参数都会被脚本参数解析的
+  `-*)` 分支 shift 丢弃（apk 分支只认 `--force-removal-of-dependent-packages` 与
+  `--force-overwrite`），改前端无效
+- 追加到 `cmd` 而非 `$@`：`--allow-untrusted` 是 apk 的全局选项，放在子命令前才一定生效
+- 仅作用于 apk 的 `add`：opkg 默认不校验包签名故不加；`update` / `upgrade` / `remove` 保持原样
+- 幂等：文件已含 `allow-untrusted` 时跳过，重复执行不会叠加
+
+### 其它
+- `WRT-BUILD` 的 `TEST` 默认值由 `true` 改为 `false`：手动触发通常就是要出固件，
+  默认的 `true` 只生成 `.config`，跑完没产物容易误以为失败（README 同步）
+## [2026-09-18] 收敛为 H5000M 单产物 + 网络加速 / 稳定性优化
+
+只保留 `H5000M-WIFI-YES-MT5700-immortalwrt-master` 一套产物，并按真机实测重排加速策略。
+完整取舍与未采纳项见 `FIRMWARE_OPTIMIZATION_REPORT.md`。
+
+### 产物收敛
+- 删除 `AP3000M-MT-AUTO.yml` / `X86-MT-AUTO.yml` 及 `Config/AP3000M.txt`、`Config/X86.txt`、`Config/MT5700M.txt`
+- 删除 `AP3000M-EEPROM/`、`Scripts/inject_airpi_prebuilt.py`、`Scripts/homeproxy/`、`Scripts/patches/dockerd/`
+- `WRT-CORE.yml` 删除 AP3000M 专用的 Rust 预编译步骤（省 1.5~3 小时机时）
+- `WRT-BUILD.yml` 机型/源码/MT 模式选项各收敛为一项
+- `Handles.sh` 删除四段死代码：HomeProxy 资源预置 + ucode 修复、aurora 样式、AP3000M EEPROM、dockerd 修补
+- `Packages.sh` 去掉 aurora 克隆、HomeProxy 版本约束改写、airpi 克隆
+- MT5700M 分支在 ApplyMTMode / VerifyMTMode 中保留为守卫：配置已删，误选会明确报错终止
+
+### 版本标识
+- 新增 `WRT_MARK`（默认 `OWrt`），状态页尾缀由 `woshinibabao1-…` 改为 `OWrt-…`
+
+### 插件
+- 装：`luci-theme-argon` + `luci-app-argon-config` + 中文包、`luci-app-openclash` + 中文包
+- 装：`dnsmasq-full`（OpenClash 的 nftset/ipset 分流依赖它，替换默认 dnsmasq）
+- **补回** `luci-app-mosdns`：真机在用但配方已丢，不补回来下次刷机即功能回退
+- 卸：homeproxy / easytier / gecoosac / wolultra / samba4 / upnp / aurora（主题 + 配置页）
+- 卸：`sing-box`（HomeProxy 走后成孤儿，只剩内核无界面）
+
+### 加速与稳定性（真机实测依据，见报告第一节）
+- **默认开启软件 flow offload**：原先无条件关闭。改为「SQM 未启用则开、启用则关」，
+  二者互斥（被卸载的连接绕过 qdisc，CAKE/HTB 会失效）
+- 硬件卸载（`flow_offloading_hw`）保持关闭：本基线无 `mtk_wed`，5G WAN 又是 USB CDC-NCM，
+  PPE 管不到，开了命中率≈0 且会让 nft 计数器看不到流量
+- 首次开机脚本显式兜底 packet steering
+- sysctl 补三项：TCP Fast Open、`somaxconn`/`tcp_max_syn_backlog` 1024、`rp_filter=0`（双出口非对称路由）
+- `Config/GENERAL.txt` 显式声明 `kmod-nf-flow`、`kmod-crypto-hw-safexcel`
+
+### 未采纳（避免负优化，理由详见报告第三节）
+- turboacc / SFE / shortcut-fe：与 nf_flow_table 抢 hook，6.18 + Filogic 上编不过或随机断流
+- `mtk_hnat`：mtk-openwrt-feeds 树外驱动，本基线无此 .ko，且与主线 PPE 抢同一张硬件表
+- WED / zram / backlog 放大 / 锁频：均需真机验证或有明确负收益
 
 ## [2026-09-15] 修复 luci-app-homeproxy 的 sing-box 版本约束导致的构建失败
 

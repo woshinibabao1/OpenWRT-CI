@@ -8,8 +8,14 @@
 # 做法：
 #   1) 把相关中断按轮询绑定到 CPU0..CPU3，保证每核都有活干；
 #   2) 给所有网络接口设 RPS/XPS，把软中断摊到全部核；
-#   3) 关 irqbalance：它按自己的拓扑模型改写 smp_affinity，在本机 ARM 上
-#      实测并不能把中断摊平，反而会覆盖掉上面的静态绑定。二者只能留一个。
+#   3) 与 irqbalance 互斥：两者都写 /proc/irq/*/smp_affinity，同时开会互相覆盖。
+#
+# ⚠️ 本服务默认**不启用**。固件默认的四核均摊走 irqbalance（硬件中断）
+#   + packet steering（收包软中断）组合，见 99-mt5700-net 第 3/4 节。
+#   只有在你实测确认 irqbalance 摊不平、想强制静态均分时再手动切换：
+#     /etc/init.d/irqbalance disable && /etc/init.d/irqbalance stop
+#     /etc/init.d/mt5700-smp    enable && /etc/init.d/mt5700-smp    start
+#   本脚本启动时会自动替你停掉 irqbalance（互斥），stop 后需自行恢复。
 #
 # ⚠️ 不硬编码 IRQ 号：不同驱动中断号完全不同（mtk 闭源驱动常见 237/245，
 #   主线 mt76 是另一套），这里按 /proc/interrupts 里的设备名动态匹配。
@@ -104,7 +110,7 @@ start() {
 	if [ -x /etc/init.d/irqbalance ]; then
 		/etc/init.d/irqbalance stop 2>/dev/null
 		/etc/init.d/irqbalance disable 2>/dev/null
-		log "已停用 irqbalance（与静态亲和互斥）"
+		log "已停用 irqbalance（两者都写 smp_affinity，互相覆盖）"
 	fi
 
 	irq_n="$(apply_affinity "$ncpu")"

@@ -14,17 +14,13 @@ on:
         type: choice
         options:
           - H5000M-WIFI-YES
-          - AP3000M
-          - X86
       SOURCE:
         description: '源码仓库'
         default: 'immortalwrt/immortalwrt'
         required: true
         type: choice
         options:
-          - VIKINGYFY/immortalwrt
           - immortalwrt/immortalwrt
-          - LiBwrt/openwrt-6.x
       BRANCH:
         description: '源码分支'
         default: 'master'
@@ -35,21 +31,33 @@ on:
         required: false
         type: string
       MT_MODE:
-        description: 'MT 插件模式（二选一，留空则不安装任何 MT 插件）'
+        description: 'MT 插件模式'
         default: 'MT5700'
         required: true
         type: choice
         options:
           - MT5700
-          - MT5700M
-          - NONE
+      FLOW_OFFLOAD:
+        description: 'Flow Offload 选型（auto 默认：SQM 未启用时开软件卸载）'
+        default: 'auto'
+        required: false
+        type: choice
+        options:
+          - auto
+          - off
+          - on
+          - on-hw
       TEST:
         description: '仅生成配置文件，不编译固件。'
-        default: 'true'
+        # 2026-09-19 改为默认 false：手动触发本工作流的意图通常就是要出固件，
+        # 默认的 true 只会生成 .config，容易让人以为「跑完了但没产物」。
+        # 只想校验配置时手动勾选 true 即可。
+        default: 'false'
         required: true
         type: boolean
 
-permissions: write-all
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -57,7 +65,8 @@ jobs:
     uses: ./.github/workflows/WRT-CORE.yml
     with:
       WRT_CONFIG: ${{inputs.CONFIG}}
-      WRT_THEME: aurora
+      WRT_THEME: argon
+      WRT_MARK: OWrt
       WRT_NAME: OWRT
       WRT_SSID: OWRT
       WRT_WORD: 12345678
@@ -68,7 +77,8 @@ jobs:
       WRT_SOURCE: ${{inputs.SOURCE}}
       WRT_PACKAGE: ${{inputs.PACKAGE}}
       WRT_TEST: ${{inputs.TEST}}
-      # NONE / 其他 → 空字符串（不安装任何 MT 插件）
-      # 注意：GHA 表达式中空字符串为 falsy，不能写成 `cond && '' || x`，
-      # 必须用显式三元链保证 NONE 时最终得到空值。
-      MT_MODE: ${{ inputs.MT_MODE == 'MT5700' && 'MT5700' || (inputs.MT_MODE == 'MT5700M' && 'MT5700M' || '') }}
+      # Flow Offload 选型透传（默认 auto，与 H5000M-MT-AUTO 的 workflow_run 路径行为一致）
+      WRT_FLOW_OFFLOAD: ${{inputs.FLOW_OFFLOAD}}
+      # 唯一保留的 MT 模式：MT5700（woshinibabao1/MT5700-Console 单包方案）。
+      # MT5700M 已停用（依赖 sms-tool_q 版本号对 apk 非法，且功能重复）。
+      MT_MODE: MT5700

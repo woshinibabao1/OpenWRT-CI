@@ -1,0 +1,47 @@
+## 统一 WAN 侧出方向 TTL / Hop Limit —— 防「多设备共享上网」检测
+##
+## 原理：不同操作系统的初始 TTL 不同（Windows 128、Linux/Android 64、macOS 64），
+## 逐跳递减后在出口侧会同时出现 63/64/127/128 等多种值。DPI 据此判定
+## 「同一出口后面挂了多台设备」。在 postrouting 统一改写成一个定值，
+## 所有出包看起来都来自同一台设备。
+##
+## 参考：《OpenWrt 预防校园网多设备检测配置》
+##   https://www.cnblogs.com/z-addone/p/19855795
+##   （原方案针对校园网锐捷/深信服 DPI；5G CPE 共享上网是同一类检测，同样适用）
+##
+## ── 为什么用 $wan_devices 而不是写死接口名 ────────────────────────────
+## 原方案写的是 oifname "wan" / "pppoe-wan"，那是 x86 软路由的习惯命名。
+## 本机（H5000M）实测 `fw4 print`：
+##     define wan_devices = { "eth1", "eth2" }
+##   eth1 = 有线 WAN 口，eth2 = 5G 模组（USB CDC-NCM）
+## 写死 "wan" 在这里一条都匹配不上，规则会静默失效。
+## $wan_devices 由 fw4 按防火墙 zone 生成，换接口、换固件都不会失效。
+##
+## ── 为什么这个文件能引用到 $wan_devices ──────────────────────────────
+## /etc/nftables.d/README：本目录下所有 *.nft 由 fw4 在 `inet fw4` 表内 include，
+## 而 include 指令（实测位于 define 之后）与 define 处于同一解析单元，宏可见。
+## 已在真机用 `fw4 print | nft -c -f -` 校验通过（RC=0）。
+##
+## ── priority 300 的含义 ──────────────────────────────────────────────
+## 必须在 postrouting（路由决策之后），否则取不到真实出接口 oifname。
+## 300 大于 fw4 的 srcnat（nat 类型，priority 100），保证在 SNAT 之后再改 TTL，
+## 不会干扰 nat 链里的接口判定。
+##
+## ── 两个已知前提（不是猜的，是本机实测/既有策略）─────────────────────
+## 1. **开了 flow offload 时本规则对快转连接不生效。**
+##    软件/硬件卸载把连接从 nftables 路径上摘走（与 UA2F 必须关卸载同理）。
+##    本固件 auto 模式下 SQM 未启用时会开软件卸载 —— 若要 TTL 统一稳定生效，
+##    需在「网络 → 防火墙 → 常规设置」关闭路由/NAT 卸载，
+##    或 `uci set firewall.@defaults[0].flow_offloading=0 && uci commit firewall`。
+## 2. **5G 模组（eth2）自身会再做一层 NAT**（实测 wan_subnets = 100.0.0.0/8，
+##    是 CGNAT 地址段）。路由器这侧改完的 TTL 会不会被模组重新生成 IP 头时
+##    重置，取决于模组固件行为，需抓包确认；有线 WAN（eth1）一定生效。
+##
+## 验证：`nft list ruleset | grep -A 5 mangle_ttl_unify`
+## 回滚：删掉本文件后 `service firewall restart`
+
+chain mangle_ttl_unify {
+	type filter hook postrouting priority 300; policy accept;
+	oifname $wan_devices ip ttl set 128
+	oifname $wan_devices ip6 hoplimit set 128
+}

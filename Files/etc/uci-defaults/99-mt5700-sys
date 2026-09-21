@@ -11,9 +11,11 @@
 # zram 本身就是「内存压缩」：把不活跃页压缩后仍留在 RAM 里，
 # 比写磁盘快几个数量级；H5000M 是 eMMC，频繁写 swap 还会缩短寿命，zram 完全避开。
 #
-# 算法 lzo-rle：速度与压缩率的平衡点。内核不支持时 /etc/init.d/zram-swap
-# 会自动回退到 lzo（参考固件就是 lzo）。想要更高压缩率可改成 zstd，
-# 代价是压缩/解压更吃 CPU —— 改 /etc/config/system 的 zram_comp_algo 即可。
+# 算法固定 lzo：OpenWrt 的 zram.init 注释明写 "default to lzo, which is always
+#   available"，这是唯一保证内核一定支持的算法，不写死就有开机失败的风险。
+#   想要更高压缩率可改 zstd，代价是压缩/解压更吃 CPU ——
+#   改 /etc/config/system 的 zram_comp_algo 即可，改之前先
+#   cat /sys/block/zram0/comp_algorithm 确认该算法在内核里真的存在。
 #
 # 注意：zram 上限是「压缩后的数据上限」，实际占用的物理内存约为此值的
 # 1/2 ~ 1/3，并不会真的吃掉 512M 物理内存。
@@ -51,11 +53,17 @@ for SECTION in $(uci -q show wireless | awk -F= '$2 == "wifi-iface" { print $1 }
 done
 uci -q commit wireless
 
-# ---------- 3. 启用四核均衡调度 ----------
-# 真正的活由 /etc/init.d/mt5700-smp 每次开机做（中断亲和 + RPS/XPS），
-# 这里只负责把它设为开机自启。
+# ---------- 3. 四核均衡调度：走 irqbalance，不启用 mt5700-smp ----------
+# 默认方案是 irqbalance（硬件中断亲和）+ packet steering（收包软中断 RPS），
+#   在 99-mt5700-net 里配置，两者合起来就是「四核平均分」。
+# /etc/init.d/mt5700-smp 是**静态**中断轮询绑定的备选方案，与 irqbalance 互斥
+#   （两者都写 /proc/irq/*/smp_affinity），故这里**不**设为开机自启，
+#   并显式 disable 一次，防止被别的模板或手工改动打开。
+# 只有实测确认 irqbalance 摊不平、想强制均分时再手动切换：
+#   /etc/init.d/irqbalance disable && /etc/init.d/irqbalance stop
+#   /etc/init.d/mt5700-smp    enable && /etc/init.d/mt5700-smp    start
 if [ -x /etc/init.d/mt5700-smp ]; then
-	/etc/init.d/mt5700-smp enable
+	/etc/init.d/mt5700-smp disable 2>/dev/null || true
 fi
 
 # ---------- 4. NTP 换成国内服务器 ----------
