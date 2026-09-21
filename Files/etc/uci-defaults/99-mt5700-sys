@@ -53,17 +53,26 @@ for SECTION in $(uci -q show wireless | awk -F= '$2 == "wifi-iface" { print $1 }
 done
 uci -q commit wireless
 
-# ---------- 3. 四核均衡调度：走 irqbalance，不启用 mt5700-smp ----------
-# 默认方案是 irqbalance（硬件中断亲和）+ packet steering（收包软中断 RPS），
-#   在 99-mt5700-net 里配置，两者合起来就是「四核平均分」。
-# /etc/init.d/mt5700-smp 是**静态**中断轮询绑定的备选方案，与 irqbalance 互斥
-#   （两者都写 /proc/irq/*/smp_affinity），故这里**不**设为开机自启，
-#   并显式 disable 一次，防止被别的模板或手工改动打开。
-# 只有实测确认 irqbalance 摊不平、想强制均分时再手动切换：
-#   /etc/init.d/irqbalance disable && /etc/init.d/irqbalance stop
-#   /etc/init.d/mt5700-smp    enable && /etc/init.d/mt5700-smp    start
+# ---------- 3. 四核均衡调度：启用 mt5700-smp（静态中断亲和）----------
+# 为什么不用 irqbalance（2026-09-21 真机实测）：
+#   irqbalance 全程只动了以太网的两个中断（67→CPU1、68→CPU3），对负载最大的
+#   无线（IRQ 79，186 万次）与 USB 5G 模组（IRQ 74，10 万次）**毫无作为** ——
+#   它们的 smp_affinity 一直是 f（全核掩码），但计数 100% 落在 CPU0。
+# mt5700-smp 按中断负载贪心分配到最轻的核，实测结果：
+#   CPU0=无线 IRQ79、CPU1=USB/5G IRQ74、CPU2=eth IRQ68、CPU3=eth IRQ67
+#   —— 四核都有活干，不再是「一核干活三核围观」。
+#
+# ⚠️ 两个必须知道的边界：
+#   1. 与 irqbalance 互斥（都写 /proc/irq/*/smp_affinity），
+#      本服务启动时会自动停用 irqbalance，无需另外操作。
+#   2. **IRQ 79（无线 mt7996e）的亲和不可写**：echo 到 smp_affinity 返回 RC=1，
+#      affinity_hint=0、effective_affinity=0，停掉 irqbalance 后重试同样失败
+#      —— PCIe MSI 在驱动层没实现 irq_set_affinity，属硬件/驱动限制。
+#      所以做不到「完全均分」，CPU0 注定要扛无线硬中断；
+#      收包软中断那一半由 mt5700-rps 避开 CPU0 来补偿（见该文件注释）。
 if [ -x /etc/init.d/mt5700-smp ]; then
-	/etc/init.d/mt5700-smp disable 2>/dev/null || true
+	/etc/init.d/mt5700-smp enable 2>/dev/null || true
+	logger -t mt5700-sys "已启用 mt5700-smp（静态中断亲和，替代 irqbalance）"
 fi
 
 # ---------- 4. NTP 换成国内服务器 ----------

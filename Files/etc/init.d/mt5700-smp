@@ -1,24 +1,29 @@
 #!/bin/sh /etc/rc.common
 # SPDX-License-Identifier: MIT
-# H5000M / MT7987A 四核均衡调度（"让四核平均分，不偷懒"）
+# H5000M / MT7987A 硬中断亲和：把「能搬的」中断按负载贪心分摊到四个核
 #
-# 背景（实测）：无线（mt7992/BE5040 一类）与 USB 5G 模组的中断默认几乎全压 CPU0，
-#   其余三核计数长期为 0；高吞吐时单核先打满，整机提前降速。
+# ── 为什么不直接交给 irqbalance（2026-09-21 真机实测）────────────────────
+#   * irqbalance 全程只动了以太网的两个中断（67→CPU1、68→CPU3）；
+#     无线 mt7996e（IRQ 79）与 USB 5G 模组（IRQ 74）它一个都没碰。
+#   * IRQ 79 / 74 的 smp_affinity 一直是 f（全核掩码），但计数 100% 落在 CPU0。
+#     ★ 关键认知：**多核掩码 ≠ 分摊**。单条 MSI 中断每次仍由内核选定的一个核
+#       响应，实测就是固定 CPU0。要让它离开 CPU0，只能写成**单核**掩码。
+#   * 手工验证（真机）：
+#       IRQ 74  echo 4 > /proc/irq/74/smp_affinity  → 成功，计数真的搬到 CPU2
+#       IRQ 79  echo 8 > /proc/irq/79/smp_affinity  → **RC=1 写不进去**，读回仍是 f，
+#               affinity_hint=0、effective_affinity=0；停掉 irqbalance 后重试同样失败。
+#               ＝ PCIe MSI 在驱动层没实现 irq_set_affinity，属硬件/驱动限制，谁都改不动。
 #
-# 做法：
-#   1) 把相关中断按轮询绑定到 CPU0..CPU3，保证每核都有活干；
-#   2) 给所有网络接口设 RPS/XPS，把软中断摊到全部核；
-#   3) 与 irqbalance 互斥：两者都写 /proc/irq/*/smp_affinity，同时开会互相覆盖。
+# ── 所以本脚本做的事 ────────────────────────────────────────────────────
+#   把**能搬**的中断（74 等）搬到 CPU0 之外的核，让 CPU0 专心扛搬不走的无线中断。
+#   这是当前硬件条件下能拿到的最好结果 —— 做不到「四核完全均分」，
+#   因为占总中断量 95% 以上的 IRQ 79 无法迁移。
 #
-# ⚠️ 本服务默认**不启用**。固件默认的四核均摊走 irqbalance（硬件中断）
-#   + packet steering（收包软中断）组合，见 99-mt5700-net 第 3/4 节。
-#   只有在你实测确认 irqbalance 摊不平、想强制静态均分时再手动切换：
-#     /etc/init.d/irqbalance disable && /etc/init.d/irqbalance stop
-#     /etc/init.d/mt5700-smp    enable && /etc/init.d/mt5700-smp    start
-#   本脚本启动时会自动替你停掉 irqbalance（互斥），stop 后需自行恢复。
-#
-# ⚠️ 不硬编码 IRQ 号：不同驱动中断号完全不同（mtk 闭源驱动常见 237/245，
-#   主线 mt76 是另一套），这里按 /proc/interrupts 里的设备名动态匹配。
+# ── 边界 ────────────────────────────────────────────────────────────────
+#   * 与 irqbalance 互斥（都写 /proc/irq/*/smp_affinity），启动时自动停用 irqbalance。
+#   * 软中断（RPS/XPS）**不归本脚本管**，见 /etc/init.d/mt5700-rps ——
+#     曾经在这里写过，结果 stop() 会把 rps_cpus 清零，等于把 mt5700-rps 的成果抹掉。
+#   * 不硬编码 IRQ 号：按 /proc/interrupts 里的设备名动态匹配。
 #
 # 回滚：/etc/init.d/mt5700-smp disable && /etc/init.d/mt5700-smp stop
 #       再 /etc/init.d/irqbalance enable && /etc/init.d/irqbalance start
@@ -32,6 +37,8 @@ IRQ_MATCH='eth|mt76|mt79|mt798|wifi|wlan|phy[0-9]|xhci|usb|hnat|wed|pcie|qdma|ra
 # 不碰的中断：时钟/定时器/IPI 交给内核自己管，乱绑会拖垮调度
 IRQ_SKIP='arch_timer|arch_mem_timer|timer|IPI|reschedule|function|cpu-boost|gtimer'
 
+TMP_IRQS='/tmp/.mt5700-smp-irqs'
+
 log() {
 	logger -t mt5700-smp "$1"
 }
@@ -40,52 +47,14 @@ ncpu_get() {
 	grep -c '^processor' /proc/cpuinfo
 }
 
-# 全核掩码的十六进制形式（4 核 -> f）
 mask_all() {
-	local n="$1"
-	printf '%x' $(( (1 << n) - 1 ))
+	printf '%x' $(( (1 << $1) - 1 ))
 }
 
-# 列出待均衡的中断号
-list_irqs() {
-	awk -v m="$IRQ_MATCH" -v s="$IRQ_SKIP" '
-		$1 ~ /^[0-9]+:$/ {
-			irq = $1
-			sub(/:$/, "", irq)
-			if ($0 ~ s) next
-			if ($0 ~ m) print irq
-		}' /proc/interrupts
-}
-
-apply_affinity() {
-	local ncpu="$1"
-	local i=0 irq cpu
-	for irq in $(list_irqs); do
-		cpu=$(( i % ncpu ))
-		printf '%x' $(( 1 << cpu )) > "/proc/irq/$irq/smp_affinity" 2>/dev/null
-		i=$(( i + 1 ))
-	done
-	echo "$i"
-}
-
-apply_rps() {
-	local mask="$1"
-	local n=0 d q
-	for d in /sys/class/net/*/queues; do
-		[ -d "$d" ] || continue
-		for q in "$d"/rx-*; do
-			[ -e "$q/rps_cpus" ] || continue
-			echo "$mask" > "$q/rps_cpus" 2>/dev/null && n=$(( n + 1 ))
-		done
-		for q in "$d"/tx-*; do
-			[ -e "$q/xps_cpus" ] || continue
-			echo "$mask" > "$q/xps_cpus" 2>/dev/null
-		done
-	done
-	echo "$n"
-}
-
-# 关闭 GRO fraglist：mtk 原厂 smp 脚本也这么做，能抬高软件转发峰值
+# 关闭 GRO fraglist：提升软件转发路径的峰值吞吐。
+# 依据：厂家实现（higowrt 固件 /sbin/smp.sh 的 disable_gro_fraglist）原样这么做，
+#   其注释为 "Improve SW path peak throughput by disabling the GRO fraglist feature"。
+# 之前因"本机未实测过收益"而移除，现补回 —— 有厂家依据，且失败时静默跳过。
 disable_gro_fraglist() {
 	command -v ethtool >/dev/null 2>&1 || return 0
 	local d
@@ -97,45 +66,123 @@ disable_gro_fraglist() {
 	done
 }
 
+# 输出 "<irq> <总计数> <当前实际所在核>"，按总计数降序
+# 第 3 列用途：写不进去的中断，其负载要记到它实际所在的核上（否则贪心会算错）
+list_irqs_sorted() {
+	local awk_out
+	awk -v ncpu="$1" -v m="$IRQ_MATCH" -v s="$IRQ_SKIP" '
+		$1 ~ /^[0-9]+:$/ {
+			irq = $1; sub(/:$/, "", irq)
+			if ($0 ~ s) next
+			if ($0 ~ m) {
+				tot = 0; dom = 0; best = -1
+				for (i = 0; i < ncpu; i++) {
+					v = $(i + 2) + 0
+					tot += v
+					if (v > best) { best = v; dom = i }
+				}
+				printf "%s %d %d\n", irq, tot, dom
+			}
+		}' /proc/interrupts > "$TMP_IRQS"
+
+	if command -v sort >/dev/null 2>&1; then
+		# ⚠️ 两个 busybox 坑（都是实测踩出来的）：
+		#   ① 不支持 "-k2,2nr" 连写（会静默不排序），必须拆成独立参数；
+		#   ② 不能用 -o 写回同一个文件（结果会跑到 stdout，源文件保持未排序）。
+		#      不排序会退化成 /proc/interrupts 原始行序，负载最大的中断反而最后处理。
+		sort -k2 -n -r "$TMP_IRQS" > "${TMP_IRQS}.s" 2>/dev/null && \
+			mv "${TMP_IRQS}.s" "$TMP_IRQS"
+	fi
+}
+
+# 取当前累计负载最小的核（贪心）
+pick_lightest() {
+	local ncpu="$1" i best bv v
+	best=0
+	eval "bv=\$l0"
+	i=1
+	while [ "$i" -lt "$ncpu" ]; do
+		eval "v=\$l$i"
+		if [ "$v" -lt "$bv" ]; then bv="$v"; best="$i"; fi
+		i=$(( i + 1 ))
+	done
+	echo "$best"
+}
+
+add_load() {
+	local cpu="$1" add="$2" cur
+	eval "cur=\$l$cpu"
+	eval "l$cpu=\$(( cur + add ))"
+}
+
+# 返回 0 表示写入被内核接受（读回值 == 期望值）
+# ⚠️ 不能只 2>/dev/null 了事：IRQ 79 那种「写入返回失败但脚本看不出来」的情况，
+#    会让日志显示「已均衡 5 个中断」而实际一个都没动。
+write_affinity() {
+	local irq="$1" want="$2" rb
+	printf '%s' "$want" > "/proc/irq/$irq/smp_affinity" 2>/dev/null || return 1
+	rb=$(cat "/proc/irq/$irq/smp_affinity" 2>/dev/null | tr -d ',' | sed 's/^0*//')
+	[ "$rb" = "$want" ] || return 1
+	return 0
+}
+
 start() {
-	local ncpu mask irq_n rps_n
+	local ncpu mask i irq tot dom cpu want ok_n skip_n
 	ncpu="$(ncpu_get)"
 	if [ "$ncpu" -lt 2 ]; then
 		log "CPU 数=$ncpu，无需均衡，跳过"
 		return 0
 	fi
-	mask="$(mask_all "$ncpu")"
 
-	# irqbalance 与本脚本互斥，留本脚本
+	# 各核负载累加器清零
+	i=0
+	while [ "$i" -lt "$ncpu" ]; do
+		eval "l$i=0"
+		i=$(( i + 1 ))
+	done
+
 	if [ -x /etc/init.d/irqbalance ]; then
 		/etc/init.d/irqbalance stop 2>/dev/null
 		/etc/init.d/irqbalance disable 2>/dev/null
 		log "已停用 irqbalance（两者都写 smp_affinity，互相覆盖）"
 	fi
 
-	irq_n="$(apply_affinity "$ncpu")"
-	rps_n="$(apply_rps "$mask")"
+	list_irqs_sorted "$ncpu"
+
+	ok_n=0
+	skip_n=0
+	while read -r irq tot dom; do
+		[ -n "$irq" ] || continue
+		cpu="$(pick_lightest "$ncpu")"
+		want="$(printf '%x' $(( 1 << cpu )))"
+		if write_affinity "$irq" "$want"; then
+			add_load "$cpu" "$tot"
+			ok_n=$(( ok_n + 1 ))
+		else
+			# 搬不动（如 IRQ 79）：把它的负载记到实际所在核，别让贪心误判
+			add_load "$dom" "$tot"
+			skip_n=$(( skip_n + 1 ))
+			log "IRQ $irq 亲和不可写（驱动不支持 irq_set_affinity），留在 CPU$dom"
+		fi
+	done < "$TMP_IRQS"
+	rm -f "$TMP_IRQS"
+
 	disable_gro_fraglist
 
-	log "均衡完成：$irq_n 个中断轮询绑到 $ncpu 核；$rps_n 个接收队列 RPS 掩码=$mask"
+	log "中断亲和完成：$ok_n 个已分摊到 $ncpu 核；$skip_n 个不可迁移（驱动限制）"
 }
 
 stop() {
-	local ncpu mask
+	local ncpu mask irq
 	ncpu="$(ncpu_get)"
 	mask="$(mask_all "$ncpu")"
-	local irq
-	for irq in $(list_irqs); do
-		echo "$mask" > "/proc/irq/$irq/smp_affinity" 2>/dev/null
+	for irq in $(awk -v m="$IRQ_MATCH" -v s="$IRQ_SKIP" '
+			$1 ~ /^[0-9]+:$/ { irq=$1; sub(/:$/,"",irq); if ($0 ~ s) next; if ($0 ~ m) print irq }
+		' /proc/interrupts); do
+		printf '%s' "$mask" > "/proc/irq/$irq/smp_affinity" 2>/dev/null
 	done
-	local f
-	for f in /sys/class/net/*/queues/rx-*/rps_cpus; do
-		[ -e "$f" ] && echo 0 > "$f" 2>/dev/null
-	done
-	for f in /sys/class/net/*/queues/tx-*/xps_cpus; do
-		[ -e "$f" ] && echo 0 > "$f" 2>/dev/null
-	done
-	log "已还原为内核默认（全核亲和 + RPS 关闭）"
+	# 只还原 smp_affinity —— RPS/XPS 由 mt5700-rps 负责，这里不能碰
+	log "已还原为内核默认（中断亲和全核）"
 }
 
 restart() {

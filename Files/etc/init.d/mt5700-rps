@@ -1,42 +1,76 @@
 #!/bin/sh /etc/rc.common
 # SPDX-License-Identifier: MIT
-# H5000M / MT7987A：把收包软中断（RPS/XPS）摊到全部核
+# H5000M / MT7987A：收包软中断（RPS/XPS）的多核分摊
 #
-# 为什么要做（2026-09-21 真机实测，不是推测）：
-#   1. 无线 mt7996e 的硬中断（IRQ 79）与 USB 5G 模组（IRQ 74）**100% 落在 CPU0**，
-#      累计 121 万次从未迁移过；irqbalance 全程只动了以太网的两个中断（67→CPU1、
-#      68→CPU3）。单个 MSI 中断只能绑一个核，硬件层面劈不开 —— 只能靠 RPS 分流。
-#   2. 固件默认的 rps_cpus 是**单核掩码**（phy0.1-ap0=4 → CPU2、eth2=8 → CPU3）。
-#      单核掩码等于"把所有收包处理强制塞给一个核"。
-#   3. 改成全核掩码 f 后，8 条并发 TCP 流压测 12 秒：
-#      NET_RX 软中断 CPU0 +7437 / CPU1 +5308 / CPU3 +7150（≈37%/27%/36%），
-#      softirq CPU 时间 109 / 80 / 94 jiffies 分散到三核；
-#      而单核掩码下是 112 jiffies 全压在一个核上。
+# ── 三层事实（均为 2026-09-21 真机实测，非推测）─────────────────────────
+#   1. 无线 mt7996e 硬中断（IRQ 79）与 USB 5G 模组（IRQ 74）**100% 落在 CPU0**，
+#      累计 140 万次从未迁移；irqbalance 全程只动了以太网的两个（67→CPU1、68→CPU3）。
+#      单个 MSI 中断只能被一个核响应 —— **smp_affinity 写成全核 f 也不等于分摊**，
+#      内核仍固定选一个核（实测就是 CPU0）。硬件层面劈不开，只能靠 RPS 分流。
+#   2. 固件默认 rps_cpus 是**单核掩码**（phy0.1-ap0=4 → CPU2、eth2=8 → CPU3），
+#      等于把所有收包处理强制塞给一个核。
+#   3. 8 条并发 TCP 流压测 12 秒的对比（这是本脚本最终选型的依据）：
+#        rps_cpus=f（全核）      → CPU0 占 NET_RX **42%**、softirq **47.5%**
+#        rps_cpus=e（排除 CPU0） → CPU0 占 NET_RX **15%**、softirq **13%**
+#                                  其余三核 25% / 33% / 25%
+#      ★ 关键认知：收包软中断应当**避开该接口硬中断所在的核** ——
+#        硬中断已占住 CPU0，若 RPS 仍把软中断派给它，该核就会被双重占用。
+#        这一点来自厂家实现（higowrt 固件 /sbin/smp.sh 的 MT7990_whnat 分支）：
+#        有线接口 rps = 0xe（排除 CPU0），无线接口 rps = 0x7（排除 CPU3）。
 #
-# ⚠️ 验证时必须用**多条并发流**：RPS 按 flow hash 选核，同一条 TCP 流的包
-#    必然落在同一个核（这是 RPS 的设计，为了避免乱序）。用单流压测会
-#    误判成"全核掩码没生效/反而更差"——实测单流时 CPU0 确实会占到 92%。
+# ⚠️ 验证必须用**多条并发流**：RPS 按 flow hash 选核，同一条 TCP 流的所有包
+#    必然落在同一个核（为避免乱序）。单流压测会误判成"全核掩码反而更差"
+#    —— 实测单流时 CPU0 确实会占到 92%。
 #
-# 与 irqbalance 的关系：irqbalance 只写 /proc/irq/*/smp_affinity（硬件中断亲和），
-#   本脚本只写 /sys/class/net/*/queues/*/{rps,xps}_cpus（软件收包分发），
-#   两者互不覆盖，可以同时开。
-#
-# 与 mt5700-smp 的关系：mt5700-smp 会改硬中断亲和（与 irqbalance 互斥，默认不启用），
-#   本脚本不动任何 smp_affinity，只做软中断分发，是默认方案的一部分。
+# ── 边界 ────────────────────────────────────────────────────────────────
+#   本脚本只写 /sys/class/net/*/queues/*/{rps,xps}_cpus，**不碰 smp_affinity**，
+#   所以与 irqbalance / mt5700-smp（硬中断亲和）都不冲突，可以并存。
 
 START=95
 STOP=10
+
+# 无线接口名特征（主线 mt76 是 phyX.Y-apN，MTK 闭源驱动是 ra0/rai0，通用是 wlanX）
+WIFI_IFACE_GLOB='phy*|*-ap*|ra0|rai0|wlan*'
+# 无线硬中断在 /proc/interrupts 里的设备名特征
+WIFI_IRQ_MATCH='mt76|mt79|mt798|wifi|phy[0-9]|wlan|ra[0-9]|rai[0-9]'
 
 log() {
 	logger -t mt5700-rps "$1"
 }
 
-# 全核掩码的十六进制形式（4 核 -> f）
-mask_all() {
-	printf '%x' $(( (1 << $1) - 1 ))
+ncpu_get() {
+	grep -c '^processor' /proc/cpuinfo
 }
 
-# 等网络接口就绪：无线接口由 netifd/wpad 稍后才建出来，跑太早会漏设
+# 无线接口名判定
+is_wifi_iface() {
+	case "$1" in
+		phy*) return 0 ;;
+		*-ap*) return 0 ;;
+		ra0|rai0*) return 0 ;;
+		wlan*) return 0 ;;
+	esac
+	return 1
+}
+
+# 无线硬中断当前实际落在哪个核（/proc/interrupts 里取计数最大的那一列）
+# 返回 CPU 序号；找不到（无无线 / 驱动改名）时输出空
+wifi_irq_cpu() {
+	awk -v ncpu="$1" -v m="$WIFI_IRQ_MATCH" '
+		$1 ~ /^[0-9]+:$/ {
+			if ($0 ~ m) {
+				best = -1; dom = 0
+				for (i = 0; i < ncpu; i++) {
+					v = $(i + 2) + 0
+					if (v > best) { best = v; dom = i }
+				}
+				print dom
+				exit
+			}
+		}' /proc/interrupts
+}
+
+# 等接口就绪：无线接口由 netifd/wpad 稍后才建出来，跑太早会漏设
 wait_ifaces() {
 	local i=0
 	while [ $i -lt 20 ]; do
@@ -48,32 +82,62 @@ wait_ifaces() {
 }
 
 start() {
-	local ncpu mask f rx_n=0 tx_n=0
+	local ncpu all_dec all_hex wifi_cpu wifi_dec wifi_hex wifi_n=0 other_n=0
+	local iface mask f
 
-	ncpu="$(grep -c '^processor' /proc/cpuinfo)"
+	ncpu="$(ncpu_get)"
 	if [ "$ncpu" -lt 2 ]; then
 		log "CPU 数=$ncpu，无需分摊，跳过"
 		return 0
 	fi
 
 	wait_ifaces || log "警告：br-lan 20 秒内未就绪，仅设置当前已存在的接口"
-	mask="$(mask_all "$ncpu")"
+
+	all_dec=$(( (1 << ncpu) - 1 ))
+	all_hex="$(printf '%x' "$all_dec")"
+
+	# 无线接口的 RPS 排除掉「无线硬中断所在核」
+	wifi_hex="$all_hex"
+	wifi_cpu="$(wifi_irq_cpu "$ncpu")"
+	if [ -n "$wifi_cpu" ]; then
+		wifi_dec=$(( all_dec & ~(1 << wifi_cpu) ))
+		if [ "$wifi_dec" -gt 0 ]; then
+			wifi_hex="$(printf '%x' "$wifi_dec")"
+		else
+			wifi_hex="$all_hex"
+		fi
+		log "无线硬中断在 CPU$wifi_cpu，无线接口 RPS 用 0x$wifi_hex（避开该核）"
+	else
+		log "未识别到无线硬中断，全部接口统一用全核掩码 0x$all_hex"
+	fi
 
 	for f in /sys/class/net/*/queues/rx-*/rps_cpus; do
 		[ -e "$f" ] || continue
-		echo "$mask" > "$f" 2>/dev/null && rx_n=$(( rx_n + 1 ))
-	done
-	for f in /sys/class/net/*/queues/tx-*/xps_cpus; do
-		[ -e "$f" ] || continue
-		echo "$mask" > "$f" 2>/dev/null && tx_n=$(( tx_n + 1 ))
+		iface="${f#/sys/class/net/}"
+		iface="${iface%%/*}"
+		if is_wifi_iface "$iface"; then
+			mask="$wifi_hex"
+			wifi_n=$(( wifi_n + 1 ))
+		else
+			mask="$all_hex"
+			other_n=$(( other_n + 1 ))
+		fi
+		echo "$mask" > "$f" 2>/dev/null
 	done
 
-	if [ "$rx_n" -eq 0 ]; then
+	# XPS（发包）与硬中断核无关，统一全核
+	local tx_n=0
+	for f in /sys/class/net/*/queues/tx-*/xps_cpus; do
+		[ -e "$f" ] || continue
+		echo "$all_hex" > "$f" 2>/dev/null && tx_n=$(( tx_n + 1 ))
+	done
+
+	if [ "$wifi_n" -eq 0 ] && [ "$other_n" -eq 0 ]; then
 		log "警告：一个接收队列都没设上，接口可能尚未就绪"
 		return 1
 	fi
 
-	log "RPS/XPS 已设全核掩码 0x$mask（$ncpu 核）：$rx_n 个接收队列、$tx_n 个发送队列"
+	log "RPS 完成（$ncpu 核）：无线队列 $wifi_n 个=0x$wifi_hex、其它队列 $other_n 个=0x$all_hex；XPS $tx_n 个=0x$all_hex"
 }
 
 stop() {

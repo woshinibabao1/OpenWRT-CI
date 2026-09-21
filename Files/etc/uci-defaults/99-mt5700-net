@@ -100,28 +100,26 @@ if [ -f /etc/sysctl.d/99-mt5700-tcp.conf ]; then
 	sysctl -p /etc/sysctl.d/99-mt5700-tcp.conf 2>/dev/null || true
 fi
 
-# ---------- 3. 中断均衡 ----------
+# ---------- 3. 中断均衡（硬件中断亲和）----------
 # 实测（2026-09-21）：无线 mt7996e（IRQ 79）与 USB 5G 模组（IRQ 74）
-#   **100% 压在 CPU0**，累计 121 万次从未迁移过；irqbalance 全程只动了
+#   **100% 压在 CPU0**，累计 186 万次从未迁移过；irqbalance 全程只动了
 #   以太网的两个中断（67→CPU1、68→CPU3）。
-#   单个 MSI 中断只能绑一个核，这是硬件限制 —— 剩下的活交给第 4 节的 RPS 分流。
+#   ★ 关键认知：**smp_affinity 写成全核 f 不等于分摊** —— 单条 MSI 中断
+#     每次仍由内核选定的一个核响应，实测固定 CPU0。要搬走必须写**单核**掩码。
+# 责任划分：
+#   mt5700-smp —— 硬件中断亲和（在 99-mt5700-sys 里启用，本文件负责停用 irqbalance）
+#   mt5700-rps —— 收包软中断散列 RPS（见第 4 节）
 #
-# 保持 irqbalance 启用 —— 它与下面第 4 节的 RPS 是配套的：
-#   irqbalance      管**硬件中断**亲和（写 /proc/irq/*/smp_affinity）
-#   packet steering 管**收包软中断**散列（RPS）
-# 两者合起来就是「四核平均分」，本固件走这套组合。
-#
-# 备选方案：/etc/init.d/mt5700-smp 提供**静态**中断轮询绑定。
-#   同一台真机 dry-run 验证过：能把 8 个中断（以太网 5 个 + mt7992-vec_data0 +
-#   xhci-hcd:usb1 + mt7992-wed）精确均分到 4 个核。
-#   但它与 irqbalance **互斥**（都写 smp_affinity），故默认不启用。
-#   只有在你实测确认 irqbalance 摊不平、想强制均分时再手动切换：
-#     /etc/init.d/irqbalance disable && /etc/init.d/irqbalance stop
-#     /etc/init.d/mt5700-smp enable && /etc/init.d/mt5700-smp start
+# 这里显式**停用 irqbalance**，改由 mt5700-smp 接管硬件中断亲和：
+#   实测 irqbalance 对负载最大的无线（IRQ 79，186 万次）与 USB 5G（IRQ 74）
+#   毫无作为，只动了以太网两个中断；mt5700-smp 能把 74 也搬走。
+#   两者都写 /proc/irq/*/smp_affinity，同时开会互相覆盖，必须二选一。
+# ⚠️ 即便如此也做不到完全均分：IRQ 79 的亲和驱动不支持写入
+#    （echo 返回 RC=1、effective_affinity=0），只能留在 CPU0。
 if [ -f /etc/config/irqbalance ]; then
-	uci -q set irqbalance.@irqbalance[0].enabled='1'
+	uci -q set irqbalance.@irqbalance[0].enabled='0'
 	uci -q commit irqbalance
-	/etc/init.d/irqbalance enable 2>/dev/null || true
+	/etc/init.d/irqbalance disable 2>/dev/null || true
 fi
 
 # ---------- 4. 数据包引导（packet steering / RPS）----------
