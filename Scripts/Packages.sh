@@ -445,10 +445,14 @@ UPDATE_VERSION() {
 # 来源 CHN-beta/rkp-ipid —— 仓库根目录本身就是 OpenWrt 内核包
 #   （KernelPackage/rkp-ipid，SUBMENU=Other modules），故不加 special 参数，
 #   克隆后目录名保持 rkp-ipid，配置符号为 CONFIG_PACKAGE_kmod-rkp-ipid。
-# ⚠️ 上游已 archived（最后提交 2020-10-21）。源码用的是 nf_register_net_hook /
-#   skb_ensure_writable / ip_fast_csum，6.x 内核仍在，但树外模块没有兼容性保证：
-#   若将来编不过，删掉本行与 GENERAL.txt 里的 CONFIG_PACKAGE_kmod-rkp-ipid=y 即可回退。
-UPDATE_PACKAGE "rkp-ipid" "CHN-beta/rkp-ipid" "master"
+#
+# ⚠️ **默认不克隆、不编译**（稳定优先，2026-09-21 决策）：
+#   上游已 archived（最后提交 2020-10-21），树外内核模块对 6.18 无兼容性保证；
+#   编不过＝整次构建失败，编过若在新内核上 OOPS＝整机重启。保留能力但默认关闭。
+# 开启方法（两处同时改）：
+#   ① 取消下面这行的注释
+#   ② Config/GENERAL.txt 里把 CONFIG_PACKAGE_kmod-rkp-ipid 改成 =y
+#UPDATE_PACKAGE "rkp-ipid" "CHN-beta/rkp-ipid" "master"
 
 # 网络调优：注入 Files/etc 下的 sysctl 与 uci-defaults（随固件打包，首次开机生效）
 INSTALL_NET_TUNING

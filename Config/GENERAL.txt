@@ -155,13 +155,16 @@ CONFIG_PACKAGE_kmod-crypto-hw-safexcel=y
 
 # 内核模块 - 防共享上网检测：改写 IP 头的 ID 字段（IPID）
 # rkp-ipid：把出方向包的 IPID 改成单调递增（或随机），消除多设备共享上网的 IPID 指纹。
-#   来源 CHN-beta/rkp-ipid，菜单位置 Kernel modules → Other modules → kmod-rkp-ipid。
-#   该仓库根目录本身就是 OpenWrt 内核包（KernelPackage/rkp-ipid），由 Packages.sh 克隆。
-# ⚠️ 上游已 archived（最后提交 2020-10-21），属树外内核模块；若将来内核改动导致编不过，
-#    删掉本行 + Packages.sh 里的 UPDATE_PACKAGE "rkp-ipid" 即可回退。
-# ⚠️ 模块只处理带 mark 0x10（mark_capture 参数）的包，装了默认不改写任何流量；
-#    要真正生效还需一条给出方向包打 mark 的防火墙规则（本仓库未加）。
-CONFIG_PACKAGE_kmod-rkp-ipid=y
+#
+# ⚠️ **默认不编译**（稳定优先，2026-09-21 决策）：
+#   1. 上游 CHN-beta/rkp-ipid 已 archived、最后提交 2020-10-21，属树外内核模块，
+#      对 6.18 内核没有兼容性保证 —— 编不过会让整次构建直接失败（几小时机时）；
+#   2. 就算编过，未适配新内核的内核模块一旦 OOPS 就是整机重启，风险高于收益；
+#   3. 它只处理带 mark 0x10 的包，装上默认不改写任何流量，也谈不上即时收益。
+# 需要时开启（下面两处必须同时改，只改一处会克隆不到或直接编失败）：
+#   ① 本行改成 CONFIG_PACKAGE_kmod-rkp-ipid=y
+#   ② 取消 Scripts/Packages.sh 里 UPDATE_PACKAGE "rkp-ipid" 那一行的注释
+# CONFIG_PACKAGE_kmod-rkp-ipid is not set
 
 # 内核模块 - NFT 防火墙
 CONFIG_PACKAGE_kmod-nft-core=y

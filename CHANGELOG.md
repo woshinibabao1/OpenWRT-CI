@@ -76,17 +76,16 @@
 - **5G 侧（eth2）效果未验证**：参考固件 `wan_subnets = 100.0.0.0/8` 是 CGNAT，模组自身还做一层
   NAT；路由器改完的 TTL 会不会被模组重建 IP 头时重置，需抓包确认。eth1 有线 WAN 一定生效。
 
-**顺带加的编译项**：`kmod-rkp-ipid`（IPID 改写）——
-`Config/GENERAL.txt` 加 `CONFIG_PACKAGE_kmod-rkp-ipid=y`，
-`Scripts/Packages.sh` 加 `UPDATE_PACKAGE "rkp-ipid" "CHN-beta/rkp-ipid" "master"`。
-来源仓库 `CHN-beta/rkp-ipid` 根目录就是 OpenWrt 内核包（菜单位置
-Kernel modules → Other modules），符号为 `CONFIG_PACKAGE_kmod-rkp-ipid`。
+**IPID（kmod-rkp-ipid）：已备好但默认不编译**（2026-09-21「一切以稳定为主」决策）：
 
-⚠️ 两条如实说明：
-- 该模块只处理带 `mark 0x10`（`mark_capture` 模块参数）的包，**装上默认不改写任何流量**，
+- 上游 `CHN-beta/rkp-ipid` 已 archived、最后提交 2020-10-21，是**树外内核模块**，
+  对 6.18 内核没有兼容性保证：编不过＝整次构建失败（几小时机时）；
+  编过了若在新内核上 OOPS＝整机重启。风险高于收益。
+- 该模块还只处理带 `mark 0x10`（`mark_capture` 模块参数）的包，**装上默认不改写任何流量**，
   要生效还需一条给出方向包打 mark 的防火墙规则，本仓库未加。
-- 上游已 archived（最后提交 2020-10-21）。源码用的是 `nf_register_net_hook` /
-  `skb_ensure_writable` / `ip_fast_csum`，6.x 内核仍在，但树外模块无兼容性保证。
+- 故 `Config/GENERAL.txt` 写 `# CONFIG_PACKAGE_kmod-rkp-ipid is not set`，
+  `Scripts/Packages.sh` 里 `UPDATE_PACKAGE "rkp-ipid" ...` 保持注释。
+  能力保留在仓库里，需要时两处同时打开即可。
 
 UA2F 按「只加编译项」的要求**未加**。
 
