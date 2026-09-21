@@ -239,10 +239,9 @@ sysctl -w net.core.netdev_budget=300
 
 ### 7.4 本轮确认**不能做**的两项（附硬证据，避免以后再挖）
 
-- **WED**：与第三节结论一致，并补齐了证据链 —— 本机 `15010000.wed` / `15104800.wdma`
-  两个平台设备**在设备树里**、`mt7996e.ko` 里 17 处 wed 符号（含 `_wed_offload_enable`、
-  `mtk_soc_wed_ops`）也都在，但 `/sys/bus/platform/drivers/` 下**没有 wed 驱动**、
-  `modules.builtin` 里无 wed → 属"上游还没做完"，不是"拿不到"。
+- **WED**：不是"驱动没做完"这么简单，完整阻断链见 **附A**（结论：WED 与 HNAT 不重叠、
+  WED 依赖 HNAT；本机三条阻断链同时成立 —— 缺 WO 固件、缺 `nf_flow_table_hw`/
+  `flow_offload_hw_*`、且 WED 只在硬件卸载开启时工作而硬件卸载会破坏 TTL 统一）。
   基线固件同样把 `wed_enable` 写成 0（`/etc/modules.d/mt7996e`）。
 - **`luci-app-mtk-puncture`（Wi-Fi 7 前导码打孔）**：驱动 `mt76.ko`/`mt76-connac-lib.ko`/
   `mt7996e.ko` 中 `punctur` **零命中**；`/lib/netifd/`、`/usr/share/hostap/`、`hostapd.uc`
@@ -262,4 +261,65 @@ awk '{print $1, $10}' /proc/net/softnet_stat
 # 4. NAT 端口是否真的用起来了（并发高时抽样）
 cat /proc/net/nf_conntrack | wc -l
 ```
+
+---
+
+## 附A、WED 与 HNAT 的关系（定论归档，2026-09-22）
+
+**结论：不重叠。WED 与 HNAT 不是二选一，而是同一条硬件加速流水线的上下游；且 WED 严格依赖 HNAT/PPE，单独开 WED 没有任何意义。**
+
+### A.1 三方独立依据
+
+- **OpenWrt 官方 WED 文档**：WED 是 hardware flow offloading 的**扩展**，
+  "allowing the Packet Processing Engine (PPE) to handle packets directly to/from the
+  WiFi chipset"；并明确写着 **"WED is only working when HW (hardware) offload is enabled.
+  It does not work for SW offload or when offload is disabled."**
+- **OpenWrt BPI-R4 页面（MT7988，与 MT7987 同代 NETSYS V3）**：WED 是"traffic forwarding
+  from/to Wireless"，"It works with the existing flow-offloading aka. **HWNAT engine**
+  of MediaTek SoCs"。
+- **厂家脚本自证**：基线 `/sbin/smp-mt76.sh` 里只有 `WED_ENABLE=1` 时才调用
+  `nftables_flowoffload_enable "$HW_OFFLOAD"`（`HW_OFFLOAD=1`）。
+  → **WED 是"开关条件"，HNAT 才是被打开的东西。**
+
+**命名对照（同一件事的三套名字）**：HNAT / HWNAT（厂外树外驱动 `mtk_hnat`）
+＝ PPE（主线 `mtk_ppe` + `mtk_eth_soc` offload；Netsys V3 文档里也叫 NPU）
+＝ 转发加速引擎。WED（Wireless Ethernet Dispatch，配 WDMA）＝ 把 Wi-Fi 芯片的包
+DMA 直送 PPE 的通道。**一句话：HNAT 是引擎，WED 是给引擎接上无线的管子。**
+
+### A.2 本机实测状态（2026-09-22，全部只读）
+
+| 环节 | 状态 | 证据 |
+| :-- | :-- | :-- |
+| PPE/HNAT 引擎本体 | ✅ 在 | `/sys/kernel/debug/ppe0`、`ppe1`（含 `entries`/`bind`）；符号 `mtk_ppe_init` / `mtk_ppe_start` / `mtk_ppe_debugfs_init` / `mtk_flow_offload_replace` / `mtk_eth_offload_init` 齐 |
+| 当前流表条目 | 0 条 | `/sys/kernel/debug/ppe0/entries` 为空（offload 关着，符合预期） |
+| WED 硬件节点 | ✅ 在 | DT `wed@15010000`（compatible `mediatek,mt7987-wed`）+ `wdma@15104800`；`/sys/kernel/debug/wed0/`（txinfo/rxinfo/rro/amsdu/rtqm/regidx） |
+| WED 驱动符号 | ✅ 在 | 48 个 `mtk_wed*` 符号（`attach`/`flow_add`/`start`/`stop`/`mcu_init`/`tx_ring_setup`…） |
+| **WED 是否 attach** | ❌ **没有** | dmesg **无** `platform 15010000.wed: MTK WED WO Firmware Version …`（attach 成功的标志行）；`wed0/txinfo`、`rxinfo` 读出为空；`15010000.wed/driver` 无绑定，`/sys/bus/platform/drivers/` 下无 `mtk-wed` |
+| **WO 固件** | ❌ **缺失** | `/lib/firmware` 下 `find -iname '*wo*' -o -iname '*wed*'` **零命中**；`mediatek/mt7987/` 只有 2.5G PHY 的 `i2p5ge-phy-*.bin`。MT7987（Netsys V3）执行 WED 需要 WO 固件 |
+| **硬件流表钩子** | ❌ **未编入** | `nf_flow_table_hw.ko` 不在 `/lib/modules`、不在 `modules.builtin`；kallsyms 里**连 `flow_offload_hw_*` 符号都没有**（只有软件路径 `nf_flow_offload_add/del/hook/stats`）。而 `/etc/modules.d/nf-flow` 里却写着 `nf_flow_table_hw` 一行 → **死引用**，kmodloader 加载失败且不报错 |
+| 桥接 BPF 组件 `bridger` | ✅ 已装但无用 | 已装、`bridge_local_tx=1`/`rx=0`。它只在 WED 生效时才有意义（dumb-AP 下跟踪桥接流） |
+
+### A.3 本机 WED 不可用的阻断链（三条同时成立）
+
+1. **缺 WO 固件**（`mt7987_wo.bin`）→ WED 无法 attach；
+2. **缺 `nf_flow_table_hw` / `flow_offload_hw_*`** → PPE 接不上 nft 流表；
+3. **即使前两条补齐，WED 也只在硬件卸载开启时工作** → 必须 `flow_offloading_hw=1`
+   → 而这会绕过 nft 的 postrouting → **TTL 统一失效 → 运营商丢弃客户端 TCP
+   → 客户端完全没网**（2026-09-21 已实测：offload 开时客户端 HTTP 25 秒超时、
+   conntrack 条目带 `[OFFLOAD]`、`mangle_ttl_unify` 的 postrouting 计数器为 0）。
+
+### A.4 取舍的实质与结论
+
+需要同时取舍的不是 "WED vs HNAT"，而是 **"硬件加速 vs 客户端能不能上网"**。
+本机 WAN 是 5G 模组（eth2），客户端数量有限、上行普遍 <200Mbps，软件转发（四核 RPS）
+足以覆盖；而 TTL 统一是**硬前提**（缺了它客户端完全不通）。
+→ **结论：保持现状（flow offload 关、`flow_offloading_hw=0`、`wed_enable=N`）。**
+
+### A.5 历史存档：别再重新注入 WED 补丁
+
+本仓库 2026-08 曾注入 MT7987 WED V3.1 补丁（`Scripts/patches/wed/999-mtk7987-wed-v31.patch`
+与 `998-mt76-wed-hwrro-enum.patch`），经 `d1d718d` → `313909a` → `9069348` → `6e2e650`
+→ `f2096b6` → `a678400` 多轮修编译，最终以 `341b87c`、`0b10213`
+（"Remove kernel-side WED v3.1 patch that broke mt76 build"）移除。
+**别再重来** —— 就算编译过了，A.3 的三条阻断链依然成立。
 
