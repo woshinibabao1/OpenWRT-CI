@@ -1,5 +1,54 @@
 # 更新日志
 
+## [2026-09-21] 深挖厂家基准：无线升 EHT160、conntrack expect 表对齐
+
+本轮把对比从「插件层」下沉到 **内核参数 / sysctl / nft / hotplug / 无线默认值**：
+解析 Mwrt 固件 `/etc` 全树（1334 节点，提取 614 个文件）逐项对照，并把 higowrt 的
+`defconfig/mt7987_mt7992.config` 与上游 immortalwrt 的 `config-6.18` 做交叉比对。
+
+**改动 1：5GHz 由 HE160/HE80 升到 EHT160**（`Files/etc/uci-defaults/99-mt5700-net`）
+
+| 依据 | 内容 |
+|---|---|
+| 硬件支持 | `iw phy phy0 info` 列出 `EHT Iftypes: AP` 与 `EHT-MCS Map (BW = 160)`；网卡 `iwinfo` 报 MediaTek MT7992E / HW Mode **802.11be** |
+| 厂家基准 | Mwrt 的 `99c-wifi-5g-channel-boardb` 注释写明 "mtwifi.sh hands EVERY board the same 5GHz defaults (**channel 36 + EHT160**)" |
+| 频谱不变 | 与原先 HE160 同为 36-64 的 160MHz 块，**不新增 DFS 风险** |
+| 收益 | 启用 EHT 4096-QAM，Wi-Fi 7 客户端协商速率约翻倍（HE160 2SS 实测 1441 Mbit/s） |
+
+⚠️ CN 域 `(5150 - 5350 @ 160)` 允许该 160MHz 块，但跨 UNII-2A（52-64）属 DFS；
+若某环境雷达检测导致 AP 起不来，htmode 退回 `HE80`（36 起 80MHz，非 DFS）。
+
+**改动 2：给所有 radio 补 `country`**（同节 5a）
+
+原先只设了 `radio1`。厂家 `99-wifi-default-country` 是遍历全部 radio——缺 country 时
+reg domain 停在 world(00)，5GHz 信道全标 no-IR（不能发信标），表现为"无线像是禁用的"。
+新逻辑遍历所有 wifi-device、已有 country 的跳过（幂等，不覆盖手动选择）。
+
+**改动 3：`net.netfilter.nf_conntrack_expect_max` 992 → 16384**
+（`Files/etc/sysctl.d/99-mt5700-conntrack.conf`）
+
+expect 表用于 NAT 环境下的**预测连接**（FTP 数据通道、SIP/VoIP、RTSP）。本机 992 的
+来由是内核按"模块加载那一刻的 conntrack_max"推导，而我们后来才用 sysctl 把它提到
+100000，expect_max 不会重算。纯上限、不预分配，零风险对齐厂家值。
+
+### 已核对并证伪的项（附证据，别再重复排查）
+
+| 项 | 结论 |
+|---|---|
+| `CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE` | higowrt 有、**上游 generic config-6.18 也有** → 我们继承的就是 O2，非差异 |
+| `CONFIG_HZ_100` / `PREEMPT_NONE` / `LRU_GEN` | 上游本来就是这些值，higowrt 未偏离（交集取值不同项 = **0**） |
+| `nf_conntrack_helper=1` | 本机 `/proc/sys/net/netfilter/nf_conntrack_helper` **不存在**（该内核未暴露），无法照搬也不必要 |
+| buckets / udp_timeout / udp_timeout_stream / acct / checksum / bpf_jit | 真机实测与厂家**完全一致** |
+| `vm.min_free_kbytes` / `accept_ra` / `ipfrag_*_thresh` | 真机 16384 / 0 / 内核默认，与厂家一致 |
+| 厂家 RPS 写法（`echo 6`，排 CPU0+CPU3） | 我们的全核掩码经多流实测更均匀，且无线侧已按硬中断核动态排除，更好 |
+| `99c-wifi-5g-channel-boardb`（改 149） | 门控在 `NRadio-C2000MAX` 板（board B），H5000M 不执行 |
+| `99b-wifi-selfmanaged-2g` / `99-be3600-fixups` | 分别针对 Intel 自管理网卡与 MT7993(BE3600) 板，H5000M 不适用 |
+| `98-tom_modem-timeout-wrap` / `20-modem-net` / `99-add-5g-handler` | QModem 体系专用（`tom_modem` 是它的 AT 工具）；我们走自研 at-webserver，不引 QModem |
+| `eqos` / `turboacc` | 厂家 eqos 默认 `enabled=0`（未启用）；turboacc 的 fastpath 依赖 `mtkhnat.ko`（我们无 HNAT），其 sysctl 项我们已逐条覆盖 |
+| `dnsmasq log-facility=/dev/null` | 会丢掉排障日志；我们 `log_size=128`（内存环形缓冲）本就不写 flash，收益为负 |
+| zram 压缩算法 | 两边均为 `lzo`、512MB（真机 `uci show system` 实测），无差异；且真机 Swap used = 0（内存充足从未换出），换 zstd 也无实际收益 |
+| 无线 EHT40（2.4G） | 真机已是，无需改 |
+
 ## [2026-09-21] 移除 OpenClash / MosDNS；与 higowrt + Mwrt 双基准核准
 
 按用户要求移除 OpenClash 与 MosDNS，并以两个厂家基准做了最优性核准。

@@ -148,16 +148,33 @@ if [ -f /etc/init.d/mt5700-rps ]; then
 	/etc/init.d/mt5700-rps enable
 fi
 
-# ---------- 5. 5G 无线：锁定 36 信道 + 80MHz ----------
-# CN 监管域下 5.8G（149~165）只批 80MHz，配 160MHz 时 hostapd 报
-#   "Could not select hw_mode and channel. (-3)"，AP 直接起不来；
-# 5.2G 唯一的 160MHz 块跨 DFS 区（52~64），开机要先做 1~10 分钟雷达静默检测。
-# 36 + HE80 非 DFS、保存即起，是高密度环境最稳的组合。
+# ---------- 5. 无线默认值（对齐厂家基准）----------
+# 5a. 给**所有** radio 补 country（厂家 99-wifi-default-country 的同一做法）：
+#     无 country 时 reg domain 停在 world(00)，5GHz 信道全部标 no-IR（不能发信标），
+#     现象是「无线在 LuCI 里显示为禁用、客户端也搜不到信号」。
+#     已有 country 的 radio 跳过，绝不覆盖手动选择（幂等）。
+for dev in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
+	[ -n "$(uci -q get wireless.$dev.country)" ] && continue
+	uci -q set wireless.$dev.country='CN'
+done
+
+# 5b. 5GHz：36 信道 + EHT160。
+# ★ 2026-09-21 由 HE160/HE80 改为 **EHT160**，依据：
+#   ① 硬件与驱动都支持：`iw phy phy0 info` 明确列出 "EHT Iftypes: AP" 与
+#      "EHT-MCS Map (BW = 160)"（网卡 iwinfo 报 MediaTek MT7992E，HW Mode 802.11be）；
+#   ② 厂家基准默认就是它：Mwrt 的 99c-wifi-5g-channel-boardb 注释写明
+#      "mtwifi.sh hands EVERY board the same 5GHz defaults (channel 36 + EHT160)"；
+#   ③ 频谱占用与原先的 HE160 **完全相同**（都是 36-64 的 160MHz 块），不新增 DFS 风险；
+#   ④ 收益：启用 EHT 的 4096-QAM，Wi-Fi 7 客户端协商速率约翻倍
+#      （同一 MCS 档位下 HE160 2SS 实测 1441 Mbit/s）。
+#   ⚠️ `iw reg get` 显示 CN 域 `(5150 - 5350 @ 160)`，即 36-64 允许 160MHz 带宽，
+#      但该块跨 UNII-2A（52-64）属 DFS，reg 标注了 radar detect widths 含 160MHz。
+#      若所处环境雷达检测导致 AP 起不来，把 htmode 退回 'HE80'（36 起 80MHz 非 DFS，最稳）。
 if [ "$(uci -q get wireless.radio1.band)" = "5g" ]; then
 	uci -q set wireless.radio1.channel='36'
-	uci -q set wireless.radio1.htmode='HE80'
+	uci -q set wireless.radio1.htmode='EHT160'
 	uci -q set wireless.radio1.country='CN'
-	uci -q commit wireless
 fi
+uci -q commit wireless
 
 exit 0

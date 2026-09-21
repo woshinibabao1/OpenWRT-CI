@@ -245,9 +245,11 @@ CONFIG_PACKAGE_libimobiledevice=y
 # 内存压缩交换（zram）
 # H5000M 物理内存 1GB。zram 把不活跃页压缩后留在 RAM 里当作交换设备，
 # 既避免 eMMC 被频繁写坏，又比磁盘 swap 快几个数量级。
-# 容量（512M）与压缩算法（lzo-rle）由 Files/etc/uci-defaults/99-mt5700-sys
-# 写入 /etc/config/system（system.@system[0].zram_size_mb / zram_comp_algo），
-# 由 /etc/init.d/zram-swap 生效。
+# 容量（512M）与压缩算法（lzo）由 Files/etc/uci-defaults/99-mt5700-sys
+# 写入 /etc/config/system（system.@system[0].zram_size_mb / zram_comp_algo）。
+# ⚠️ 实际生效的 init 脚本名是 **/etc/init.d/zram**（不是 zram-swap）：
+#    package/system/zram-swap/Makefile 用 INSTALL_BIN files/zram.init → /etc/init.d/zram。
+#    写错名字会让 enable 静默失效。
 CONFIG_PACKAGE_zram-swap=y
 
 # 常用工具
