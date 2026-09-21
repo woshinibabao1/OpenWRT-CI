@@ -170,6 +170,10 @@ done
 #   ⚠️ `iw reg get` 显示 CN 域 `(5150 - 5350 @ 160)`，即 36-64 允许 160MHz 带宽，
 #      但该块跨 UNII-2A（52-64）属 DFS，reg 标注了 radar detect widths 含 160MHz。
 #      若所处环境雷达检测导致 AP 起不来，把 htmode 退回 'HE80'（36 起 80MHz 非 DFS，最稳）。
+#   ✅ 真机实测（2026-09-21 20:38，带 setsid 自动回滚守护）：改为此值 + wifi reload 后
+#      **5 秒** AP 即恢复，iwinfo 报 `HT Mode: EHT160`，未触发 DFS 阻塞；
+#      已关联的 Wi-Fi 6 客户端仍按 160MHz HE-MCS 11 HE-NSS 2 协商（向下兼容无损），
+#      EHT 4096-QAM 的收益待 Wi-Fi 7 客户端接入时体现。
 if [ "$(uci -q get wireless.radio1.band)" = "5g" ]; then
 	uci -q set wireless.radio1.channel='36'
 	uci -q set wireless.radio1.htmode='EHT160'

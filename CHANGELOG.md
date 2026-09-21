@@ -18,6 +18,13 @@
 ⚠️ CN 域 `(5150 - 5350 @ 160)` 允许该 160MHz 块，但跨 UNII-2A（52-64）属 DFS；
 若某环境雷达检测导致 AP 起不来，htmode 退回 `HE80`（36 起 80MHz，非 DFS）。
 
+**真机实测（2026-09-21 20:38，用 setsid 自动回滚守护执行，与 SSH 会话解耦）**：
+改 `htmode=EHT160` → `wifi reload` → **5 秒**后 AP 恢复，`iwinfo` 报
+`Mode: Master  Channel: 36  HT Mode: EHT160`（Center Channel 50，即 36-64 的 160MHz 块），
+**未触发 DFS 阻塞**。已关联的客户端自动重连；其中一个 **Wi-Fi 6** 客户端仍按
+`160MHz HE-MCS 11 HE-NSS 2` 协商（tx 2401.9 Mbit/s），证明**向下兼容无损** ——
+EHT 的 4096-QAM 收益将在 Wi-Fi 7 客户端接入时体现。
+
 **改动 2：给所有 radio 补 `country`**（同节 5a）
 
 原先只设了 `radio1`。厂家 `99-wifi-default-country` 是遍历全部 radio——缺 country 时
