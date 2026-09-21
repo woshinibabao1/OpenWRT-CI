@@ -1,4 +1,50 @@
 # 更新日志
+## [2026-09-21] 四核负载均衡：RPS/XPS 改全核掩码（实测修复「四核平均分」未达成）
+
+起因：真机体检发现「四核平均分」实际没做到，中断分布 cpu0=190 万 / cpu3=83 万。
+本轮做了间隔采样的增量实测（累计值会误导），定位到两个层面：
+
+**1. 硬件中断层面（无法解决，是硬件限制）**
+- 无线 `mt7996e`（IRQ 79）累计 **121 万次、100% 落在 CPU0**；
+  USB 5G 模组（IRQ 74）累计 2.9 万次、同样 100% 在 CPU0。
+- irqbalance 全程只动了以太网的两个中断（67→CPU1、68→CPU3），**没碰无线和 USB**。
+- 单个 MSI 中断只能绑一个核，硬件层面劈不开 —— 只能靠 RPS 在软件层面分流。
+
+**2. 软件收包层面（本轮真正修掉的）**
+- 固件默认的 `rps_cpus` 是**单核掩码**：`phy0.1-ap0`=4（CPU2）、`eth2`=8（CPU3）。
+  单核掩码的含义是「把所有收包处理强制塞给一个核」。
+- 根因：`Files/etc/uci-defaults/99-mt5700-net` 第 4 节写的是
+  `if [ -f /etc/init.d/packet_steering ]; then enable; fi` —— 但真机
+  `uci show network.globals` 里**没有 packet_steering 键**，等于没生效。
+  OpenWrt 的 packet steering 是**由 uci 配置驱动**的，不是靠那个 init 脚本。
+
+**改动**
+- 新增 `Files/etc/init.d/mt5700-rps`（START=95）：开机后把所有接口的
+  `rps_cpus` / `xps_cpus` 强制设为全核掩码（4 核 → `f`），并等 `br-lan` 就绪最多 20 秒。
+  它只写 `/sys/class/net/*/queues/*/{rps,xps}_cpus`，**不碰 `smp_affinity`**，
+  因此与 irqbalance 不冲突（irqbalance 只写 smp_affinity）。
+- `99-mt5700-net` 第 4 节改为显式 `uci set network.globals.packet_steering='1'`
+  + 启用 `mt5700-rps` 兜底。
+- `Scripts/Packages.sh` 增加 `mt5700-rps` 存在性硬断言（缺了会静默失效，不报错）。
+
+**实测效果**（8 条并发 TCP 流、12 秒窗口）
+
+| | 单核掩码（修复前） | 全核掩码 f（修复后） |
+|---|---|---|
+| NET_RX 软中断分布 | CPU2 **95%**，其余≈0 | **CPU0 37% / CPU1 27% / CPU3 36%** |
+| softirq CPU 时间 | 112 jiffies **全压一个核** | **109 / 80 / 94 分散到三核** |
+
+真机试跑验证：把 RPS 清零后执行脚本 → 8 个接收队列 + 64 个发送队列全部设为 `f`，
+日志 `RPS/XPS 已设全核掩码 0xf（4 核）`；`stop` 归 0、`start` 可恢复。
+
+**⚠️ 两个验证方法上的坑（否则会得出错误结论）**
+1. **必须用多条并发流压测**：RPS 按 flow hash 选核，同一条 TCP 流的所有包
+   必然落在同一个核（这是 RPS 为避免乱序的设计）。单流压测时 CPU0 会占到 92%，
+   看起来像「全核掩码反而更差」，实际是测试方法的问题。
+2. **rc.common 脚本不能直接 `sh script start`**：那样只会定义函数而不执行它，
+   `start` 的调度依赖 shebang `#!/bin/sh /etc/rc.common`。
+   正确写法是 `sh /etc/rc.common /path/script start` 或直接执行文件。
+
 ## [2026-09-21] TTL 绕过实测落地：flow offload 默认关闭（真机 A/B 实证）
 
 ### 结论先行

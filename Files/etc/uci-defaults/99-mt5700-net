@@ -101,9 +101,12 @@ if [ -f /etc/sysctl.d/99-mt5700-tcp.conf ]; then
 fi
 
 # ---------- 3. 中断均衡 ----------
-# 实测无线与 USB 5G 模组的中断默认全压 CPU0，其余三核为 0。
+# 实测（2026-09-21）：无线 mt7996e（IRQ 79）与 USB 5G 模组（IRQ 74）
+#   **100% 压在 CPU0**，累计 121 万次从未迁移过；irqbalance 全程只动了
+#   以太网的两个中断（67→CPU1、68→CPU3）。
+#   单个 MSI 中断只能绑一个核，这是硬件限制 —— 剩下的活交给第 4 节的 RPS 分流。
 #
-# 保持 irqbalance 启用 —— 它与下面第 4 节的 packet steering 是配套的：
+# 保持 irqbalance 启用 —— 它与下面第 4 节的 RPS 是配套的：
 #   irqbalance      管**硬件中断**亲和（写 /proc/irq/*/smp_affinity）
 #   packet steering 管**收包软中断**散列（RPS）
 # 两者合起来就是「四核平均分」，本固件走这套组合。
@@ -121,11 +124,36 @@ if [ -f /etc/config/irqbalance ]; then
 	/etc/init.d/irqbalance enable 2>/dev/null || true
 fi
 
-# ---------- 4. 数据包引导（packet steering）----------
+# ---------- 4. 数据包引导（packet steering / RPS）----------
 # 把收包软中断按流散列到多个核，配合上面的 irqbalance 一起打破
-# 「中断全压 CPU0」的格局。真机已默认启用，这里显式兜底，避免换配置后丢失。
-if [ -f /etc/init.d/packet_steering ]; then
-	/etc/init.d/packet_steering enable 2>/dev/null || true
+# 「中断全压 CPU0」的格局。
+#
+# ⚠️ 2026-09-21 实测更正：这里原来只写了
+#       if [ -f /etc/init.d/packet_steering ]; then ... enable; fi
+#   但真机 `uci show network.globals` 里**没有 packet_steering 键**，
+#   rps_cpus 停在单核掩码（phy0.1-ap0=4 → CPU2、eth2=8 → CPU3），等于没生效：
+#   netifd 的 packet steering 是**靠 uci 配置驱动**的，不是靠那个 init 脚本。
+#   所以这里必须显式写 uci，并用 mt5700-rps 在开机后兜底强制全核掩码。
+#
+# 实测依据（8 条并发 TCP 流、压测 12 秒）：
+#   单核掩码：NET_RX 软中断 95% 集中在一个核，softirq 112 jiffies 全压一核
+#   全核掩码：NET_RX 分散到 CPU0/CPU1/CPU3（≈37%/27%/36%），
+#             softirq 109 / 80 / 94 jiffies 分散到三核
+# ⚠️ 验证必须用**多流**：RPS 按 flow hash 选核，同一条 TCP 流的所有包
+#    必然落在同一个核（避免乱序），单流压测会误判成"全核掩码反而更差"。
+
+# 4a. netifd 原生 packet steering（由 uci 驱动，接口 up 时自动设置）
+if [ -z "$(uci -q get network.globals)" ]; then
+	uci -q set network.globals=globals
+fi
+uci -q set network.globals.packet_steering='1'
+uci -q commit network
+
+# 4b. 兜底：开机后强制把所有接口的 RPS/XPS 设成全核掩码
+#     （netifd 只管它自己管理的设备，且只在接口 up 那一刻设一次）
+if [ -f /etc/init.d/mt5700-rps ]; then
+	chmod 0755 /etc/init.d/mt5700-rps 2>/dev/null
+	/etc/init.d/mt5700-rps enable
 fi
 
 # ---------- 5. 5G 无线：锁定 36 信道 + 80MHz ----------

@@ -304,6 +304,9 @@ INSTALL_NET_TUNING() {
 	[ -f "$DST_DIR/etc/uci-defaults/99-mt5700-wan" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/uci-defaults/99-mt5700-wan"; exit 1; }
 	# nft 规则文件缺失/损坏会让 fw4 加载失败 —— 后果是刷完直接没网，必须硬断言。
 	[ -f "$DST_DIR/etc/nftables.d/12-mangle-ttl-128.nft" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/nftables.d/12-mangle-ttl-128.nft"; exit 1; }
+	# mt5700-rps：收包软中断四核分摊。缺了它 rps_cpus 会停在单核掩码，
+	# 「四核平均分」静默失效（不报错、不崩溃，只是吞吐上不去），必须硬断言。
+	[ -f "$DST_DIR/etc/init.d/mt5700-rps" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/init.d/mt5700-rps"; exit 1; }
 }
 
 case "$MT_MODE" in

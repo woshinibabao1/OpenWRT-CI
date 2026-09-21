@@ -1,0 +1,93 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: MIT
+# H5000M / MT7987A：把收包软中断（RPS/XPS）摊到全部核
+#
+# 为什么要做（2026-09-21 真机实测，不是推测）：
+#   1. 无线 mt7996e 的硬中断（IRQ 79）与 USB 5G 模组（IRQ 74）**100% 落在 CPU0**，
+#      累计 121 万次从未迁移过；irqbalance 全程只动了以太网的两个中断（67→CPU1、
+#      68→CPU3）。单个 MSI 中断只能绑一个核，硬件层面劈不开 —— 只能靠 RPS 分流。
+#   2. 固件默认的 rps_cpus 是**单核掩码**（phy0.1-ap0=4 → CPU2、eth2=8 → CPU3）。
+#      单核掩码等于"把所有收包处理强制塞给一个核"。
+#   3. 改成全核掩码 f 后，8 条并发 TCP 流压测 12 秒：
+#      NET_RX 软中断 CPU0 +7437 / CPU1 +5308 / CPU3 +7150（≈37%/27%/36%），
+#      softirq CPU 时间 109 / 80 / 94 jiffies 分散到三核；
+#      而单核掩码下是 112 jiffies 全压在一个核上。
+#
+# ⚠️ 验证时必须用**多条并发流**：RPS 按 flow hash 选核，同一条 TCP 流的包
+#    必然落在同一个核（这是 RPS 的设计，为了避免乱序）。用单流压测会
+#    误判成"全核掩码没生效/反而更差"——实测单流时 CPU0 确实会占到 92%。
+#
+# 与 irqbalance 的关系：irqbalance 只写 /proc/irq/*/smp_affinity（硬件中断亲和），
+#   本脚本只写 /sys/class/net/*/queues/*/{rps,xps}_cpus（软件收包分发），
+#   两者互不覆盖，可以同时开。
+#
+# 与 mt5700-smp 的关系：mt5700-smp 会改硬中断亲和（与 irqbalance 互斥，默认不启用），
+#   本脚本不动任何 smp_affinity，只做软中断分发，是默认方案的一部分。
+
+START=95
+STOP=10
+
+log() {
+	logger -t mt5700-rps "$1"
+}
+
+# 全核掩码的十六进制形式（4 核 -> f）
+mask_all() {
+	printf '%x' $(( (1 << $1) - 1 ))
+}
+
+# 等网络接口就绪：无线接口由 netifd/wpad 稍后才建出来，跑太早会漏设
+wait_ifaces() {
+	local i=0
+	while [ $i -lt 20 ]; do
+		[ -d /sys/class/net/br-lan ] && return 0
+		i=$(( i + 1 ))
+		sleep 1
+	done
+	return 1
+}
+
+start() {
+	local ncpu mask f rx_n=0 tx_n=0
+
+	ncpu="$(grep -c '^processor' /proc/cpuinfo)"
+	if [ "$ncpu" -lt 2 ]; then
+		log "CPU 数=$ncpu，无需分摊，跳过"
+		return 0
+	fi
+
+	wait_ifaces || log "警告：br-lan 20 秒内未就绪，仅设置当前已存在的接口"
+	mask="$(mask_all "$ncpu")"
+
+	for f in /sys/class/net/*/queues/rx-*/rps_cpus; do
+		[ -e "$f" ] || continue
+		echo "$mask" > "$f" 2>/dev/null && rx_n=$(( rx_n + 1 ))
+	done
+	for f in /sys/class/net/*/queues/tx-*/xps_cpus; do
+		[ -e "$f" ] || continue
+		echo "$mask" > "$f" 2>/dev/null && tx_n=$(( tx_n + 1 ))
+	done
+
+	if [ "$rx_n" -eq 0 ]; then
+		log "警告：一个接收队列都没设上，接口可能尚未就绪"
+		return 1
+	fi
+
+	log "RPS/XPS 已设全核掩码 0x$mask（$ncpu 核）：$rx_n 个接收队列、$tx_n 个发送队列"
+}
+
+stop() {
+	local f
+	for f in /sys/class/net/*/queues/rx-*/rps_cpus; do
+		[ -e "$f" ] && echo 0 > "$f" 2>/dev/null
+	done
+	for f in /sys/class/net/*/queues/tx-*/xps_cpus; do
+		[ -e "$f" ] && echo 0 > "$f" 2>/dev/null
+	done
+	log "已还原为内核默认（RPS/XPS 关闭）"
+}
+
+restart() {
+	stop
+	start
+}
