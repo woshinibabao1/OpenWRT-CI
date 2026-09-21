@@ -16,11 +16,18 @@
 #   · /lib/modules/<kver>/ 里没有 mtk_wed.ko → WiFi 侧硬件转发（WED）本基线缺失；
 #   · 上网出口是 eth2（5G 模组，USB CDC-NCM），PPE 只挂在 SoC 以太网口上，
 #     管不到 USB 口。
-# 结论：软件卸载（nf_flow_table 快转路径）对**所有**接口都有效，包括 USB 5G WAN，
-#       是本机型唯一确定拿得到的加速，默认打开（MODE=auto 且 SQM 未启用时）；
+# 结论（★ 2026-09-21 更正本段旧说法）：软件卸载（nf_flow_table 快转路径）对**所有**
+#       接口都有效，包括 USB 5G WAN，是本机型唯一确定拿得到的加速。
+#       **但默认值是 off，不是 auto** —— Files/etc/mt5700/flow-offload 写的是 MODE=off，
+#       Scripts/ApplyFlowOffload.sh 的兜底默认也是 off。因为本固件带 TTL 归一规则，而卸载
+#       会把连接从 nftables 路径上摘走，两者不可共存（真机实证：开着卸载时客户端 HTTP
+#       25 秒超时、conntrack 带 [OFFLOAD]、出口 TTL 不受规则控制；关掉后同一请求 HTTP 200
+#       / 1.0 秒）。即：下面 auto 分支里的 TTL 探测只在**显式**选择 auto 时才会走到。
 #       硬件卸载在这台机器上只可能命中「有线 LAN↔有线 LAN」这一类流量，
 #       命中率≈0，开了还会让 nft 计数器看不到流量（排障变难），故 on-hw 也仅在有线场景有意义。
-#       等固件带上 mtk_wed（WiFi 硬件转发）后再把默认改为 on-hw 才有意义。
+#       （MT7987 的 WED 经查属上游未完成：设备树有 wed 节点，但 modules.builtin 里没有
+#        mtk_wed、主线驱动无该 SoC 匹配、上游 linux-firmware 无 mt7987_wo.bin —— 见
+#        CLOSED_SOURCE_AUDIT.md。等上游补齐后再谈 on-hw。）
 #
 # 与 SQM/CAKE 互斥：被卸载的连接完全绕过 qdisc，CAKE/HTB 一律失效。
 #   故 auto 模式下先查 SQM：已启用就保持 offload 关闭（保住整形），两者只能二选一；

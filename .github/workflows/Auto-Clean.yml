@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       keep_latest_per_device:
-        description: '保留每个机型最新一个 Release（不勾选则清除 Releases 中的全部文件）'
+        description: '保留每个机型最新一个 Release（不勾选则清除全部文件。定时触发时此项无效，一律按保留处理）'
         type: boolean
         default: false
 
@@ -28,8 +28,17 @@ jobs:
           set -euo pipefail
 
           REPO="${{ github.repository }}"
-          # 默认清除全部；手动触发且勾选 keep_latest_per_device 时仅保留每个机型最新一个
-          KEEP_LATEST="${{ inputs.keep_latest_per_device }}"
+          # 手动触发且勾选 keep_latest_per_device 时仅保留每个机型最新一个。
+          #
+          # ★ 定时触发（schedule）时 inputs 全为空，若按"空=不保留"处理就会把 Release 全删光，
+          #   而紧随其后的构建要 3~6 小时 —— 这段时间仓库里一个固件都没有，想刷回上一版
+          #   都做不到，与本项目"稳定优先"的原则相悖。
+          #   故定时场景一律按 keep-latest 处理：每个机型至少留最新一个，直到新固件发布出来。
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            KEEP_LATEST="true"
+          else
+            KEEP_LATEST="${{ inputs.keep_latest_per_device }}"
+          fi
           PER_PAGE=100
           DELETED=0
 

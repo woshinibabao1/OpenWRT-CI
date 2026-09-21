@@ -41,13 +41,21 @@ if [ -f "$WIFI_SH" ]; then
 	sed -i "s/country='.*'/country='CN'/g" $WIFI_SH
 	#修改2.4G默认频宽为 40MHz
 	sed -i "s/htmode='HT20'/htmode='HT40'/g" $WIFI_SH
-	#5G 固定 80MHz（HE80），不再拉到 160MHz。原因（真机实测）：
-	#   1) CN 监管域 (5725 - 5850 @ 80)，5.8G（149~165）只批 80MHz；配 160MHz 时
-	#      hostapd 报 "Frequency 5845 is not allowed (seg0)" →
-	#      "Could not select hw_mode and channel. (-3)"，AP 直接起不来；
-	#   2) 5.2G 唯一的 160MHz 块（36~64）跨 DFS 区，开机要先做 1~10 分钟雷达静默检测；
-	#   3) 城中村高密度环境 160MHz 干扰重，80MHz 实际更稳、协商速率几乎无损。
-	sed -i "s/htmode='VHT80'/htmode='HE80'/g" $WIFI_SH
+	#5G 默认频宽：EHT160（Wi-Fi 7）。2026-09-21 由 HE80 改为 EHT160。
+	#   依据：① 本机网卡 MT7992E 是 802.11be —— `iw phy phy0 info` 明确列出
+	#         "EHT Iftypes: AP" 与 "EHT-MCS Map (BW = 160)"；
+	#         ② 厂家基准（Mwrt）默认就是 channel 36 + EHT160；
+	#         ③ 频谱占用与 HE160 完全相同（36-64 的 160MHz 块），不新增 DFS 风险。
+	#   真机实测：改为 EHT160 后 wifi reload 仅 5 秒 AP 即恢复、未触发 DFS 阻塞；
+	#             Wi-Fi 6 客户端仍按 160MHz HE-MCS 11 HE-NSS 2 协商（向下兼容无损）。
+	#   ⚠️ 不要退回「149 信道 + 160MHz」：CN 域 (5725-5850 @ 80) 只批 80MHz，
+	#      那样配 hostapd 会报 "Frequency 5845 is not allowed (seg0)" →
+	#      "Could not select hw_mode and channel. (-3)"，AP 直接起不来。
+	#      仅当所处环境雷达检测导致 36-64 的 160MHz 起不来时，才退回 HE80。
+	sed -i "s/htmode='VHT80'/htmode='EHT160'/g" $WIFI_SH
+	# 上游若改了默认频宽，上面的 sed 会零匹配却仍返回 0（GNU sed 的特性）→ 静默失效。
+	# 这里补一条可见性检查，让它至少吵一声。
+	grep -q "htmode='EHT160'" $WIFI_SH || echo "::warning::Settings: $WIFI_SH 中未匹配到 htmode='VHT80' 锚点，5G 频宽未被改写（上游可能改了默认值）"
 elif [ -f "$WIFI_UC" ]; then
 	#修改WIFI名称
 	sed -i "s/ssid='.*'/ssid='$WRT_SSID'/g" $WIFI_UC

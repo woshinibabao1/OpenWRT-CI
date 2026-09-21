@@ -75,19 +75,17 @@ case "$MODE" in
 		check_must_not luci-app-mt5700m
 		check_must_not sms-tool_q
 		check_must_not ubus-at-daemon
-		# 反向依赖探测：mt5700m 不应被任何包以 =y 拉入
-		if grep -qE '^CONFIG_PACKAGE_luci-app-mt5700m=[ym]' "$DOT_CONFIG"; then
-			echo "::error::检测到 MT5700 与 MT5700M 软件包冲突"
-		fi
+		# 注：原先这里还有一段 `grep -qE '^CONFIG_PACKAGE_luci-app-mt5700m=[ym]'` 的
+		# 「反向依赖探测」，但它与上一行 check_must_not 的判据**完全相同**
+		# （pkg_selected 用的就是 =[ym]），属纯重复；且它只 echo ::error:: 却不置 FAIL=1 ——
+		# 一旦有人删掉 check_must_not，这里就成了「只喊不拦」。已删除，拦截统一走 check_must_not。
 		;;
 	MT5700M )
 		check_must luci-app-mt5700m
 		check_must sms-tool_q
 		check_must ubus-at-daemon
 		check_must_not luci-app-mt5700
-		if grep -qE '^CONFIG_PACKAGE_luci-app-mt5700=[ym]' "$DOT_CONFIG"; then
-			echo "::error::检测到 MT5700M 与 MT5700 软件包冲突"
-		fi
+		# 同上：原先的 `grep -qE '^CONFIG_PACKAGE_luci-app-mt5700=[ym]'` 重复段已删除。
 		;;
 	"" )
 		check_must_not luci-app-mt5700

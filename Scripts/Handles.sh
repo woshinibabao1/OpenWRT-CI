@@ -9,24 +9,33 @@ else
 fi
 
 #修改argon主题字体和颜色
+ARGON_CFG="$PKG_PATH/luci-theme-argon/luci-app-argon-config/root/etc/config/argon"
 if [ -d "$PKG_PATH/luci-theme-argon" ]; then
 	echo " "
-	if sed -i "s/primary '.*'/primary '#31a1a1'/; s/'0.2'/'0.5'/; s/'none'/'bing'/; s/'600'/'normal'/" \
-		"$PKG_PATH/luci-theme-argon/luci-app-argon-config/root/etc/config/argon"; then
+	# ★ GNU sed 零匹配也返回 0，故必须先 grep 锚点再动手 ——
+	#   否则 `if sed -i ...; then echo fixed` 会把假成功报成已修复，
+	#   上游一改模板就静默失效（表现只是"主题颜色没生效"，很难联想到这步）。
+	if [ ! -f "$ARGON_CFG" ]; then
+		echo "::warning::theme-argon: 未找到 $ARGON_CFG（上游可能调了目录结构），配色未修正"
+	elif grep -q "primary '" "$ARGON_CFG"; then
+		sed -i "s/primary '.*'/primary '#31a1a1'/; s/'0.2'/'0.5'/; s/'none'/'bing'/; s/'600'/'normal'/" "$ARGON_CFG"
 		echo "theme-argon has been fixed!"
 	else
-		echo "theme-argon fix failed; continuing!"
+		echo "::warning::theme-argon: 未匹配锚点 \"primary '\"，配色未修正（上游可能已改模板）"
 	fi
 fi
 
 #修改mini-diskmanager菜单位置
+DISKMAN_MENU="$PKG_PATH/luci-app-mini-diskmanager/luci-app-mini-diskmanager/root/usr/share/luci/menu.d/luci-app-mini-diskmanager.json"
 if [ -d "$PKG_PATH/luci-app-mini-diskmanager" ]; then
 	echo " "
-	if sed -i "s/services/system/g" \
-		"$PKG_PATH/luci-app-mini-diskmanager/luci-app-mini-diskmanager/root/usr/share/luci/menu.d/luci-app-mini-diskmanager.json"; then
+	if [ ! -f "$DISKMAN_MENU" ]; then
+		echo "::warning::mini-diskmanager: 未找到 $DISKMAN_MENU，菜单位置未调整"
+	elif grep -q 'services' "$DISKMAN_MENU"; then
+		sed -i "s/services/system/g" "$DISKMAN_MENU"
 		echo "mini-diskmanager has been fixed!"
 	else
-		echo "mini-diskmanager fix failed; continuing!"
+		echo "::warning::mini-diskmanager: 菜单里已无 \"services\"，无需调整（上游可能已改到 system）"
 	fi
 fi
 
@@ -36,10 +45,13 @@ TS_FILE="$(find "$FEEDS_PACKAGES" -maxdepth 3 -type f -wholename '*/tailscale/Ma
 if [ -f "$TS_FILE" ]; then
 	echo " "
 
-	if sed -i '/\/files/d' "$TS_FILE"; then
+	if grep -q '/files' "$TS_FILE"; then
+		sed -i '/\/files/d' "$TS_FILE"
 		echo "tailscale has been fixed!"
 	else
-		echo "tailscale fix failed; continuing!"
+		# 零匹配不是错误：上游若本来就不再引用 /files，这里无事可做。原先的写法会把
+		# 这种情况报成 "fixed!"（sed 零匹配返回 0），反而掩盖"确实改了"与"没改"的区别。
+		echo "tailscale: Makefile 里已无 /files 引用，无需修复"
 	fi
 fi
 
@@ -48,14 +60,20 @@ RUST_FILE="$(find "$FEEDS_PACKAGES" -maxdepth 3 -type f -wholename '*/rust/Makef
 if [ -f "$RUST_FILE" ]; then
 	echo " "
 
-	if sed -i 's/ci-llvm=true/ci-llvm=false/g' "$RUST_FILE"; then
+	if grep -q 'ci-llvm=true' "$RUST_FILE"; then
+		sed -i 's/ci-llvm=true/ci-llvm=false/g' "$RUST_FILE"
 		echo "rust has been fixed!"
 	else
-		echo "rust fix failed; continuing!"
+		# 这条失效会让 rust 编译直接失败（构建当场变红），不会拖到真机才发现，故中性提示即可。
+		echo "rust: ci-llvm 已为 false 或上游改了写法，无需修复"
 	fi
 fi
 
 #修复 honk 包安装阶段 /var 目录冲突
+# ★ [当前不会生效] honk 插件已停用：Packages.sh 里 INSTALL_HONK_PREBUILT 被注释，
+#   Config/GENERAL.txt 里 honk 相关符号也全是注释态，package/ 下不会出现 honk，
+#   故下面这段 `[ -f "$HONK_FILE" ]` 目前恒为假。它是「随 INSTALL_HONK_PREBUILT
+#   一起启用」的配套修补 —— 将来重新启用 honk 时，这段会随之自动生效，别删。
 # 根因：honk 的 Package/honk/install 中执行 $(INSTALL_DIR) $(1)/var/share/honk，
 # 会在 pkgdir 下创建 var/ 目录；但 OpenWrt rootfs 中 /var 是指向 /tmp 的符号链接，
 # 构建系统复制 pkgdir 到 rootfs 时 cp 无法用目录覆盖符号链接，报错：
@@ -66,10 +84,11 @@ HONK_FILE="$(find "$PKG_PATH" -maxdepth 2 -type f -wholename '*/honk/Makefile' -
 if [ -f "$HONK_FILE" ]; then
 	echo " "
 
-	if sed -i '/chmod 0700 \$(1)\/var\/share\/honk/d; s# \$(1)/var/share/honk##g' "$HONK_FILE"; then
+	if grep -q 'var/share/honk' "$HONK_FILE"; then
+		sed -i '/chmod 0700 \$(1)\/var\/share\/honk/d; s# \$(1)/var/share/honk##g' "$HONK_FILE"
 		echo "honk /var directory conflict has been fixed!"
 	else
-		echo "honk fix failed; continuing!"
+		echo "honk: Makefile 里已无 var/share/honk 引用，无需修复"
 	fi
 fi
 
@@ -94,10 +113,17 @@ if [ -f "$PMC_FILE" ]; then
 
 	if grep -q 'allow-untrusted' "$PMC_FILE"; then
 		echo "package-manager: untrusted already allowed; skipping!"
-	elif sed -i 's|^\t*if flock -x 200; then|\t\t\t# install 默认允许未签名包（自编译 apk 无签名，否则装不上）\n\t\t\tif [ "$action" = "add" ] \&\& [ "$ipkg_bin" = "apk" ]; then\n\t\t\t\tcmd="$cmd --allow-untrusted"\n\t\t\tfi\n\t\t\tif flock -x 200; then|' "$PMC_FILE"; then
-		echo "package-manager: install now defaults to --allow-untrusted!"
+	elif ! grep -qP '^\t*if flock -x 200; then' "$PMC_FILE"; then
+		# ★ 必须显式区分「锚点不存在」与「sed 执行失败」：GNU sed 即使零匹配也返回 0，
+		#   而 `if sed -i ...; then` 会把零匹配的假成功报成 "has been fixed!"。
+		#   锚点一旦随上游改版消失，修补就不会写入，CI 仍全绿，直到真机上安装自编译 apk
+		#   才报 untrusted（错误信息只有一句 untrusted，极难定位到是这一步没生效）。
+		#   这里不 exit 1：该修补只影响「LuCI 里手动装包」这一次要能力，为它中断几小时的
+		#   构建不划算；但必须留下可见的警告。
+		echo "::warning::package-manager: 未找到锚点 'if flock -x 200; then'，--allow-untrusted 未注入；LuCI 软件页将装不上自编译 apk。请检查上游 $PMC_FILE"
 	else
-		echo "package-manager fix failed; continuing!"
+		sed -i 's|^\t*if flock -x 200; then|\t\t\t# install 默认允许未签名包（自编译 apk 无签名，否则装不上）\n\t\t\tif [ "$action" = "add" ] \&\& [ "$ipkg_bin" = "apk" ]; then\n\t\t\t\tcmd="$cmd --allow-untrusted"\n\t\t\tfi\n\t\t\tif flock -x 200; then|' "$PMC_FILE"
+		echo "package-manager: install now defaults to --allow-untrusted!"
 	fi
 fi
 

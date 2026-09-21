@@ -153,8 +153,13 @@ if [ "$MT_MODE" = "MT5700M" ]; then
 fi
 # UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
 # UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"
-# viking feed：仍克隆（其余包可能用到），但把已停用的包目录一并清掉，
-# 避免它们出现在 package/ 里被意外选中或拖慢 feeds 扫描。
+# viking feed：仍克隆（其余包可能用到），第 5 参数会在克隆前把 feeds 里已停用包的
+# 目录清掉。
+# ⚠️ 精确说明它到底清了哪里：UPDATE_PACKAGE 的删除循环只 find `../feeds/luci/` 与
+#    `../feeds/packages/`，所以 axonhub / gecoosac / timewol / wolplus / wolultra 会
+#    留在克隆出来的 `./packages/` 里（它们没被任何 Config 层选中，不进固件，只是多几个
+#    目录被 package/ 扫描）。真正需要"物理删掉"的只有 sing-box / luci-app-homeproxy，
+#    由下面那行 rm 处理。
 UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-box luci-app-homeproxy luci-app-timewol luci-app-wolplus luci-app-wolultra"
 
 # P06（加固，非必需）：viking feed 克隆到 ./packages/（git clone 的目录名取 URL 仓库名
@@ -305,12 +310,14 @@ INSTALL_NET_TUNING() {
 
 	[ -d "$SRC_DIR" ] || { echo "net-tuning: $SRC_DIR 不存在，跳过"; return 0; }
 
-	mkdir -p "$DST_DIR/etc/uci-defaults" "$DST_DIR/etc/sysctl.d" "$DST_DIR/etc/nftables.d"
+	mkdir -p "$DST_DIR/etc/uci-defaults" "$DST_DIR/etc/sysctl.d" "$DST_DIR/etc/nftables.d" "$DST_DIR/etc/hotplug.d/net"
 	cp -rf "$SRC_DIR/etc/." "$DST_DIR/etc/"
 	chmod 0755 "$DST_DIR/etc/uci-defaults/"* 2>/dev/null || true
 	# init.d 脚本必须带可执行位，否则 rc.common 不会执行它（git 不保存 exec 位，
 	# 所以必须在这一步补，不能依赖仓库里的文件权限）。
 	chmod 0755 "$DST_DIR/etc/init.d/"* 2>/dev/null || true
+	# hotplug 脚本同理：没有执行位时 hotplug.d 会直接跳过它（静默）。
+	chmod 0755 "$DST_DIR/etc/hotplug.d/net/"* 2>/dev/null || true
 	echo "net-tuning: 已注入 Files/etc → wrt/files/etc"
 
 	# P08：复制后无断言，调优脚本丢了没人知道（直接后果：刷完没网）。
@@ -322,6 +329,9 @@ INSTALL_NET_TUNING() {
 	# mt5700-rps：收包软中断四核分摊。缺了它 rps_cpus 会停在单核掩码，
 	# 「四核平均分」静默失效（不报错、不崩溃，只是吞吐上不去），必须硬断言。
 	[ -f "$DST_DIR/etc/init.d/mt5700-rps" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/init.d/mt5700-rps"; exit 1; }
+	# hotplug 补设 RPS：init.d 在 S95 跑时无线接口还没建出来（wpad 更晚），
+	# 缺了它无线 RPS 就是静默失效 —— 同样是"不报错但功能没生效"，必须硬断言。
+	[ -f "$DST_DIR/etc/hotplug.d/net/30-mt5700-rps" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/hotplug.d/net/30-mt5700-rps"; exit 1; }
 }
 
 case "$MT_MODE" in
@@ -372,8 +382,11 @@ INSTALL_HONK_PREBUILT() {
 		mediatek) HONK_ARCH="aarch64_cortex-a53" ;;
 	esac
 
-	# 定位 OpenWrt 工作区与 files 覆盖层
-	local WRT_FILES="${GITHUB_WORKSPACE:-$(pwd)/..}/wrt/files"
+	# 定位 OpenWrt 工作区与 files 覆盖层。
+	# 注意回退路径用 ../.. —— 本脚本的 cwd 是 wrt/package（见 WRT-CORE.yml），
+	# 与 INSTALL_NET_TUNING 保持一致；原先写的 $(pwd)/.. 会得到 wrt/wrt/files。
+	# （Actions 里 GITHUB_WORKSPACE 恒有值，所以这个错只在本地调试时才暴露。）
+	local WRT_FILES="${GITHUB_WORKSPACE:-$(pwd)/../..}/wrt/files"
 	local HONK_DIR="$WRT_FILES/etc/honk"
 	local UCI_DIR="$WRT_FILES/etc/uci-defaults"
 	mkdir -p "$HONK_DIR" "$UCI_DIR"

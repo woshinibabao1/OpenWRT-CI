@@ -1,5 +1,91 @@
 # 更新日志
 
+## [2026-09-21] 全仓检测一轮：修掉 3 处静默失效 + CI 健壮性加固
+
+对 34 个文件做了系统性审查（脚本层 / 固件覆盖层 / workflow 层三路并行），
+逐条验证后落地以下改动。
+
+### 修复 1（真 bug）：无线 RPS 一直没生效，且无任何日志
+
+`init.d/mt5700-rps` 的 `wait_ifaces()` 只等 `br-lan` —— 而它由 netifd 极早建立，
+于是函数几乎立刻返回；真正要等的无线接口由 wpad 更晚建立
+（真机实测 mt7996e 约开机 12 秒 probe、**25 秒**才进入 ap0 模式），
+S95 那一刻必然还不存在。
+
+后果被"告警条件"掩盖：告警只在「一个队列都没设上（`wifi_n=0` **且** `other_n=0`）」
+时触发，而有线队列已经设上了 → 连日志都没有。真机取证也印证：
+`phy0.1-ap0/queues/rx-0/rps_cpus = 0`（完全没设），有线的三个接口都是 `f`。
+
+三处修复：
+1. **新增 `Files/etc/hotplug.d/net/30-mt5700-rps`**：接口 `add` 事件上重跑
+   `mt5700-rps start`（幂等、毫秒级），从时序上兜住 init.d 的窗口；只对无线接口名触发。
+2. `wait_ifaces()` 改为**明确只等 br-lan** 并把超时从 20 秒缩到 10 秒，
+   不再"假装在等无线"（注释写明分工）。
+3. `wifi_n=0` 时补一条 info 日志，避免下次再静默。
+4. `Packages.sh` 的 `INSTALL_NET_TUNING` 增加 hotplug 目录的创建、`chmod 0755`
+   与**硬断言**（缺了它同样是"不报错但功能没生效"）。
+
+### 修复 2：CI 健壮性（4 项）
+
+| 位置 | 问题 | 改法 |
+|---|---|---|
+| `WRT-CORE.yml` core job | 5 个 workflow 全都没有 `concurrency`。定时链（Auto-Clean → H5000M-MT-AUTO）与手动 WRT-BUILD 会重叠，两者共用同一套缓存 key，而 `actions/cache` 对已存在的 key 是**跳过保存** → 后完成的那次白编；且 Tag 含日期，同一天产出两个 Release | 加 `concurrency`，`cancel-in-progress: false`（后来者排队，不杀前一个） |
+| `WRT-CORE.yml` Clone Code | 整条流水线第二步是裸奔的 `git clone`，一次瞬时抖动就让后续几小时构建归零（上面的 curl 早就有 `--retry 5`） | 加 3 次重试（重试前先清理残目录，否则会因 path already exists 直接失败）+ 失败即 error |
+| `WRT-CORE.yml` 打包 | `WRT_KVER` 用 `find ... -exec` 可能输出**多行**，多行值写进 `$GITHUB_ENV` 会以 `Invalid format` 让该步骤失败（旁边的 `WRT_LIST` 早就用 `tr` 收敛过） | 末尾加 `\| head -n 1` |
+| `Auto-Clean.yml` | 定时触发时 `inputs` 为空 → 判定为"不保留" → **先删光所有 Release**，随后构建要 3~6 小时；这段窗口仓库里一个固件都没有，想刷回上一版都做不到 | schedule 事件一律按 keep-latest 处理，每个机型至少留最新一个 |
+
+### 修复 3：5 处 sed「假成功」（GNU sed 零匹配也返回 0）
+
+`Handles.sh` 里所有 `if sed -i ...; then echo "xxx has been fixed!"` 都是假的：
+零匹配照样返回 0，于是永远打印成功。上游一旦改版，修补不会写入但 CI 全绿。
+
+改为**先 grep 锚点再动手**，并区分三种情况（文件不存在 / 锚点不匹配 / 已是最新）。
+覆盖 argon 配色、mini-diskmanager 菜单位置、tailscale `/files`、rust `ci-llvm`、honk `/var`。
+其中 **PMC（package-manager-call）那条后果最重**：失效会让真机上 LuCI「软件 → 安装」
+装不上任何自编译 apk，错误信息只有一句 untrusted，极难定位到是 CI 这一步没生效。
+该条失效时输出 `::warning::`（不 `exit 1`：它只影响手动装包这一次要能力，
+为它中断几小时构建不划算）。
+
+### 修复 4：补上缺失的 `Config/MT5700M.txt`
+
+`ApplyMTMode.sh` 的 MT5700M 分支要求该文件存在，缺了直接
+`::error::缺少 .../Config/MT5700M.txt` + `exit 1` —— 但它**此前并不存在**，
+意味着切到 MT5700M 必失败，且 `Packages.sh` 会先克隆 + 折叠 + cargo 编 Rust 后端
+白烧几分钟才报错。已按上游 Makefile 核实的依赖补齐（已确认
+`LUCI_DEPENDS := +luci-base +ubus-at-daemon +sms-tool_q`，kmod 侧 GENERAL.txt 齐备），
+文件内注明"自 2026-09-15 起未用于出固件，未经真机验证"。
+
+### 清理与修正
+
+- `VerifyMTMode.sh`：MT5700/MT5700M 两个分支各有一段 `grep -qE '...=[ym]'` 的
+  "反向依赖探测"，与上一行 `check_must_not` 判据**完全相同**（`pkg_selected` 用的就是
+  `=[ym]`），且只 `echo ::error::` 却不置 `FAIL=1` → 已删除，拦截统一走 `check_must_not`。
+- `Packages.sh`：`HONK` 段的 `WRT_FILES` 回退路径 `$(pwd)/..` → `$(pwd)/../..`
+  （cwd 是 `wrt/package`，原写法得到 `wrt/wrt/files`；Actions 里 `GITHUB_WORKSPACE` 恒有值，
+  所以只在本地调试时暴露）。
+- 注释不实修正：
+  - `99-mt5700-net` 头部说软件卸载"默认打开（MODE=auto…）" → 实际**默认 off**
+    （`Files/etc/mt5700/flow-offload` 与 `ApplyFlowOffload.sh` 都是 off），
+    且 auto 分支里的 TTL 探测只在显式选 auto 时才走到；
+  - `99-mt5700-conntrack.conf` 说 buckets "本机默认 63488"，与该文件自己第 41 行
+    （也是实测值 65536）自相矛盾 → 已更正为 65536；
+  - `mt5700-rps` 里 IRQ 累计次数写 140 万、另两个文件写 186 万 → 统一改为"百万次量级"，
+    避免三个文件三个数字；
+  - `Packages.sh` 的 viking 注释说"避免它们出现在 package/ 里"，实际删除循环只 find
+    `../feeds/...`，克隆出来的 `./packages/` 里那些包仍在 → 已按真实行为改写。
+- `Handles.sh` 的 honk 段补标注：honk 已停用（`INSTALL_HONK_PREBUILT` 被注释），
+  这段目前恒不命中，属"随它一起启用"的配套修补，勿删。
+
+### 评估后未改动（附理由）
+
+| 项 | 理由 |
+|---|---|
+| `Packages.sh` 的 `UPDATE_VERSION()` 无调用点 | 它是上游模板函数、注释里带用法示例，删掉会让 fork 用户少一个工具；且不是错误逻辑，不算残留 |
+| `mt5700-rps` 对非无线接口统一用全核掩码 `f` | 与它注释里"应避开硬中断核"的原则不完全一致，但无线侧已按硬中断核动态排除；有线/USB 侧实测全核分散更好，改动需重新压测，本轮不动 |
+| `12-mangle-ttl-128.nft` 依赖 fw4 的 `$wan_devices` | 若 wan 区被改名会导致符号未定义、整表加载失败。真机 `nft -c` 当前通过；写死 `{ eth1, eth2 }` 会失去动态性，暂保持现状并记录风险 |
+| `WRT_TEST` 在两个调用方类型不一致（boolean vs 字符串） | 靠隐式转换，当前行为正确；统一会动到调用契约，收益低于风险 |
+| `actions/cache@v4` 的 `save-always` 无效 | 官方已标注该输入不按预期工作（其 `post-if` 仍要求 `success()`）。正确改法是拆 `cache/restore` + `cache/save`，涉及缓存策略重构，单独一轮做更稳 |
+
 ## [2026-09-21] 深挖厂家基准：无线升 EHT160、conntrack expect 表对齐
 
 本轮把对比从「插件层」下沉到 **内核参数 / sysctl / nft / hotplug / 无线默认值**：

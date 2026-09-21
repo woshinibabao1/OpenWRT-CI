@@ -101,6 +101,14 @@ jobs:
   core:
     name: ${{inputs.WRT_SOURCE}}
     runs-on: ubuntu-latest
+    # 防两次构建互踩：定时链（Auto-Clean → H5000M-MT-AUTO）与手动 WRT-BUILD 可能重叠，
+    # 而两者共用同一套缓存 key（wrt-tc-$WRT_TARGET-$WRT_INFO-$WRT_BRANCH-$WRT_CACHE_WEEK）。
+    # actions/cache 对已存在的 key 是**跳过保存**，后完成的那次白编；且 Tag 含日期，
+    # 同一天会产出两个 Release（Auto-Clean 已跑完，不会再去清）。
+    # cancel-in-progress: false = 后来者**排队**而非杀掉前一个 —— 编译到一半被杀最浪费机时。
+    concurrency:
+      group: wrt-build-${{inputs.WRT_CONFIG}}-${{inputs.MT_MODE}}
+      cancel-in-progress: false
     # 略低于平台 6h 硬上限：被硬上限杀掉时 runner 直接终止，
     # 缓存的 post 保存步骤会被整段跳过，下次必然冷编译。
     timeout-minutes: 345
@@ -166,7 +174,18 @@ jobs:
 
       - name: Clone Code
         run: |
-          git clone --depth=1 --single-branch --branch $WRT_BRANCH $WRT_REPO ./wrt/
+          # 整条流水线的第二步，此前是裸奔的 git clone —— 一次瞬时抖动就让后面
+          # 几小时的构建在第 2 步归零（上面的 curl 早就加了 --retry 5）。
+          # 重试前必须先删残留目录，否则重试会因 "destination path already exists" 直接失败。
+          for TRY in 1 2 3; do
+            if git clone --depth=1 --single-branch --branch $WRT_BRANCH $WRT_REPO ./wrt/; then
+              break
+            fi
+            echo "::warning::git clone 第 $TRY 次失败，15 秒后重试"
+            rm -rf ./wrt/
+            sleep 15
+          done
+          [ -d ./wrt/.git ] || { echo "::error::git clone 连续 3 次失败：$WRT_REPO@$WRT_BRANCH"; exit 1; }
 
           cd ./wrt/ && echo "WRT_HASH=$(git log -1 --pretty=format:'%h')" >> $GITHUB_ENV
 
@@ -408,7 +427,10 @@ jobs:
           cp -f ./.config ./upload/Config-"$WRT_CONFIG"-"$WRT_MT"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_DATE".txt
 
           if [[ $WRT_TEST != 'true' ]]; then
-            echo "WRT_KVER=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^kernel - \K[\d\.]+' {} \;)" >> $GITHUB_ENV
+            # WRT_KVER 必须收敛为**一行**：每个 manifest 都会输出一行内核版本，
+            # 产物里一旦出现第二个 manifest，多行值写进 $GITHUB_ENV 会以
+            # "Invalid format" 让本步骤直接失败（旁边的 WRT_LIST 早就用 tr 收敛过）。
+            echo "WRT_KVER=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^kernel - \K[\d\.]+' {} \; | head -n 1)" >> $GITHUB_ENV
             echo "WRT_LIST=$(find ./bin/targets/ -type f -name "*.manifest" -exec grep -oP '^luci-(app|theme)[^ ]*' {} \; | tr '\n' ' ')" >> $GITHUB_ENV
 
             # P05（双校验之二）：编译后断言产物 manifest 不含 sing-box / homeproxy。

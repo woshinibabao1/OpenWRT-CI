@@ -4,7 +4,7 @@
 #
 # ── 三层事实（均为 2026-09-21 真机实测，非推测）─────────────────────────
 #   1. 无线 mt7996e 硬中断（IRQ 79）与 USB 5G 模组（IRQ 74）**100% 落在 CPU0**，
-#      累计 140 万次从未迁移；irqbalance 全程只动了以太网的两个（67→CPU1、68→CPU3）。
+#      累计百万次量级从未迁移；irqbalance 全程只动了以太网的两个（67→CPU1、68→CPU3）。
 #      单个 MSI 中断只能被一个核响应 —— **smp_affinity 写成全核 f 也不等于分摊**，
 #      内核仍固定选一个核（实测就是 CPU0）。硬件层面劈不开，只能靠 RPS 分流。
 #   2. 固件默认 rps_cpus 是**单核掩码**（phy0.1-ap0=4 → CPU2、eth2=8 → CPU3），
@@ -29,8 +29,6 @@
 START=95
 STOP=10
 
-# 无线接口名特征（主线 mt76 是 phyX.Y-apN，MTK 闭源驱动是 ra0/rai0，通用是 wlanX）
-WIFI_IFACE_GLOB='phy*|*-ap*|ra0|rai0|wlan*'
 # 无线硬中断在 /proc/interrupts 里的设备名特征
 WIFI_IRQ_MATCH='mt76|mt79|mt798|wifi|phy[0-9]|wlan|ra[0-9]|rai[0-9]'
 
@@ -70,10 +68,15 @@ wifi_irq_cpu() {
 		}' /proc/interrupts
 }
 
-# 等接口就绪：无线接口由 netifd/wpad 稍后才建出来，跑太早会漏设
+# 等 br-lan（有线/网桥就绪的判据），最多 10 秒。
+# ★ 不要在这里死等无线：无线接口由 wpad 稍后建立 —— 真机实测 mt7996e 约开机 12 秒
+#   probe、**25 秒**才进入 ap0 模式，而本脚本在 S95 跑，死等会白白拖慢启动。
+#   原先的实现就是只等 br-lan 却指望无线队列已存在，导致无线 RPS 静默落空
+#   （且因为"其它队列 >0"连告警都不会触发）。
+#   现在缺的无线队列由 Files/etc/hotplug.d/net/30-mt5700-rps 在接口 add 事件上补设。
 wait_ifaces() {
 	local i=0
-	while [ $i -lt 20 ]; do
+	while [ $i -lt 10 ]; do
 		[ -d /sys/class/net/br-lan ] && return 0
 		i=$(( i + 1 ))
 		sleep 1
@@ -136,6 +139,10 @@ start() {
 		log "警告：一个接收队列都没设上，接口可能尚未就绪"
 		return 1
 	fi
+
+	# 无线队列在 S95 时通常还没出现（wpad 未建立接口），属正常时序，不算异常；
+	# 由 hotplug.d/net/30-mt5700-rps 在接口 add 时补设。
+	[ "$wifi_n" -eq 0 ] && log "无线队列尚未就绪（wpad 未建接口），交由 hotplug 补设"
 
 	log "RPS 完成（$ncpu 核）：无线队列 $wifi_n 个=0x$wifi_hex、其它队列 $other_n 个=0x$all_hex；XPS $tx_n 个=0x$all_hex"
 }
