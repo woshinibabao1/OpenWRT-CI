@@ -330,6 +330,9 @@ INSTALL_NET_TUNING() {
 	mkdir -p "$DST_DIR/etc/uci-defaults" "$DST_DIR/etc/sysctl.d"
 	cp -rf "$SRC_DIR/etc/." "$DST_DIR/etc/"
 	chmod 0755 "$DST_DIR/etc/uci-defaults/"* 2>/dev/null || true
+	# init.d 脚本必须带可执行位，否则 rc.common 不会执行它（git 不保存 exec 位，
+	# 所以必须在这一步补，不能依赖仓库里的文件权限）。
+	chmod 0755 "$DST_DIR/etc/init.d/"* 2>/dev/null || true
 	echo "net-tuning: 已注入 Files/etc → wrt/files/etc"
 }
 

@@ -1,0 +1,77 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# H5000M 系统级优化 —— 首次开机由 uci-defaults 执行一次，执行后自动删除。
+#
+# 三项：① zram 内存压缩交换 ② 无线客户端互通（关 AP 隔离）③ 启用四核均衡调度。
+# proxy_arp_pvlan 不在这里做，它在 /etc/sysctl.d/99-mt5700-lan.conf 里，
+# 由 sysctl 服务加载（写在这里的话开机太早，br-lan 还没建好）。
+
+# ---------- 1. zram 内存压缩交换（512M）----------
+# H5000M 物理内存 1GB。参考固件（Mwrt）实测 zram0 ≈ 494MB，这里取 512M。
+# zram 本身就是「内存压缩」：把不活跃页压缩后仍留在 RAM 里，
+# 比写磁盘快几个数量级；H5000M 是 eMMC，频繁写 swap 还会缩短寿命，zram 完全避开。
+#
+# 算法 lzo-rle：速度与压缩率的平衡点。内核不支持时 /etc/init.d/zram-swap
+# 会自动回退到 lzo（参考固件就是 lzo）。想要更高压缩率可改成 zstd，
+# 代价是压缩/解压更吃 CPU —— 改 /etc/config/system 的 zram_comp_algo 即可。
+#
+# 注意：zram 上限是「压缩后的数据上限」，实际占用的物理内存约为此值的
+# 1/2 ~ 1/3，并不会真的吃掉 512M 物理内存。
+# ⚠️ 脚本名是 /etc/init.d/zram，不是 zram-swap：
+#   package/system/zram-swap/Makefile 里写的是
+#     $(INSTALL_BIN) ./files/zram.init $(1)/etc/init.d/zram
+#   —— 包名与实际安装的 init 脚本名不一致（真机已核实：参考固件的
+#      /etc/init.d/ 下只有 zram）。写错名字会让整段被静默跳过。
+#   这里两个名字都探测，兼容不同版本。
+ZRAM_INIT=""
+for CANDIDATE in /etc/init.d/zram /etc/init.d/zram-swap; do
+	[ -x "$CANDIDATE" ] && {
+		ZRAM_INIT="$CANDIDATE"
+		break
+	}
+done
+
+if [ -n "$ZRAM_INIT" ]; then
+	uci -q set system.@system[0].zram_size_mb='512'
+	uci -q set system.@system[0].zram_comp_algo='lzo'
+	uci -q commit system
+	"$ZRAM_INIT" enable
+	logger -t mt5700-sys "已配置 zram 512M（$ZRAM_INIT）"
+else
+	logger -t mt5700-sys "未找到 zram init 脚本，跳过 zram 配置"
+fi
+
+# ---------- 2. 无线：关闭客户端隔离 ----------
+# isolate=1 是 AP 隔离，同一 SSID 下的设备互相不可见。
+# MLO 场景下同一台客户端的多个射频会被当成不同设备、彼此隔离，
+# 表现为「连上 WiFi 却访问不了同网段设备（NAS/投屏/另一台手机）」。
+# OpenWrt 默认本就是 0，这里显式写一遍，防止固件模板或 MLO 路径把它打开。
+for SECTION in $(uci -q show wireless | awk -F= '$2 == "wifi-iface" { print $1 }'); do
+	uci -q set "${SECTION}.isolate"='0'
+done
+uci -q commit wireless
+
+# ---------- 3. 启用四核均衡调度 ----------
+# 真正的活由 /etc/init.d/mt5700-smp 每次开机做（中断亲和 + RPS/XPS），
+# 这里只负责把它设为开机自启。
+if [ -x /etc/init.d/mt5700-smp ]; then
+	/etc/init.d/mt5700-smp enable
+fi
+
+# ---------- 4. NTP 换成国内服务器 ----------
+# 依据：参考固件（Mwrt）实测用的是腾讯/阿里/国家授时中心。
+# OpenWrt 默认的 pool.ntp.org 在国内解析与往返都慢，5G CPE 冷启动后
+# 系统时间可能要拖很久才同步 —— 时间不对会让 HTTPS 证书校验失败，
+# 表现为「能上网但所有 https 站点都报证书错误」。
+# 只在 system.ntp 段已存在时改，避免给别的机型凭空建段。
+if uci -q get system.ntp >/dev/null 2>&1; then
+	uci -q delete system.ntp.server 2>/dev/null
+	for SVR in ntp.tencent.com ntp1.aliyun.com ntp.ntsc.ac.cn cn.ntp.org.cn; do
+		uci -q add_list "system.ntp.server=$SVR"
+	done
+	uci -q set system.ntp.enabled='1'
+	uci -q set system.ntp.enable_server='0'
+	uci -q commit system
+fi
+
+exit 0

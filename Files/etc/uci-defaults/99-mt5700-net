@@ -23,11 +23,20 @@ if [ -f /etc/sysctl.d/99-mt5700-tcp.conf ]; then
 fi
 
 # ---------- 3. 中断均衡 ----------
-# 实测 mt7996e 与 USB 5G 模组的中断默认全压 CPU0，其余三核为 0。
+# 实测无线与 USB 5G 模组的中断默认全压 CPU0，其余三核为 0。
+#
+# 这里【不再启用 irqbalance】：irqbalance 会按自己的策略改写
+# /proc/irq/*/smp_affinity，与 mt5700-smp 的静态绑定互相覆盖，两者只能留一个。
+# 四核均摊改由 /etc/init.d/mt5700-smp 负责（中断轮询亲和 + RPS/XPS），
+# 开机自启在 99-mt5700-sys 里打开，该服务启动时会主动停用 irqbalance。
+#
+# 想换回 irqbalance（两者效果请自行实测对比，本固件默认选静态绑定）：
+#   /etc/init.d/mt5700-smp disable && /etc/init.d/mt5700-smp stop
+#   /etc/init.d/irqbalance enable && /etc/init.d/irqbalance start
 if [ -f /etc/config/irqbalance ]; then
-	uci -q set irqbalance.@irqbalance[0].enabled='1'
+	uci -q set irqbalance.@irqbalance[0].enabled='0'
 	uci -q commit irqbalance
-	/etc/init.d/irqbalance enable 2>/dev/null || true
+	/etc/init.d/irqbalance disable 2>/dev/null || true
 fi
 
 # ---------- 4. 5G 无线：锁定 36 信道 + 80MHz ----------

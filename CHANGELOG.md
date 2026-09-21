@@ -1,4 +1,83 @@
 # 更新日志
+## [2026-09-21] 系统层优化：四核调度 / zram 内存压缩交换 / LAN 二层互通
+
+### 背景
+
+以参考固件（Hiveton H5000M 上的 Mwrt，`192.168.88.1`）为对照做实测取证，它有四项本仓库没有的能力：
+
+| 能力 | 参考固件实测 | 本仓库（官方 immortalwrt master） |
+|---|---|---|
+| 四核 IRQ/RPS 均摊 | `mtk-smp`（`/sbin/smp.sh` + `/etc/init.d/mtk_smp`） | 无，只有 irqbalance |
+| 内存压缩交换 | `zram0` ≈ 494MB，算法 `lzo` | 无 |
+| MLO 跨射频 ARP 代答 | 可用 | 未开 |
+| 无线客户端互通 | `isolate` 未设置（=0） | 未显式约束 |
+
+本次把四项补齐，并顺带把 NTP 换成国内服务器。
+
+### 新增
+
+1. **`Files/etc/init.d/mt5700-smp`** —— 四核均衡调度服务（每次开机运行）
+   - 中断轮询绑定到 CPU0..CPU3；RPS/XPS 摊到全核；关闭 GRO fraglist
+   - **不硬编码 IRQ 号**：按 `/proc/interrupts` 的设备名动态匹配。
+     mtk 闭源驱动常见 237/245，主线 mt76 是另一套，写死必然失效
+2. **`Files/etc/uci-defaults/99-mt5700-sys`** —— 首次开机配置
+   - zram 512M + 算法 `lzo`；无线 `isolate=0`；启用 `mt5700-smp`；NTP 换国内
+3. **`Files/etc/sysctl.d/99-mt5700-lan.conf`** —— `proxy_arp_pvlan=1`
+
+### 变更
+
+- `Files/etc/uci-defaults/99-mt5700-net`：irqbalance 由**启用改为停用**（与静态亲和互斥，两者只能留一个）
+- `Scripts/Packages.sh`：`INSTALL_NET_TUNING()` 补 `chmod 0755 etc/init.d/*`
+  （git 不保存 exec 位，不补则 init 脚本开机不会被执行）
+- `Config/GENERAL.txt`：`CONFIG_PACKAGE_zram-swap=y`
+- `.github/workflows/WRT-CORE.yml`：关键包自检加入 `zram-swap`
+
+### 两个易踩的坑（已规避，勿改回）
+
+1. **zram 的 init 脚本名是 `/etc/init.d/zram`，不是 `zram-swap`**
+   —— `package/system/zram-swap/Makefile` 里写的是
+   `$(INSTALL_BIN) ./files/zram.init $(1)/etc/init.d/zram`。
+   真机 `/etc/init.d/` 下只有 `zram`。写错名字会导致整段配置被静默跳过。
+   脚本已同时探测两个名字以兼容不同版本。
+2. **压缩算法固定 `lzo`** —— OpenWrt 的 `zram.init` 注释明写
+   "default to lzo, which is always available"，这是唯一保证存在的算法。
+   `lzo-rle` / `zstd` 需先 `cat /sys/block/zram0/comp_algorithm` 确认内核支持。
+
+### 未做：mtkhnat 的 s2s（内网到内网转发）
+
+`uci set mtkhnat.global.s2s='1'` 本轮**没有落地**，原因是实测三条证据：
+
+1. 参考固件 `uci show mtkhnat` → `Entry not found`，且无 `/etc/init.d/mtkhnat`；
+   其 `mtkhnat.ko` 里 `strings | grep s2s` 无结果
+2. 参考固件的 hnat 走 debugfs（`echo [type] [option] > /sys/kernel/debug/hnat/hnat_setting`，
+   已知 type 8=IPv6、11=bind_rate、12=macvlan），没有 UCI 配置层
+3. 本仓库用官方 `immortalwrt/immortalwrt` master，`target/linux/mediatek/files/.../mtk_hnat` 不存在
+
+补充：Hiveton 的 higowrt 文档提到 OpenWrt 25.12 起主线自带 mtkhnat 内核 patch
+（`999-274x`，`CONFIG_NET_MEDIATEK_HNAT=m`），但它与 `Files/etc/uci-defaults/99-mt5700-net`
+里为 SQM/CAKE 而**关闭 flow offload** 的策略直接冲突——硬件加速会绕过 qdisc，
+CAKE 整形失效。若要 s2s，需先决定放弃 CAKE，属另一次权衡。
+
+另有资料指出 mt798x 每 PPE 仅 16K entry，开 s2s 会让 LAN 内网流量挤占条目、
+削弱 WAN 加速，家用场景不推荐。
+
+### 验证（真机 dry-run，未写入、未 commit）
+
+在参考固件（H5000M，4 核）上跑通：
+
+```
+ncpu=4  mask_all=f
+irq=66 cpu=0  15100000.ethernet     irq=77 cpu=1  mt7992-vec_data0
+irq=67 cpu=1  15100000.ethernet     irq=79 cpu=2  xhci-hcd:usb1
+irq=68 cpu=2  15100000.ethernet     irq=84 cpu=3  mt7992-wed
+irq=69 cpu=3  15100000.ethernet
+irq=71 cpu=0  15100000.ethernet
+合计 8 个中断参与轮询绑定；rps 队列 13 / xps 队列 58；ethtool 可用
+zram init 探测命中 /etc/init.d/zram
+```
+
+`sh -n` 语法检查：`mt5700-smp`、`99-mt5700-sys`、`99-mt5700-net` 全部通过。
+
 ## [2026-09-15] 修复 luci-app-homeproxy 的 sing-box 版本约束导致的构建失败
 
 ### 故障现象

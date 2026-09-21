@@ -241,7 +241,7 @@ jobs:
           # 关键包选择自检：kconfig 对不存在的包会静默丢弃（不报错），
           # 所以光看“defconfig 成功”不能证明包名有效，这里把新增项打印出来核对。
           echo "===== 关键包选择自检（缺失即代表包名无效，会被静默丢弃）====="
-          grep -E '^CONFIG_PACKAGE_(kmod-sched-core|kmod-sched|kmod-sched-cake|kmod-sched-pie|kmod-sched-fq-pie|kmod-ifb|kmod-tcp-bbr|tc-full|ethtool|irqbalance|luci-app-irqbalance|sqm-scripts|luci-app-mt5700|luci-app-mt5700m|sms-tool_q|ubus-at-daemon)=' .config || true
+          grep -E '^CONFIG_PACKAGE_(kmod-sched-core|kmod-sched|kmod-sched-cake|kmod-sched-pie|kmod-sched-fq-pie|kmod-ifb|kmod-tcp-bbr|tc-full|ethtool|irqbalance|luci-app-irqbalance|sqm-scripts|zram-swap|luci-app-mt5700|luci-app-mt5700m|sms-tool_q|ubus-at-daemon)=' .config || true
           echo "----- 目标与内核选项 -----"
           grep -E '^(CONFIG_TARGET_MULTI_PROFILE|CONFIG_TARGET_ALL_PROFILES|CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_hiveton_h5000m)=' .config || true
           grep -E '^CONFIG_(DEFAULT_TCP_CONG|TCP_CONG_BBR|KERNEL_TCP_CONG_BBR|KERNEL_NET_SCH_CAKE|KERNEL_NET_SCH_FQ)=' .config || true

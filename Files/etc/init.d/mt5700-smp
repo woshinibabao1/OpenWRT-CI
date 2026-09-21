@@ -1,0 +1,138 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: MIT
+# H5000M / MT7987A 四核均衡调度（"让四核平均分，不偷懒"）
+#
+# 背景（实测）：无线（mt7992/BE5040 一类）与 USB 5G 模组的中断默认几乎全压 CPU0，
+#   其余三核计数长期为 0；高吞吐时单核先打满，整机提前降速。
+#
+# 做法：
+#   1) 把相关中断按轮询绑定到 CPU0..CPU3，保证每核都有活干；
+#   2) 给所有网络接口设 RPS/XPS，把软中断摊到全部核；
+#   3) 关 irqbalance：它按自己的拓扑模型改写 smp_affinity，在本机 ARM 上
+#      实测并不能把中断摊平，反而会覆盖掉上面的静态绑定。二者只能留一个。
+#
+# ⚠️ 不硬编码 IRQ 号：不同驱动中断号完全不同（mtk 闭源驱动常见 237/245，
+#   主线 mt76 是另一套），这里按 /proc/interrupts 里的设备名动态匹配。
+#
+# 回滚：/etc/init.d/mt5700-smp disable && /etc/init.d/mt5700-smp stop
+#       再 /etc/init.d/irqbalance enable && /etc/init.d/irqbalance start
+
+START=99
+STOP=10
+
+# 参与均衡的中断关键字（匹配 /proc/interrupts 整行，含末尾设备名）
+IRQ_MATCH='eth|mt76|mt79|mt798|wifi|wlan|phy[0-9]|xhci|usb|hnat|wed|pcie|qdma|ra[0-9]|rai[0-9]'
+
+# 不碰的中断：时钟/定时器/IPI 交给内核自己管，乱绑会拖垮调度
+IRQ_SKIP='arch_timer|arch_mem_timer|timer|IPI|reschedule|function|cpu-boost|gtimer'
+
+log() {
+	logger -t mt5700-smp "$1"
+}
+
+ncpu_get() {
+	grep -c '^processor' /proc/cpuinfo
+}
+
+# 全核掩码的十六进制形式（4 核 -> f）
+mask_all() {
+	local n="$1"
+	printf '%x' $(( (1 << n) - 1 ))
+}
+
+# 列出待均衡的中断号
+list_irqs() {
+	awk -v m="$IRQ_MATCH" -v s="$IRQ_SKIP" '
+		$1 ~ /^[0-9]+:$/ {
+			irq = $1
+			sub(/:$/, "", irq)
+			if ($0 ~ s) next
+			if ($0 ~ m) print irq
+		}' /proc/interrupts
+}
+
+apply_affinity() {
+	local ncpu="$1"
+	local i=0 irq cpu
+	for irq in $(list_irqs); do
+		cpu=$(( i % ncpu ))
+		printf '%x' $(( 1 << cpu )) > "/proc/irq/$irq/smp_affinity" 2>/dev/null
+		i=$(( i + 1 ))
+	done
+	echo "$i"
+}
+
+apply_rps() {
+	local mask="$1"
+	local n=0 d q
+	for d in /sys/class/net/*/queues; do
+		[ -d "$d" ] || continue
+		for q in "$d"/rx-*; do
+			[ -e "$q/rps_cpus" ] || continue
+			echo "$mask" > "$q/rps_cpus" 2>/dev/null && n=$(( n + 1 ))
+		done
+		for q in "$d"/tx-*; do
+			[ -e "$q/xps_cpus" ] || continue
+			echo "$mask" > "$q/xps_cpus" 2>/dev/null
+		done
+	done
+	echo "$n"
+}
+
+# 关闭 GRO fraglist：mtk 原厂 smp 脚本也这么做，能抬高软件转发峰值
+disable_gro_fraglist() {
+	command -v ethtool >/dev/null 2>&1 || return 0
+	local d
+	for d in /sys/class/net/*; do
+		d="${d##*/}"
+		[ -e "/sys/class/net/$d" ] || continue
+		ethtool -k "$d" 2>/dev/null | grep -q 'rx-gro-list' || continue
+		ethtool -K "$d" rx-gro-list off 2>/dev/null
+	done
+}
+
+start() {
+	local ncpu mask irq_n rps_n
+	ncpu="$(ncpu_get)"
+	if [ "$ncpu" -lt 2 ]; then
+		log "CPU 数=$ncpu，无需均衡，跳过"
+		return 0
+	fi
+	mask="$(mask_all "$ncpu")"
+
+	# irqbalance 与本脚本互斥，留本脚本
+	if [ -x /etc/init.d/irqbalance ]; then
+		/etc/init.d/irqbalance stop 2>/dev/null
+		/etc/init.d/irqbalance disable 2>/dev/null
+		log "已停用 irqbalance（与静态亲和互斥）"
+	fi
+
+	irq_n="$(apply_affinity "$ncpu")"
+	rps_n="$(apply_rps "$mask")"
+	disable_gro_fraglist
+
+	log "均衡完成：$irq_n 个中断轮询绑到 $ncpu 核；$rps_n 个接收队列 RPS 掩码=$mask"
+}
+
+stop() {
+	local ncpu mask
+	ncpu="$(ncpu_get)"
+	mask="$(mask_all "$ncpu")"
+	local irq
+	for irq in $(list_irqs); do
+		echo "$mask" > "/proc/irq/$irq/smp_affinity" 2>/dev/null
+	done
+	local f
+	for f in /sys/class/net/*/queues/rx-*/rps_cpus; do
+		[ -e "$f" ] && echo 0 > "$f" 2>/dev/null
+	done
+	for f in /sys/class/net/*/queues/tx-*/xps_cpus; do
+		[ -e "$f" ] && echo 0 > "$f" 2>/dev/null
+	done
+	log "已还原为内核默认（全核亲和 + RPS 关闭）"
+}
+
+restart() {
+	stop
+	start
+}
