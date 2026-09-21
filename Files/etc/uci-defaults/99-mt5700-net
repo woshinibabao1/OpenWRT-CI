@@ -141,12 +141,54 @@ fi
 # ⚠️ 验证必须用**多流**：RPS 按 flow hash 选核，同一条 TCP 流的所有包
 #    必然落在同一个核（避免乱序），单流压测会误判成"全核掩码反而更差"。
 
-# 4a. netifd 原生 packet steering（由 uci 驱动，接口 up 时自动设置）
-if [ -z "$(uci -q get network.globals)" ]; then
-	uci -q set network.globals=globals
+# ⚠️⚠️ 2026-09-22 实测推翻了下面这段旧做法，改为**关掉** packet steering（见 4a）。
+# 旧注释留着是为了记录当时的误判，别照着恢复。
+#
+# 4a. netifd 原生 packet steering —— 必须关掉，不能再用（2026-09-22 实测）
+#
+# 冲突实锤（2026-09-22，本机 4 核 MT7987，**全程未动任何真实接口**）：
+#   1. 手工写入 mt5700-rps 的期望值：phy0.1-ap0=e、br-lan=f、eth2=f
+#   2. 触发「用户在 LuCI 保存一次配置」的等价事件：
+#        ubus call service event '{"type":"config.change","data":{"package":"firewall"}}'
+#      换成 package=network 结果一样 —— /etc/init.d/packet_steering 的
+#      service_triggers() 里两者都注册了 procd_add_reload_trigger。
+#   3. 回读：phy0.1-ap0 由 e 变成 **4**（CPU2）、eth2 由 f 变成 **8**（CPU3）
+#   4. 对照组：先 disable + stop 再重复步骤 2 —— 掩码**原样保持** e / f
+#
+# ⚠️ 测法教训（别再踩）：想验证这条链路时，`ubus send network.interface ...`
+#    之类伪造事件**不会**被 procd 接住，实测掩码纹丝不动，会得到「没有冲突」的
+#    假阴性 —— 我第一遍就是这么误判的。可复现的触发方式是上面的 config.change。
+#
+# 原因：`/usr/libexec/network/packet-steering.uc` 用的是
+#   cpu_mask(cpu) = sprintf("%x", 1 << cpu)  → **每队列单核掩码**。
+# 也就是说「固件默认 rps_cpus 是单核掩码（phy0.1-ap0=4、eth2=8）」这个现象，
+# 根源就是它，不是「没设 uci 键导致没生效」—— 旧注释的诊断是反的。
+#
+# 而单核掩码正是三档里**最差**的一档（本节上方实测：NET_RX 95% 压在一个核）。
+# 开着它，等于让它在运行期**反复把 mt5700-rps 的成果改回最差档**。
+#
+# ⚠️ 停用要**两道**，缺一不可（2026-09-22 逐条实测）：
+#   ① disable —— 删掉 /etc/rc.d/S25packet_steering，管**下次及以后**的开机；
+#   ② stop    —— 管**本次开机**。uci-defaults 在 S10 跑，S25 在它之后，
+#                而 rc 序列的 /etc/rc.d/S* glob 开机时就展开完了，disable 挡不住本次。
+#                服务只要注册着，`interface.*` 与 network/firewall 触发器就活着，
+#                之后每次配置变更都会再覆盖一次。
+#                这道由 mt5700-rps（START=95 > 25）在写掩码前兜底执行，见该文件。
+#
+# ⚠️ 这里**绝不能**写 packet_steering='0' 当「关掉」（实测，比单核更糟）：
+#   看 /etc/init.d/packet_steering 的 reload_service() —— 它**无条件**执行 ucode，
+#     键缺失 → 按「普通模式」跑（= 单核掩码）
+#     ='0'   → ucode 收到参数 0 设 disable=true，set_netdev_cpu() 写 **val = 0**
+#              → 把所有队列的 RPS **整个关掉**，收包全压在硬中断那个核上
+#     ='2'   → all_cpus=true → cpu=-1 → 全核掩码 f（但它会连无线口一起写成 f，
+#              覆盖掉 mt5700-rps 为无线避开中断核的 e，仍然不行）
+#   所以正确做法是**删掉这个键**并停用服务，而不是设成 0。
+if [ -x /etc/init.d/packet_steering ]; then
+	uci -q delete network.globals.packet_steering 2>/dev/null
+	uci -q commit network
+	/etc/init.d/packet_steering disable 2>/dev/null || true
+	logger -t mt5700-net "已停用 netifd packet steering（其单核掩码会在配置变更时覆盖 mt5700-rps）；本次开机实例由 mt5700-rps(S95) 兜底停止"
 fi
-uci -q set network.globals.packet_steering='1'
-uci -q commit network
 
 # 4b. 兜底：开机后强制把所有接口的 RPS/XPS 设成全核掩码
 #     （netifd 只管它自己管理的设备，且只在接口 up 那一刻设一次）

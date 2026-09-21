@@ -96,6 +96,29 @@ start() {
 
 	wait_ifaces || log "警告：br-lan 20 秒内未就绪，仅设置当前已存在的接口"
 
+	# ── 先把 netifd 的 packet steering 摘掉，否则它会抢同一个文件 ────────────
+	# /etc/init.d/packet_steering（START=25）与本脚本（START=95）**都写 rps_cpus**，
+	# 而它用的是「每队列单核掩码」（cpu_mask(cpu) = 1 << cpu），正是实测三档里
+	# 最差的一档。更麻烦的是它注册了 network / firewall / interface.* 三个触发器：
+	# 2026-09-22 实锤 —— 用户在 LuCI 保存一次「网络」或「防火墙」配置，
+	# config.change 事件就会让它 reload，把本脚本设的 e/f 改回 4/8。
+	#
+	# 必须在本脚本里兜底，光靠 uci-defaults 的 disable 不够：
+	#   uci-defaults 在 S10 跑，S25 在它**之后**，而 rc 序列的 /etc/rc.d/S* glob
+	#   开机那一刻就展开完了 —— disable 只删链接，挡不住本次开机已经起来的实例。
+	#   本脚本 S95 > S25，此时它已在跑，这里 stop 才能真正摘掉注册与触发器。
+	#
+	# 两道都是幂等的：disable 只是删一个软链，stop 一个没跑的服务是 no-op。
+	# 只在确认注册着时才 stop 并记日志，避免每次 hotplug 都刷一条日志。
+	if [ -x /etc/init.d/packet_steering ]; then
+		/etc/init.d/packet_steering disable 2>/dev/null || true
+		if ubus call service list '{"name":"packet_steering"}' 2>/dev/null \
+			| grep -q '"packet_steering"'; then
+			/etc/init.d/packet_steering stop 2>/dev/null || true
+			log "已停用 netifd packet steering（其单核掩码会在配置变更时覆盖本脚本），RPS 由本脚本独占"
+		fi
+	fi
+
 	all_dec=$(( (1 << ncpu) - 1 ))
 	all_hex="$(printf '%x' "$all_dec")"
 

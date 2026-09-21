@@ -20,7 +20,7 @@
 | **HNAT**（`mtk_hnat`，联发科 tree 外驱动） | ❌ 不在本基线 | 无 `mtk_hnat.ko`，`dmesg` 无 hnat 记录 |
 | EIP197 硬件加密（SAFExcel） | ✅ 已加载 | `lsmod` 有 `crypto_safexcel`、`cryptodev` |
 | 中断均衡 | ✅ 在跑 | `/usr/sbin/irqbalance -f -c 2 -t 10`，`uci irqbalance.enabled=1` |
-| 数据包引导（packet steering） | ✅ 已启用 | `/etc/init.d/packet_steering enabled` |
+| 数据包引导（packet steering） | ⛔ **已停用**（2026-09-22 反转，见下） | 与 `mt5700-rps` 抢同一个 `rps_cpus`，且会把它改回最差的单核掩码 |
 | BBR 拥塞控制 | ✅ 已生效 | `/etc/sysctl.d/12-tcp-bbr.conf` + `99-mt5700-tcp.conf` |
 | CAKE / SQM | ⚪ 默认关闭（不限速） | `sqm.eth1.enabled='0'` |
 | flow offload | ❌ **关闭**（本次改为默认开） | 防火墙 defaults 里没有 `flow_offloading` 项 |
@@ -89,7 +89,26 @@
 - 回滚：网络 → 防火墙 → 常规设置，取消「Flow Offloading」；或
   `uci set firewall.@defaults[0].flow_offloading=0; uci commit firewall; /etc/init.d/firewall restart`
 
-**2）显式兜底 packet steering**（同脚本）：netifd 的 packet steering 必须由 **uci** 驱动（`network.globals.packet_steering='1'`），光有 init 脚本不生效；再由首次开机启用的 `mt5700-rps` 强制多核掩码兜底。硬件中断亲和改由 `mt5700-smp` 接管，**irqbalance 在本脚本中被显式停用**（实测对负载最大的无线 IRQ 79 与 USB 5G IRQ 74 毫无作为，且两者同写 `smp_affinity` 会互相覆盖，必须二选一）。
+**2）~~显式兜底 packet steering~~ → 已于 2026-09-22 反转：改为**停用**（同脚本第 4 节）**
+
+> ⚠️ 原结论「必须由 uci 驱动 `packet_steering='1'`」已被实测推翻，**别照着恢复**。
+>
+> 它和 `mt5700-rps` 都写 `/sys/class/net/*/queues/*/rps_cpus`，而它用的是
+> `cpu_mask(cpu) = 1 << cpu`（每队列**单核掩码**），正是实测三档里最差的一档。
+> 且它注册了 `network` / `firewall` / `interface.*` 触发器 —— 用户在 LuCI 保存一次
+> 「网络」或「防火墙」配置就会 reload，把 `mt5700-rps` 设的 `e`/`f` 改回 `4`/`8`。
+>
+> 现做法：`uci-defaults`(S10) 删键 + `disable`（管下次开机）；`mt5700-rps`(S95 > S25)
+> 写掩码前 `stop` 掉本次开机已起来的实例（rc 序列的 `S*` glob 开机就展开完，`disable`
+> 挡不住本次）。实测注册计数 1→0，之后两次 config.change 掩码纹丝不动。
+> ⚠️ 不能用 `packet_steering='0'` 当"关掉" —— 那会让 ucode 把 RPS **整个清零**，更糟。
+>
+> 完整证据与触发手法见 `CHANGELOG.md` 的 `[2026-09-22]` 条目。
+>
+> 相关但独立的一条（未反转，仍然成立）：硬件中断亲和改由 `mt5700-smp` 接管，
+> `irqbalance` 在 `99-mt5700-net` 里被显式停用 —— 实测它对负载最大的无线 IRQ 79
+> 与 USB 5G IRQ 74 毫无作为，且两者同写 `smp_affinity` 会互相覆盖，必须二选一。
+> 收包软中断那一半由开机启用的 `mt5700-rps` 强制多核掩码兜底。
 
 **3）内核参数补三项低风险项**（`Files/etc/sysctl.d/99-mt5700-tcp.conf`）
 
