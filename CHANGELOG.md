@@ -1,5 +1,50 @@
 # 更新日志
 
+## [2026-09-21] 借鉴分析：ATang007ZH/Action-237-immortalwrt-mt798x-24.10
+
+对该仓库做了全量核查（README、14 个 workflow、6 个 diy 脚本、`files/`、343KB 的
+`.config`），结论是**整体不可借鉴，仅采纳 1 项 CI 防护**。依据如下：
+
+### 判定不可借鉴的三条硬理由
+
+1. **源码不含你的 SoC**：它编译的是 `padavanonly/immortalwrt-mt798x-24.10`（237 大佬，
+   闭源 MTK 驱动）。其 `target/linux/mediatek/dts` 里最高只有 **mt7988**，
+   **没有 mt7987，也没有 hiveton-h5000m**。你的 MT7987A 根本不在支持列表内。
+2. **目标机不同代**：360T7 / JCG Q30 Pro / CMCC-A10 全是 **MT7981**（config 里
+   `CONFIG_WARP_CHIPSET="mt7981"`、TF-A 只有 mt7981/mt7986 变体可证）。
+3. **内容与你的定位相反**：仓库自我定位是"主路由含 **passwall**、ddns-go、vlmcsd"，
+   diy-part1 的唯一作用就是插入 passwall 的 feed；diy-part2 只做改默认 IP /
+   hostname / IMG_PREFIX。这些与我们已删除代理类的方向正好相反。
+
+### 逐项核查后不采纳的部分
+
+| 项 | 不采纳的理由 |
+|---|---|
+| 内核 6.6 + 闭源驱动 | 我们已定案：vermagic `6.6.94` vs 本机 `6.18.52` 拒载，且主 WAN 走 USB 口，HNAT/WED 命中率≈0 |
+| `files/etc/opkg/distfeeds.conf` | 我们包管理器是 **apk 不是 opkg**，无关 |
+| 换 `kenzok8/golang` 1.25 源、删 feeds 自带核心库换 passwall 版 | 纯代理链路，我们不用 |
+| `CONFIG_KERNEL_DEBUG_KERNEL/DEBUG_INFO=y` | 反例：开内核调试增大体积、降性能，我们**没有**开，保持 |
+| `CONFIG_KERNEL_CGROUP_SCHED / FAIR_GROUP_SCHED / RT_GROUP_SCHED` | cgroup 调度只在跑容器时有用，这台不跑 docker，开了反而增加调度开销 |
+| `CONFIG_KERNEL_IPV6_SEG6_LWTUNNEL` | SRv6，用不上 |
+| `CONFIG_ZRAM_DEF_COMP_LZORLE` | 真机 Swap used = 0（内存从未换出），换算法收益为 0 |
+| `CONFIG_KERNEL_NF_CONNTRACK_TIMEOUT` | 需配套 per-conntrack 超时策略规则，我们没有该需求；且 6.18 与 6.6 的配置符号不保证一致 |
+| 工作流**完全没有缓存**、`make -j$(nproc) \|\| make -j1 V=s`、ubuntu-22.04 | 我们已全面更优：三对 restore/save 缓存、失败重试**保持并行**、ubuntu-latest |
+| `CONFIG_PACKAGE_eip197-mini-firmware` / `kmod-cryptodev` / `kmod-nf-flow` | 我们**已有**（H5000M-WIFI-YES.txt 里还多了 `kmod-tls`） |
+
+### 采纳的 1 项：`make download` 后清理残缺小文件
+
+`Download Packages` 步骤末尾新增：
+
+```sh
+find dl -size -1024c -exec ls -l {} \;
+find dl -size -1024c -exec rm -f {} \;
+```
+
+抓取失败时 `dl/` 会留下几十~几百字节的 HTML 错误页，**make 看到文件已存在就跳过**，
+直到编译阶段才报 checksum mismatch —— 那时已白烧几小时，且失败点离根因很远。
+先 `ls` 保留证据再删除。安全性：误删的合法小文件 make 会自动重新下载，
+不会破坏构建，代价只是多抓几百字节。
+
 ## [2026-09-21] 缓存策略重构：失败也保存 + Rust 产物缓存（上轮留待项落地）
 
 上一轮全仓检测留待的两项缓存问题，本轮核实后落地。

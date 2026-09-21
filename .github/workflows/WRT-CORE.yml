@@ -391,6 +391,16 @@ jobs:
           # 只在并行下载失败时才做串行兜底，不再每次都跑两遍全量校验
           make download -j$(nproc) || make download -j1
 
+          # 清理下载失败的残留（借鉴 P3TERX 模板，沿用多年的做法）：
+          #   抓取失败时 dl/ 里会留下几十~几百字节的 HTML 错误页/重定向页，
+          #   make 看到"文件已存在"就跳过，等到编译阶段才报 checksum mismatch ——
+          #   那时已经白烧了几小时，且失败点离根因很远，极难定位。
+          #   先 ls 打印出来便于排查（保留证据），再删除。
+          #   安全性：被误删的合法小文件，make 在需要时会自动重新下载，
+          #   不会破坏构建；代价只是多抓一次几百字节。
+          find dl -size -1024c -exec ls -l {} \;
+          find dl -size -1024c -exec rm -f {} \;
+
       - name: Compile Firmware
         if: env.WRT_TEST != 'true'
         run: |
