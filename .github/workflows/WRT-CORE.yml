@@ -208,18 +208,21 @@ jobs:
       #     mediatek/filogic，可共用同一份工具链，避免每天白编译一次。
       #   - key 不再把 commit hash 放在唯一位置上，配合 restore-keys 做前缀回退，
       #     上游一有新提交也能命中上次的工具链。
-      #   - save-always：失败/超时/取消也要保存，否则会陷入
-      #     「超时 → 无缓存 → 再超时」的死循环。
+      #   - ★ 2026-09-21 重构：原先写 `save-always: true` 试图让「失败也保存」，但
+      #     actions/cache@v4 的 action.yml 明确标注该输入
+      #     "does not work as intended"（deprecation），其 post-if 仍是 success() ——
+      #     即「失败也保存」**从未生效过**，恰好踩中下面注释担心的
+      #     「失败 → 无缓存 → 再失败」死循环。
+      #     现拆成 restore（本步骤）+ 显式 save（Compile Firmware 之后，if: always()）。
       #   - key 末尾原本是 WRT_HASH（源码提交），上游每天有新提交就多存一份内容几乎
       #     相同的缓存，几天撑满 10GB 配额后被 LRU 整批淘汰。改成 WRT_CACHE_WEEK（周）后
-      #     每周最多一份；注意同 key 已存在时 actions/cache 是**跳过保存**而非覆盖，
+      #     每周最多一份；注意同 key 已存在时 save 步骤要靠 cache-hit 判断跳过，
       #     所以一周内缓存内容保持周初那次的结果 —— 这正是要的（工具链不变，条目不增殖）。
       - name: Check Caches (Toolchain & ccache)
         id: check-cache
         if: env.WRT_TEST != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          save-always: true
           key: wrt-tc-${{env.WRT_TARGET}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_CACHE_WEEK}}
           restore-keys: |
             wrt-tc-${{env.WRT_TARGET}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-
@@ -232,11 +235,12 @@ jobs:
       #   下载的源码包与机型无关。原 key 带 WRT_CONFIG，H5000M / AP3000M / X86
       #   各存一份 2.1GB，三份就是 6.3GB，直接把 10GB 配额撑爆触发 LRU 淘汰，
       #   结果是所有缓存一起失效。共享后每个源码分支只存一份。
+      #   （save-always → restore/save 拆分的理由见上一步骤注释）
       - name: Check Caches (Download)
+        id: check-dl
         if: env.WRT_TEST != 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
-          save-always: true
           key: wrt-dl-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_CACHE_WEEK}}
           restore-keys: |
             wrt-dl-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-
@@ -280,6 +284,33 @@ jobs:
 
           $GITHUB_WORKSPACE/Scripts/Packages.sh
           $GITHUB_WORKSPACE/Scripts/Handles.sh
+
+      # ★ 2026-09-21 新增：Rust 产物缓存（MT5700 Console 后端）。
+      # 为什么值得：luci-app-mt5700 的 src/Makefile 用 cargo 交叉编译
+      # at-webserver-rust（tokio / serde / chrono / ureq 依赖树），此前每次构建
+      # 都全量重编（数分钟）。缓存其 target 目录后，依赖 crate 的编译产物直接复用，
+      # 只重编 at-webserver-rust 自身（源码变更那部分，约几十秒）。
+      # 为什么必须放在 Custom Packages **之后** restore：target 目录在包内
+      # （src/Makefile 把 CARGO_TARGET_DIR 写死为 $(CURDIR)/target），而包是
+      # Packages.sh 里刚 git clone 出来的 —— 先 restore 会让克隆目标目录非空而失败。
+      # 附带缓存 ~/.cargo/registry 与 ~/.cargo/git（依赖下载，省 30~60 秒）。
+      # ~/.rustup **不缓存**：rustup 安装在 Packages.sh 里已完成，此处恢复已晚，
+      # 且它体积大（~1GB）收益小（1~2 分钟安装）。
+      # key 用 WRT_CACHE_WEEK（周）而非源码 hash：cargo 自身的增量机制（target 内
+      # fingerprint）已能正确处理源码变化，key 只决定「是否跳过 save」—— 与工具链
+      # 缓存同一哲学：每周第一跑保存，本周内条目不增殖。
+      - name: Check Caches (Rust)
+        id: cache-rust
+        if: env.WRT_TEST != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          key: rust-mt5700-${{ env.WRT_CACHE_WEEK }}
+          restore-keys: |
+            rust-mt5700-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ./wrt/package/luci-app-mt5700/src/target
 
       - name: Custom Settings
         run: |
@@ -406,6 +437,43 @@ jobs:
           ccache -s 2>/dev/null || true
 
           exit "$RC"
+
+      # ★ 2026-09-21：显式 save 三份缓存（**编译失败也要保存**）。
+      #   原先依赖 actions/cache@v4 的 post 阶段自动保存，但其 post-if 是 success()，
+      #   「失败也保存」从未生效（save-always 已被官方标注为无效输入）——
+      #   一旦编译失败，当次进展（ccache / 已编好的工具链 / Rust target）全部丢弃，
+      #   下次从零开始，容易陷入「失败 → 无缓存 → 再失败」循环。
+      #   每条 save 都带 cache-hit != 'true'：同 key 已存在时跳过（与原 post 行为一致，
+      #   保证一周内条目不增殖）。
+      #   ⚠️ 已知边界：runner 被 6h 硬上限**直接终止**时，这些步骤同样不会执行 ——
+      #   该场景只能靠缩短编译时间规避（见上方 timeout-minutes 注释）。
+      - name: Save Caches (Toolchain & ccache)
+        if: always() && env.WRT_TEST != 'true' && steps.check-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: wrt-tc-${{env.WRT_TARGET}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_CACHE_WEEK}}
+          path: |
+            ./wrt/.ccache
+            ./wrt/staging_dir/host*
+            ./wrt/staging_dir/tool*
+
+      - name: Save Caches (Download)
+        if: always() && env.WRT_TEST != 'true' && steps.check-dl.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: wrt-dl-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_CACHE_WEEK}}
+          path: |
+            ./wrt/dl
+
+      - name: Save Caches (Rust)
+        if: always() && env.WRT_TEST != 'true' && steps.cache-rust.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: rust-mt5700-${{ env.WRT_CACHE_WEEK }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ./wrt/package/luci-app-mt5700/src/target
 
       - name: Machine Information
         run: |

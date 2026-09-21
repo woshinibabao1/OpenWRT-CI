@@ -1,5 +1,58 @@
 # 更新日志
 
+## [2026-09-21] 缓存策略重构：失败也保存 + Rust 产物缓存（上轮留待项落地）
+
+上一轮全仓检测留待的两项缓存问题，本轮核实后落地。
+
+### 改动 1：「失败也保存缓存」从未生效过 → 拆 restore/save 修复
+
+**核实**（直接读 actions/cache@v4 的官方 `action.yml`）：
+- 第 33-34 行明确标注 `save-always` 为
+  *"does not work as intended and will be removed in a future release"*（deprecation）；
+- 第 44 行 `post-if: "success()"` —— post 阶段的自动保存**只认成功**。
+
+也就是说仓库里两处 `save-always: true` 写了等于没写：**编译失败时，当次的所有进展
+（ccache 命中、已编好的工具链、下载完成的源码包）全部丢弃**，下次从零开始，
+恰好踩中原注释自己担心的「失败 → 无缓存 → 再失败」死循环。
+
+**修复**：`WRT-CORE.yml` 的两处 `actions/cache@v4` 改为 `actions/cache/restore@v4`，
+并在 `Compile Firmware` 之后新增三个显式的 `actions/cache/save@v4` 步骤
+（`if: always()` → 编译失败也保存）。每条 save 都带
+`steps.<id>.outputs.cache-hit != 'true'`：同 key 已存在时跳过 ——
+与原 post 行为一致，保证一周内条目不增殖（WRT_CACHE_WEEK 哲学不变）。
+
+配对一致性已脚本核对：三对 restore/save 的 key 与 path 完全一致。
+已知边界（注释中写明）：runner 被 6h 硬上限**直接终止**时 save 步骤同样不执行，
+该场景只能靠缩短编译时间规避。
+
+### 改动 2：Rust 产物缓存（新增，预计每次构建省 3~5 分钟）
+
+`luci-app-mt5700`（MT5700 Console 后端）每次构建都**全量重编** tokio / serde /
+chrono / ureq 依赖树（数分钟）。新增 `Check Caches (Rust)`：
+
+| 缓存内容 | 说明 |
+|---|---|
+| `./wrt/package/luci-app-mt5700/src/target` | cargo 编译产物。恢复后依赖 crate 直接复用，只重编 at-webserver-rust 自身（源码变更部分，约几十秒） |
+| `~/.cargo/registry` + `~/.cargo/git` | 依赖下载（省 30~60 秒） |
+
+实现要点（均已写进 workflow 注释）：
+- **必须放在 `Custom Packages` 之后 restore**：target 目录在包内（`src/Makefile` 把
+  `CARGO_TARGET_DIR` 写死为 `$(CURDIR)/target`），而包是 `Packages.sh` 刚 `git clone`
+  出来的 —— 先 restore 会让克隆目标目录非空而直接失败。为不改上游仓库，
+  选择直接缓存包内路径。
+- `~/.rustup` **不缓存**：rustup 安装在 `Packages.sh` 里已完成，此处恢复已晚；
+  且体积 ~1GB、收益仅 1~2 分钟，不划算。
+- key 用 `WRT_CACHE_WEEK`（周）：cargo 自身的增量机制（target 内 fingerprint）已能
+  正确处理源码变化，key 只决定「是否跳过 save」，与工具链缓存同一哲学。
+
+### 附：本轮其余核查结论（未改动）
+
+| 项 | 结论 |
+|---|---|
+| `Config/GENERAL.txt` 116 个 `=y` 包精简 | 逐一过目，**没有**像 irqbalance 那样持有实测反对证据的（分区工具组、smartmontools、libimobiledevice 等各有使用场景）—— 按「不猜测」原则不动 |
+| `Cache-Clean.yml` | 用 `gh cache delete --all`（全删），新增的 `rust-mt5700-` key 前缀无需补清单 |
+| restore-keys 部分命中的 save 行为 | `cache-hit` 仅在精确命中时为 'true' → 周切换时保存新 key、旧 key 交 LRU 回收，行为正确 |
+
 ## [2026-09-21] 全仓检测一轮：修掉 3 处静默失效 + CI 健壮性加固
 
 对 34 个文件做了系统性审查（脚本层 / 固件覆盖层 / workflow 层三路并行），
