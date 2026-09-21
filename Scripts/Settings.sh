@@ -2,14 +2,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 VIKINGYFY
 
+# find 无结果时 sed 会退化成「从 stdin 读」，命令照样返回 0 ——
+# 于是「该改的没改」被静默吞掉：表现为固件主题不对、登录 IP 不对、状态页没有编译日期，
+# 而 CI 全程全绿，等刷完机才发现。这里统一走包装函数，找不到文件直接失败。
+# 用法：EDIT_FILES "<sed 表达式>" <find 的查找路径与条件...>
+EDIT_FILES() {
+	local PATTERN="$1"; shift
+	local FILES
+	FILES="$(find "$@" -type f 2>/dev/null)"
+	if [ -z "$FILES" ]; then
+		echo "::error::Settings.sh: 未找到待修改文件（find $@）—— feeds 结构变了还是路径写错了？"
+		exit 1
+	fi
+	printf '%s\n' "$FILES" | while IFS= read -r F; do
+		sed -i "$PATTERN" "$F"
+	done
+}
+
 #移除luci-app-attendedsysupgrade
-sed -i "/attendedsysupgrade/d" $(find ./feeds/luci/collections/ -type f -name "Makefile")
+EDIT_FILES "/attendedsysupgrade/d" ./feeds/luci/collections/ -name "Makefile"
 #修改默认主题
-sed -i "s/luci-theme-bootstrap/luci-theme-$WRT_THEME/g" $(find ./feeds/luci/collections/ -type f -name "Makefile")
+EDIT_FILES "s/luci-theme-bootstrap/luci-theme-$WRT_THEME/g" ./feeds/luci/collections/ -name "Makefile"
 #修改immortalwrt.lan关联IP
-sed -i "s/192\.168\.[0-9]*\.[0-9]*/$WRT_IP/g" $(find ./feeds/luci/modules/luci-mod-system/ -type f -name "flash.js")
+EDIT_FILES "s/192\.168\.[0-9]*\.[0-9]*/$WRT_IP/g" ./feeds/luci/modules/luci-mod-system/ -name "flash.js"
 #添加编译日期标识
-sed -i "s/(\(luciversion || ''\))/(\1) + (' \/ $WRT_MARK-$WRT_DATE')/g" $(find ./feeds/luci/modules/luci-mod-status/ -type f -name "10_system.js")
+EDIT_FILES "s/(\(luciversion || ''\))/(\1) + (' \/ $WRT_MARK-$WRT_DATE')/g" ./feeds/luci/modules/luci-mod-status/ -name "10_system.js"
 
 WIFI_SH=$(find ./target/linux/mediatek/filogic/base-files/etc/uci-defaults/ -type f -name "*set-wireless.sh" 2>/dev/null)
 WIFI_UC="./package/network/config/wifi-scripts/files/lib/wifi/mac80211.uc"

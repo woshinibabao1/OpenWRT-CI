@@ -33,8 +33,23 @@ UPDATE_PACKAGE() {
 	# 克隆 GitHub 仓库
 	# P07：克隆失败（分支改名 / 仓库私有 / 限流）必须立即终止，
 	# 否则会静默缺包，最终表现为「插件莫名没了」而不是构建失败。
-	git clone --depth=1 --single-branch --branch $PKG_BRANCH "https://github.com/$PKG_REPO.git" \
-		|| { echo "::error::克隆 $PKG_REPO@$PKG_BRANCH 失败（分支改名/仓库私有/限流）"; exit 1; }
+	# 但「失败」要区分偶发与必然：GitHub 对 CI 出口 IP 的限流（403 / early EOF）
+	# 是偶发的，一次失败就 exit 1 会让几小时的构建白跑，故先重试 3 次。
+	# 重试前必须删掉残留目录，否则 git 会以 "destination path already exists" 直接失败。
+	local TRY=1
+	while [ "$TRY" -le 3 ]; do
+		if git clone --depth=1 --single-branch --branch $PKG_BRANCH "https://github.com/$PKG_REPO.git"; then
+			break
+		fi
+		echo "::warning::克隆 $PKG_REPO@$PKG_BRANCH 第 $TRY 次失败，5 秒后重试"
+		rm -rf "./$REPO_NAME"
+		TRY=$((TRY + 1))
+		sleep 5
+	done
+	if [ ! -d "./$REPO_NAME" ]; then
+		echo "::error::克隆 $PKG_REPO@$PKG_BRANCH 连续 3 次失败（分支改名/仓库私有/限流）"
+		exit 1
+	fi
 
 	# 处理克隆的仓库
 	if [[ "$PKG_SPECIAL" == "pkg" ]]; then

@@ -40,6 +40,12 @@ permissions:
 jobs:
   config:
     name: ${{ matrix.CONFIG }}-${{ matrix.MT_MODE }}
+    # 只在 Auto-Clean **成功**完成后才编译：
+    # workflow_run 的 completed 同时包含 success / failure / cancelled，不判断就
+    # 会在清理失败（如 GitHub API 限流）之后照跑一次几小时的编译，
+    # 而那次产物很快又会被下一次清理删掉，等于白烧机时。
+    # 手动触发（workflow_dispatch）时该字段为空，用短路保证照常执行。
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:

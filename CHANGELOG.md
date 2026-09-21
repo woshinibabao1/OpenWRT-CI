@@ -1,4 +1,65 @@
 # 更新日志
+## [2026-09-21] 全项目审计：设备选择硬断言 / 5G 接口 DNS / 缓存与克隆稳定性 / 文档纠偏
+
+### 背景
+
+上一轮只补了固件调优项。本轮按「先完整分析项目、再优化」把 CI 工程层与文档整体过了一遍，
+只改两类东西：**会静默出错**的，和**与实际配置不符**的。固件调优部分保持不动。
+
+### 修复 —— 三处「错了但不报错」
+
+1. **设备选择会被 kconfig 静默丢弃**
+   - `Config/H5000M-WIFI-YES.txt` 原来同时写 `CONFIG_TARGET_MULTI_PROFILE=n` 与
+     `CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_hiveton_h5000m=y`，而
+     `scripts/target-metadata.pl` 生成的 Kconfig 里是
+     `menu "Target Devices" depends on TARGET_MULTI_PROFILE`
+     —— MULTI_PROFILE=n 时整个菜单不可见，那行设备选择直接被丢弃，
+     编译目标退回平台默认 profile：**编出别的机型的固件而 CI 全程全绿**。
+     （实测 2026-09-15：`make defconfig` 会把 MULTI_PROFILE 改回 y，属于「碰巧对」。）
+   - 改：机型配置改 `=y` 并写明源码依据；`Config/PRIVATE.txt` 里那行实测无效的 `=n` 删除；
+     `WRT-CORE.yml` 在 `make defconfig` **之后**加硬断言 —— 至少一个
+     `CONFIG_TARGET_DEVICE_*=y`，`CONFIG_TARGET_ALL_PROFILES=y` 时告警。
+2. **5G 接口会收下国内不可达的 DNS**（真机事故复现路径）
+   - `Files/etc/uci-defaults/99-mt5700-wan` 建接口时写的是 `peerdns='1'`，
+     而 5G 模组（CGNAT 段 100.0.0.0/8）在 DHCP 里下发的是 `8.8.8.8 / 8.8.4.4`，
+     国内不可达。客户端每解析一个冷域名都要先等这一路超时，
+     表现为「WiFi 连上了、信号满格，但就是没网」（2026-09-21）。
+   - 改：新建接口直接 `peerdns='0'` + `dns='223.5.5.5 119.29.29.29'`；
+     接口已存在（升级而来）时**仅在用户没有自定义 DNS** 的前提下补同样的设置，不覆盖用户配置。
+3. **`Scripts/Settings.sh` 的 sed 会静默失效**
+   - `sed -i "..." $(find ...)` 在 find 无结果时退化成「从 stdin 读」，返回码仍是 0
+     —— 主题 / 登录 IP / 状态页编译日期标记没改但 CI 看不出来，等刷完机才发现。
+   - 改：统一走 `EDIT_FILES` 包装，找不到目标文件直接 `::error::` + exit 1。
+
+### 稳定性
+
+4. **缓存 key 去掉源码 commit hash**，改为按 ISO 周滚动（`WRT_CACHE_WEEK`）。
+   原来是 `…-${WRT_HASH}`：上游每来一个新提交就多存一份内容几乎相同的缓存
+   （工具链 ~1GB + ccache 上限 5G），几天就能撑满 10GB 配额 → GitHub 按 LRU 整批淘汰 →
+   「冷编译 → 超时被杀 → 没缓存 → 更冷」的死循环。按周滚动后每周最多一份；
+   注意同 key 已存在时 actions/cache 是**跳过保存**而非覆盖，所以一周内保持周初那份。
+5. **`Scripts/Packages.sh` 克隆重试 3 次**（间隔 5s，重试前清掉残留目录）。
+   GitHub 对 CI 出口 IP 的限流（403 / early EOF）是偶发的；
+   单次失败就 exit 1 会让几小时的构建白跑。残留目录不清会让下一次克隆
+   直接以 "destination path already exists" 失败，重试等于白试。
+6. **`H5000M-MT-AUTO` 只在 Auto-Clean 成功后才编译**：
+   `workflow_run` 的 `completed` 同时包含 success / failure / cancelled，不判断的话
+   清理失败（如 API 限流）之后仍会照跑一次几小时的编译，而产物很快又被下次清理删掉。
+
+### 文档纠偏（原描述与实际配置不符）
+
+7. Release 说明里「这是个平台固件包，内含多个设备」+「全系带开源硬件加速」→
+   改为「只含 Hiveton H5000M 一个设备（单 profile）」+「加速仅软件 flow offload，
+   硬件卸载默认关闭（本基线无 mtkhnat / mtk_wed），完整取舍见
+   `FIRMWARE_OPTIMIZATION_REPORT.md`」。
+8. README：平台写错（MT7986 → 本设备实际是 **MT7987A**）；
+   MT5700 插件段删掉 `ubus-at-daemon` / `sms-tool_q` 的描述
+   （方案 B 是单包自含，CI 对这两个包显式 =n 并做互斥校验）；
+   项目结构补全 `Files/etc` 下新增的 4 个调优文件；
+   Auto-Clean 的默认行为写清（默认**全部清空**，手动勾选才保留每机型最新一个）。
+9. `99-mt5700-wan` 的兜底列表移除 `mt5700-watchdog`
+   —— 该看门狗已在 MT5700 Console 2.3.25 彻底删除，留着只是个永远匹配不到的空名字。
+
 ## [2026-09-21] 系统层优化：四核调度 / zram 内存压缩交换 / LAN 二层互通
 
 ### 背景

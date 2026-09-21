@@ -132,6 +132,12 @@ jobs:
       - name: Initialization Values
         run: |
           echo "WRT_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
+          # 缓存滚动周期（ISO 年-周）：缓存 key 用它取代源码 commit hash。
+          # 用 hash 时，上游每来一个新提交就多存一份内容几乎相同的缓存
+          # （工具链 ~1GB + ccache 上限 5G，压缩后单份 1~2GB），几天就把 10GB 配额
+          # 撑满 → GitHub 按 LRU 回收，最早的连同仍在用的那份一起被淘汰 → 缓存全失效，
+          # 接着就是「冷编译 → 超时 → 没缓存 → 更冷」的死循环。按周滚动后每周最多一份。
+          echo "WRT_CACHE_WEEK=$(TZ=UTC-8 date +"%G-W%V")" >> $GITHUB_ENV
           echo "WRT_MARK=${WRT_MARK:-${GITHUB_REPOSITORY%%/*}}" >> $GITHUB_ENV
           echo "WRT_INFO=${WRT_SOURCE%%/*}" >> $GITHUB_ENV
           # P09：grep 无匹配时 exit 1（文件缺失 exit 2），故必须 || true 吸收，
@@ -179,13 +185,17 @@ jobs:
       #     上游一有新提交也能命中上次的工具链。
       #   - save-always：失败/超时/取消也要保存，否则会陷入
       #     「超时 → 无缓存 → 再超时」的死循环。
+      #   - key 末尾原本是 WRT_HASH（源码提交），上游每天有新提交就多存一份内容几乎
+      #     相同的缓存，几天撑满 10GB 配额后被 LRU 整批淘汰。改成 WRT_CACHE_WEEK（周）后
+      #     每周最多一份；注意同 key 已存在时 actions/cache 是**跳过保存**而非覆盖，
+      #     所以一周内缓存内容保持周初那次的结果 —— 这正是要的（工具链不变，条目不增殖）。
       - name: Check Caches (Toolchain & ccache)
         id: check-cache
         if: env.WRT_TEST != 'true'
         uses: actions/cache@v4
         with:
           save-always: true
-          key: wrt-tc-${{env.WRT_TARGET}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_HASH}}
+          key: wrt-tc-${{env.WRT_TARGET}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_CACHE_WEEK}}
           restore-keys: |
             wrt-tc-${{env.WRT_TARGET}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-
           path: |
@@ -202,7 +212,7 @@ jobs:
         uses: actions/cache@v4
         with:
           save-always: true
-          key: wrt-dl-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_HASH}}
+          key: wrt-dl-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_CACHE_WEEK}}
           restore-keys: |
             wrt-dl-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-
           path: |
@@ -287,6 +297,19 @@ jobs:
           # R04（P03 收口）：luci-app-firewall 是「页面上改 flow offload」的前提（网络→防火墙→常规设置页）。
           # 这条不是 || true：包名无效（被 kconfig 静默丢弃）时 CI 必须红掉，而不是带着缺页的固件发版。
           grep -q '^CONFIG_PACKAGE_luci-app-firewall=y' .config || { echo "::error::luci-app-firewall 未进入 .config，「页面上改 flow offload」不可用"; exit 1; }
+
+          # 设备选择断言：kconfig 对「依赖不满足的符号」是**静默丢弃**（不报错、不警告），
+          # 所以 defconfig 成功 ≠ 设备选对。CONFIG_TARGET_DEVICE_* 位于
+          # `menu "Target Devices" depends on TARGET_MULTI_PROFILE`，一旦那一行没生效，
+          # 编译目标会退回平台默认 profile —— 编出别的机型的固件，而 CI 全程全绿。
+          # 这里在 make defconfig 之后直接读最终 .config 校验，是最早能发现的位置。
+          DEV_SELECTED="$(grep -cE '^CONFIG_TARGET_DEVICE_[A-Za-z0-9_]+=y' .config || true)"
+          echo "已选设备条目数：${DEV_SELECTED:-0}"
+          grep -E '^CONFIG_TARGET_DEVICE_[A-Za-z0-9_]+=y' .config || true
+          [ "${DEV_SELECTED:-0}" -ge 1 ] || { echo "::error::.config 中没有任何 CONFIG_TARGET_DEVICE_*=y：设备选择被 kconfig 丢弃（多为 TARGET_MULTI_PROFILE 不是 y）"; exit 1; }
+          if grep -qE '^CONFIG_TARGET_ALL_PROFILES=y' .config; then
+            echo "::warning::CONFIG_TARGET_ALL_PROFILES=y，将编译该平台下全部设备的镜像（与单产物目标不符）"
+          fi
 
       # 配置生成后、编译前：验证 MT 模式包选择互斥（双重验证之一）
       - name: Verify MT Mode
@@ -417,11 +440,14 @@ jobs:
           tag_name: ${{env.WRT_CONFIG}}-${{env.WRT_MT}}-${{env.WRT_INFO}}-${{env.WRT_BRANCH}}-${{env.WRT_DATE}}
           files: ./wrt/upload/*.*
           body: |
-            这是个平台固件包，内含多个设备！
-            请注意选择你需要的设备固件！
-            不要问，刷就完事了！
+            # 文案按实际产物写：单 profile 编译，只此一个设备；加速只开软件卸载。
+            # 原「内含多个设备 / 全系带开源硬件加速」与实际不符 —— 会让人刷错镜像、
+            # 或以为有 HNAT/WED 硬件加速（本基线没有，硬件卸载默认关）。
+            本 Release 只含 Hiveton H5000M 一个设备的固件（单 profile 编译，不需要挑机型）。
 
-            全系带开源硬件加速，别问了！
+            加速现状（勿误读）：默认开「软件 flow offload」（nf_flow_table）；
+            硬件卸载默认关闭 —— 本基线没有 mtkhnat / mtk_wed，且 5G WAN 走 USB 口，
+            PPE 硬件转发命中率≈0。完整取舍见仓库 FIRMWARE_OPTIMIZATION_REPORT.md。
 
             源码：${{env.WRT_REPO}}
             分支：${{env.WRT_BRANCH}}

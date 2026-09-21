@@ -1,14 +1,10 @@
 # 私有扩展配置：由 Scripts/Settings.sh 在「机型配置 → GENERAL」之后叠加，
 # 是最后写入 .config 的一层，因此可以覆盖 GENERAL 中的同名项（后写覆盖）。
-
-# 意图：只编译 Hiveton H5000M 单 profile。
-# Config/H5000M-WIFI-YES.txt 写了 CONFIG_TARGET_MULTI_PROFILE=n，
-# 但 Config/GENERAL.txt 在其后写入 =y 会把它覆盖（后写覆盖），这里再写一次 =n 改回来。
 #
-# ⚠️ 实测 2026-09-15（TEST run）：这一条**没能生效**，`make defconfig` 之后
-#    .config 里仍是 CONFIG_TARGET_MULTI_PROFILE=y（defconfig 会把它改回 y）。
-#    影响可忽略：CONFIG_TARGET_ALL_PROFILES 未选中（=n），且显式选中的 DEVICE
-#    只有 mediatek_filogic_DEVICE_hiveton_h5000m 一个，产物仍是 H5000M 单设备一套镜像。
-#    保留此行是为了记录意图；若将来只想出单一镜像，可改用
-#    Config/H5000M-WIFI-YES.txt 之外的方式（如直接在机型配置里加 TARGET_SUBTARGET 限制）。
-CONFIG_TARGET_MULTI_PROFILE=n
+# 当前为空：曾经在这里写过 CONFIG_TARGET_MULTI_PROFILE=n，用于「只出单一镜像」，
+# 但它是**无效配置** —— 见 Config/H5000M-WIFI-YES.txt 里的说明：
+#   TARGET_DEVICE_* 符号位于 `menu "Target Devices" depends on TARGET_MULTI_PROFILE`，
+#   写 =n 会让它下面的设备选择一起失效；且实测 `make defconfig` 会把它改回 =y。
+# 依赖顺序（H5000M-WIFI-YES.txt → GENERAL.txt → PRIVATE.txt）里后写覆盖前写，
+# 把这种「看起来生效、实际被 defconfig 推翻」的行留在这里，只会误导后来的人。
+# 需要覆盖配置时在此追加即可（每行一条 CONFIG_*）。

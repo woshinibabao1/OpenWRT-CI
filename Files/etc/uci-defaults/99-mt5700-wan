@@ -39,7 +39,13 @@ if ! uci -q get network.MT5700M >/dev/null 2>&1; then
 	uci -q set network.MT5700M.proto='dhcp'
 	uci -q set network.MT5700M.auto='1'
 	uci -q set network.MT5700M.defaultroute='1'
-	uci -q set network.MT5700M.peerdns='1'
+	# ★ peerdns=0 + 手动指定 DNS，不要收模组下发的 DNS：
+	#   5G 模组（CGNAT 段 100.0.0.0/8）在 DHCP 里下发的 DNS 实测是 8.8.8.8 / 8.8.4.4，
+	#   国内不可达。收下它之后，客户端每解析一个冷域名都要先等这一路超时才轮到下一个，
+	#   表现为「WiFi 连上了、信号满格，但就是没网」（2026-09-21 真机事故）。
+	#   这里一律不收对端 DNS，改用国内可达的公共 DNS；要自定义改 network.MT5700M.dns。
+	uci -q set network.MT5700M.peerdns='0'
+	uci -q set network.MT5700M.dns='223.5.5.5 119.29.29.29'
 	# metric 20：低于 eth1 有线 WAN 的优先级之外，留一条备用默认路由。
 	# 有线 WAN 插上时走 eth1，拔掉后自动落到 5G。
 	uci -q set network.MT5700M.metric='20'
@@ -52,6 +58,14 @@ else
 		uci -q commit network
 		logger -t mt5700-wan "已把 MT5700M 设为开机自启（auto=1）"
 	}
+	# 已存在的接口（升级固件而来）：只在用户**没有自定义 DNS**（dns 列表为空）
+	# 且仍在收对端 DNS 时套用上面的修复，绝不覆盖用户自己填的 DNS。
+	if [ -z "$(uci -q get network.MT5700M.dns)" ] && [ "$(uci -q get network.MT5700M.peerdns)" != "0" ]; then
+		uci -q set network.MT5700M.peerdns='0'
+		uci -q set network.MT5700M.dns='223.5.5.5 119.29.29.29'
+		uci -q commit network
+		logger -t mt5700-wan "已停用对端 DNS 并改用国内公共 DNS（5G 下发的 8.8.8.8 国内不可达）"
+	fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -81,7 +95,11 @@ fi
 # ---------------------------------------------------------------------------
 # 根因已在 MT5700-Console 仓库修掉（init 脚本标成 100755），这里兜底：
 # 老固件或手工拷贝部署仍可能丢 +x，补一次再 enable，避免换个环境复发。
-for SVC in at-webserver mt5700-watchdog; do
+# 只处理 at-webserver：
+# mt5700-watchdog 已在 MT5700 Console 2.3.25 彻底删除（它的「模组重启」在
+# netifd 不接管接口时等于对空气挥拳，还会在日志里刷假动作），此处不再兜底它，
+# 免得留下一个永远匹配不到的空名字让人以为还有看门狗在跑。
+for SVC in at-webserver; do
 	[ -f "/etc/init.d/$SVC" ] || continue
 	chmod 0755 "/etc/init.d/$SVC" 2>/dev/null
 	if [ -x "/etc/init.d/$SVC" ]; then

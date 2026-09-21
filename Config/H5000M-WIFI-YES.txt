@@ -3,7 +3,20 @@ CONFIG_TARGET_mediatek=y
 CONFIG_TARGET_mediatek_filogic=y
 
 # 仅编译 Hiveton H5000M
-CONFIG_TARGET_MULTI_PROFILE=n
+#
+# ⚠️ CONFIG_TARGET_MULTI_PROFILE 必须是 y，写成 n 会让下面那行 DEVICE_* 失效：
+#   OpenWrt 的 scripts/target-metadata.pl 生成的 Kconfig 里，设备符号是
+#     menu "Target Devices"
+#       depends on TARGET_MULTI_PROFILE      ← 关键
+#         menuconfig TARGET_DEVICE_<target>_<profile>
+#   即「按设备勾选」这一整个菜单只在 MULTI_PROFILE=y 时可见。
+#   MULTI_PROFILE=n 时该符号不可见 → kconfig 静默丢弃这一行 → 编译目标退回
+#   "Target Profile" choice 的默认值（可能是同平台的其它设备），
+#   而 CI 不会报错，只会默默编出别的机型的固件。
+#   实测（2026-09-15 TEST run）：写 =n 后 `make defconfig` 仍把它改回 =y，
+#   靠的是 defconfig 的修正而非配置本身正确 —— 属于「碰巧对」，不能依赖。
+CONFIG_TARGET_MULTI_PROFILE=y
+# 关掉「全部 profile 默认选中」：否则会把 filogic 下所有设备的镜像都编出来
 CONFIG_TARGET_ALL_PROFILES=n
 CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_hiveton_h5000m=y
 

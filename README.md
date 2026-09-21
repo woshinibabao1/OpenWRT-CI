@@ -21,7 +21,7 @@
 | :--- | :--- | :--- |
 | **WRT-BUILD** | 手动 `workflow_dispatch` | 手动编译 / 预览配置。可选机型、源码、MT 模式（`MT5700`，唯一在用的模式），默认完整编译并发布固件（`TEST=false`） |
 | **H5000M-MT-AUTO** | 每天随 `Auto-Clean` 完成后自动触发，亦可手动 | 自动并行编译 H5000M 的 **MT5700** 单配置并发布 |
-| **Auto-Clean** | 每天定时 + 手动 | 清理旧 Release 与 Workflow 运行记录（保留最近 1 个 Release、30 天运行记录） |
+| **Auto-Clean** | 每天定时 + 手动 | 清理 Release 与 Workflow 运行记录。Release **默认全部清空**；手动触发时勾选 `keep_latest_per_device` 才改为「每个机型保留最新一个」。运行记录保留 30 天 |
 | **Cache-Clean** | 仅手动触发 | 清理 GitHub Actions 编译缓存（已移除每周定时清空：那会让本周第一次构建必然冷启动，配额交由 GitHub 按 LRU 自动回收） |
 
 **手动编译步骤：** 仓库页面 → `Actions` → 选择 `WRT-BUILD` → `Run workflow` → 选择机型与 MT 模式 → 直接运行即完整编译；只想校验配置时把 `TEST` 设为 `true`。
@@ -58,6 +58,11 @@ OpenWRT-CI/
 ├── Files/                    # 固件 files 覆盖层（随固件打包，首次开机生效）
 │   └── etc/
 │       ├── uci-defaults/99-mt5700-net   # 网络调优（flow offload / TCP / 中断均衡 / 5G 无线）
+│       ├── uci-defaults/99-mt5700-wan   # 补齐 MT5700M 接口、防火墙 wan 区、关 USB autosuspend
+│       ├── uci-defaults/99-mt5700-sys   # zram 512M / 无线 isolate=0 / 国内 NTP
+│       ├── sysctl.d/99-mt5700-tcp.conf  # BBR / fq_codel / TFO / rp_filter=0
+│       ├── sysctl.d/99-mt5700-lan.conf  # proxy_arp_pvlan（MLO 跨射频互通）
+│       ├── nftables.d/12-mangle-ttl-128.nft  # WAN 出包 TTL/hoplimit 统一为 128
 │       └── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw）
 ├── Scripts/                  # 编译前自定义脚本
 │   ├── Packages.sh           # 拉取第三方插件与主题（含 MT 模式条件克隆/折叠）
@@ -136,7 +141,7 @@ OpenWRT-CI/
 | 核心特征 | 详情描述 |
 | :--- | :--- |
 | 🏗️ **固件底包** | **基于 ImmortalWrt 主线最新源码构建**。内核层面已开启硬件加解密优化（`kmod-cryptodev`, `kmod-tls`），为科学分流和安全组网提供底层加速。 |
-| 🖥️ **基础架构** | 采用 **联发科 (MediaTek) Filogic** 平台 (如 MT7986 系列)，具备强大的网络数据转发能力与 Wi-Fi 7 性能。 |
+| 🖥️ **基础架构** | 采用 **联发科 (MediaTek) Filogic** 平台（本设备为 **MT7987A**，四核 Cortex-A53 + MT7992 无线），具备网络数据转发与 Wi-Fi 7 能力。 |
 | 📶 **核心模组** | 深度集成 **MT5700 5G 模组**，支持直接插卡上网，实现 5G 高速蜂窝接入。 |
 | ❄️ **散热设计** | 针对 5G 模组高负载下的发热特性，设备配备了**主动散热风扇**，专为高负载网络转化设计，确保极限性能下不降频。 |
 
@@ -151,10 +156,12 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 
 * **📊 状态监控**：在后台实时呈现 5G 信号强度、SA/NSA 网络制式、当前频段、运营商及 IMEI/IMSI 等关键状态。
 * **🔌 连接管理**：兼容 QMI/NCM 等多种拨号协议，实现高速稳定的蜂窝联网。
-* **⚙️ AT 指令交互**：内置 `ubus-at-daemon`，支持通过 Web 界面向模组发送 AT 指令，便于进行高级网络调试或频段锁定。
-* **✉️ 短信功能**：集成 `sms-tool_q`，支持通过路由器后台接收与发送运营商短信，方便接收流量提醒。
+* **⚙️ AT 指令交互**：内置 AT 通道与 Web 终端，支持通过界面向模组发送 AT 指令，便于高级调试或频段锁定。
+* **✉️ 短信功能**：通过界面接收与发送运营商短信，方便接收流量提醒。
 
-> 注：旧方案 `luci-app-mt5700m` 已停用（依赖 `sms-tool_q` 版本号对 apk 非法，且功能与 MT5700 重复），当前唯一在用的 MT 插件即上面的 `luci-app-mt5700`。
+> 注：MT5700（方案 B）是**单包自含**的，不安装 `sms-tool_q` / `ubus-at-daemon`
+> （CI 里对这两个包显式置 `=n` 并做互斥校验），短信与 AT 能力由它自己的后端提供。
+> 旧方案 `luci-app-mt5700m` 已停用（依赖 `sms-tool_q` 版本号对 apk 非法，且功能重复）。
 
 ### 2. 硬件级风扇温控 (`luci-app-h5000m-fancontrol`)
 仅 Hiveton H5000M 固件包含此插件。5G 高速传输伴随显著发热，该插件确保设备在满负荷运作下的温控稳定。
