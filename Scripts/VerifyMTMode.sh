@@ -4,7 +4,8 @@
 #
 # 检查点：
 #   - MT5700：必须存在 luci-app-mt5700；必须不存在 mt5700m / sms-tool_q / ubus-at-daemon
-#   - MT5700M：必须存在 mt5700m / sms-tool_q / ubus-at-daemon；必须不存在 luci-app-mt5700
+#   - MT5700M：⛔ 已停用（方案 A 的 QModem 依赖对 apk 非法且功能重复）——
+#              这里保留分支作守卫：一旦出现就直接报错终止，而不是让它编下去
 #   - 空模式：上述四类包全部不得被选中
 #
 # 在 OpenWrt 源码根目录执行。发现违规时 ::error:: 并 exit 1。
@@ -81,11 +82,11 @@ case "$MODE" in
 		# 一旦有人删掉 check_must_not，这里就成了「只喊不拦」。已删除，拦截统一走 check_must_not。
 		;;
 	MT5700M )
-		check_must luci-app-mt5700m
-		check_must sms-tool_q
-		check_must ubus-at-daemon
-		check_must_not luci-app-mt5700
-		# 同上：原先的 `grep -qE '^CONFIG_PACKAGE_luci-app-mt5700=[ym]'` 重复段已删除。
+		# 守卫（不是「校验通过」路径）：这个模式已停用，配好的 .config 只可能是
+		# 绕过了 ApplyMTMode.sh 拼出来的（例如手工改 workflow、直接手改 .config）。
+		# 这里明确拦下 —— 让它编完等于产出一套没人验证过的固件。
+		echo "::error::MT_MODE=MT5700M 已停用（方案 A：luci-app-mt5700m + QModem 的 sms-tool_q / ubus-at-daemon）。请改用 MT5700，或清空 MT_MODE。"
+		FAIL=1
 		;;
 	"" )
 		check_must_not luci-app-mt5700
@@ -94,7 +95,7 @@ case "$MODE" in
 		check_must_not ubus-at-daemon
 		;;
 	* )
-		echo "::error::非法 MT_MODE='$MODE'（仅允许空 / MT5700 / MT5700M）"
+		echo "::error::非法 MT_MODE='$MODE'（仅允许空 / MT5700；MT5700M 已停用）"
 		FAIL=1
 		;;
 esac

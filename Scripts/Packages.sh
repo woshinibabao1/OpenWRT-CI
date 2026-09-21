@@ -114,43 +114,25 @@ UPDATE_PACKAGE "partexp" "sirpdboy/luci-app-partexp" "main"
 # UPDATE_PACKAGE "qbittorrent" "sbwml/luci-app-qbittorrent" "master" "" "qt6base qt6tools rblibtorrent"
 
 # ===== MT 模式（MT_MODE）：独立插件配置层 =====
-# 允许值：空 / MT5700 / MT5700M；非法值直接终止。
+# 允许值：空 / MT5700；其他值（含已停用的 MT5700M）直接终止。
 # 空  —— 不克隆、不折叠任何 MT 插件
-# MT5700  —— 仅 luci-app-mt5700（单包自含 Rust 后端）
-# MT5700M —— luci-app-mt5700m（需 FOLD）+ QModem feed（sms-tool_q / ubus-at-daemon）
+# MT5700  —— 仅 luci-app-mt5700（单包自含 Rust 后端，不依赖 QModem）
+# ⛔ MT5700M（方案 A）已停用：它需要 luci-app-mt5700m + QModem feed 的
+#    sms-tool_q / ubus-at-daemon，而 sms-tool_q 的版本号（3.4.0-rc.3）对 apk 非法
+#    会导致 world 打包失败，且功能与 MT5700 完全重复。
+#    这里不再保留任何克隆/折叠代码 —— 留着只会是永不执行的死代码；
+#    拦截交给 ApplyMTMode.sh / VerifyMTMode.sh 的守卫（误选会明确报错终止）。
 MT_MODE="${MT_MODE:-}"
 echo " "
 echo "===== MT_MODE=${MT_MODE:-（空）} ====="
 case "$MT_MODE" in
-	""|MT5700|MT5700M) ;;
+	""|MT5700) ;;
 	*)
-		echo "::error::非法 MT_MODE='$MT_MODE'（仅允许空 / MT5700 / MT5700M），终止 CI"
+		echo "::error::非法 MT_MODE='$MT_MODE'（仅允许空 / MT5700；MT5700M 已停用），终止 CI"
 		exit 1
 		;;
 esac
 
-# QModem feed 仅 MT5700M 需要（提供 sms-tool_q / ubus-at-daemon）
-if [ "$MT_MODE" = "MT5700M" ]; then
-	UPDATE_PACKAGE "qmodem" "FUjr/QModem" "main"
-
-	# QModem 包共用 version.mk 的 QMODEM_VERSION（当前上游发布 "3.4.0-rc.3"）。
-	# OpenWrt 新版 apk 打包器不接受 `-rc.N`：版本串被拼成 "3.4.0-rc.3-rN" 后，
-	# apk mkpkg 报 "package version is invalid"（Error 99），阻断整个固件构建
-	# （sms-tool_q 今日三连发全灭即此因）。这里在克隆后把 X.Y.Z-rc.N 改写为
-	# apk 合法的 X.Y.Z_rcN；QModem 各包源码均内嵌仓库 src/，无版本化下载依赖，
-	# 改写只影响包版本元数据。若上游已改为合法版本，本规则自动跳过。
-	FIX_QMODEM_VERSION() {
-		local VER_FILE="./QModem/version.mk"
-		[ -f "$VER_FILE" ] || { echo "qmodem: version.mk not found, skip"; return 0; }
-		if grep -qE '^QMODEM_VERSION:=[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$' "$VER_FILE"; then
-			sed -i -E 's/^(QMODEM_VERSION:=)([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$/\1\2_rc\3/' "$VER_FILE"
-			echo "qmodem: QMODEM_VERSION sanitized to $(grep -E '^QMODEM_VERSION:=' "$VER_FILE")"
-		else
-			echo "qmodem: QMODEM_VERSION already apk-valid, no change"
-		fi
-	}
-	FIX_QMODEM_VERSION
-fi
 # UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
 # UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"
 # viking feed：仍克隆（其余包可能用到），第 5 参数会在克隆前把 feeds 里已停用包的
@@ -173,82 +155,6 @@ rm -rf ./packages/sing-box ./packages/luci-app-homeproxy
 
 # FAN789 插件及其他专用硬件插件
 UPDATE_PACKAGE "luci-app-h5000m-fancontrol" "FAN789/luci-app-h5000m-fancontrol" "main"
-
-# ===== MT5700M（方案 A）：luci-app-mt5700m monorepo 折叠 =====
-# luci-app-mt5700m 是两层 monorepo：仓库根没有 Makefile，真正可编译的包是
-#   luci-app-mt5700m/luci-app-mt5700m            (LuCI 壳，含 Makefile)
-#   mt5700webui-openwrt-server/at-webserver/     (Rust AT 后端源码，无 OpenWrt Makefile)
-# 上游发布流程（scripts/build-release.sh）会先用 cargo 交叉编译出静态二进制
-# at-webserver，再把 www/5700 前端 + 二进制 + init.d 脚本“折叠”进 LuCI 壳后
-# 一起编译。若只编译 LuCI 壳，固件会缺少 /usr/bin/at-webserver（以及
-# /usr/sbin/mt5700m-at 软链）与 /www/5700 WebUI，管理页的 AT 终端/拨号会全部失效。
-# 因此这里复刻上游折叠流程（见下方 FOLD_MT5700M）：
-#   1. 把 LuCI 壳（仓库内同名子目录）提升到 package/ 一级；
-#   2. 按编译目标架构用 cargo + rust-lld（自包含 musl，无需 OpenWrt 交叉工具链）
-#      编译 Rust 后端：mediatek → aarch64-unknown-linux-musl，x86 → x86_64-unknown-linux-musl；
-#   3. 把 www/5700、二进制、init.d 折叠进壳目录。
-# 注意：不能用 UPDATE_PACKAGE 的 "all" —— 壳目录与仓库根同名，cp -rf 会复制进自身。
-FOLD_MT5700M() {
-	local SHELL_DIR="./luci-app-mt5700m"
-	local SERVER_DIR="./luci-app-mt5700m/mt5700webui-openwrt-server/at-webserver"
-	local TMP_SHELL="./luci-app-mt5700m_shell"
-	local RUST_TARGET="aarch64-unknown-linux-musl"
-	local BIN_PATH=""
-
-	[ -d "$SHELL_DIR" ] || { echo "luci-app-mt5700m: clone not found, skip fold"; return 0; }
-	[ -d "$SHELL_DIR/luci-app-mt5700m" ] || { echo "luci-app-mt5700m: shell dir missing in repo, skip fold"; return 0; }
-	[ -d "$SERVER_DIR" ] || { echo "luci-app-mt5700m: at-webserver source missing in repo, skip fold"; return 0; }
-
-	# 第一层：LuCI 壳（先用临时名避开与仓库根同名冲突）
-	rm -rf "$TMP_SHELL"
-	mv -f "$SHELL_DIR/luci-app-mt5700m" "$TMP_SHELL"
-
-	# 目标架构 → Rust 交叉编译目标
-	case "${WRT_TARGET:-${WRT_CONFIG:-}}" in
-		x86) RUST_TARGET="x86_64-unknown-linux-musl" ;;
-	esac
-
-	# 折叠前端 + init.d（与后端二进制无关，先铺好目录）
-	mkdir -p "$TMP_SHELL/htdocs" "$TMP_SHELL/root/usr/bin" "$TMP_SHELL/root/etc/init.d"
-	cp -a "$SERVER_DIR/files/www/5700" "$TMP_SHELL/htdocs/5700"
-	cp -f "$SERVER_DIR/files/etc/init.d/at-webserver" "$TMP_SHELL/root/etc/init.d/at-webserver"
-	chmod 0755 "$TMP_SHELL/root/etc/init.d/at-webserver"
-
-	# 编译 Rust 后端（std-only，零第三方依赖，rust-lld 自包含链接）
-	if [ "${WRT_TEST:-false}" != "true" ]; then
-		if ! command -v rustup >/dev/null 2>&1; then
-			curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-				| sh -s -- -y --profile minimal --default-toolchain stable
-		fi
-		export PATH="$HOME/.cargo/bin:$PATH"
-		rustup target add "$RUST_TARGET" >/dev/null 2>&1 || true
-
-		BIN_PATH="$SERVER_DIR/target/$RUST_TARGET/release/at-webserver"
-		if ! (cd "$SERVER_DIR" && \
-			RUSTFLAGS="-C link-self-contained=yes -C linker=rust-lld" \
-			cargo build --release --locked --target "$RUST_TARGET"); then
-			echo "ERROR: luci-app-mt5700m: failed to build at-webserver ($RUST_TARGET)!" >&2
-			echo "固件将缺少 /usr/bin/at-webserver（/usr/sbin/mt5700m-at）与 /www/5700，插件不可用。" >&2
-			exit 1
-		fi
-		[ -f "$BIN_PATH" ] || { echo "ERROR: luci-app-mt5700m: at-webserver binary missing after build!" >&2; exit 1; }
-
-		cp -f "$BIN_PATH" "$TMP_SHELL/root/usr/bin/at-webserver"
-		chmod 0755 "$TMP_SHELL/root/usr/bin/at-webserver"
-	else
-		echo "luci-app-mt5700m: TEST 模式，跳过 Rust 后端编译（仅生成配置）"
-	fi
-
-	# 清理仓库根残留（含不再需要的 at-webserver 源码目录），还原正式包名
-	rm -rf "$SHELL_DIR"
-	mv -f "$TMP_SHELL" "$SHELL_DIR"
-
-	if [ -f "$SHELL_DIR/root/usr/bin/at-webserver" ] && [ -f "$SHELL_DIR/htdocs/5700/index.html" ]; then
-		echo "luci-app-mt5700m: folded www/5700 + at-webserver backend ($RUST_TARGET)"
-	else
-		echo "WARNING: luci-app-mt5700m: folded without at-webserver backend (TEST 模式)" >&2
-	fi
-}
 
 # ===== MT5700（方案 B）：luci-app-mt5700 单包（Rust 后端由包内 src/Makefile 编译）=====
 # 该包 Makefile 的 LUCI_DEPENDS 为空，不依赖 sms-tool_q / ubus-at-daemon。
@@ -335,13 +241,6 @@ INSTALL_NET_TUNING() {
 }
 
 case "$MT_MODE" in
-	MT5700M)
-		echo "MT_MODE=MT5700M：克隆并折叠 luci-app-mt5700m"
-		UPDATE_PACKAGE "luci-app-mt5700m" "LianXia233/luci-app-mt5700m" "main"
-		FOLD_MT5700M
-		# 防污染：若 feeds/工作区意外出现 luci-app-mt5700，主动移除
-		rm -rf ./luci-app-mt5700
-		;;
 	MT5700)
 		echo "MT_MODE=MT5700：克隆 luci-app-mt5700（不安装 mt5700m / sms-tool_q / ubus-at-daemon）"
 		# 源：woshinibabao1/MT5700-Console（本项目自己维护的 MT5700 Console，单包自含

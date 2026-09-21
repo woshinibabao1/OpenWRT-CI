@@ -48,6 +48,12 @@
 
 > 说明：`ApplyMTMode.sh` / `VerifyMTMode.sh` 里的 **MT5700M 分支保留为守卫**——
 > 现在 `Config/MT5700M.txt` 已删除，万一有人手滑选了 MT5700M 会**明确报错终止**，而不是静默编出半残固件。
+>
+> 补充（2026-09-22）：该文件曾在 2026-09-21 被误当"缺失的 bug"补回一次 —— 补回等于
+> **临时拆掉这道守卫**（误选会真的开始克隆 QModem + 折叠 + 出未验证固件）。现已删除还原，
+> 并把 `ApplyMTMode.sh` / `VerifyMTMode.sh` 的 MT5700M 分支统一改成**明确报"该方案已停用"**
+> （语义比"缺文件"更直白），同时清掉 `Packages.sh` 里随之永不再执行的 QModem 克隆、
+> `FIX_QMODEM_VERSION` 与 `FOLD_MT5700M`。
 
 ### B. 固件版本标识
 

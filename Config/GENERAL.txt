@@ -74,9 +74,13 @@ CONFIG_PACKAGE_luci-app-h5000m-netmode=y
 # CONFIG_PACKAGE_easytier is not set
 # CONFIG_PACKAGE_luci-app-easytier is not set
 
-# MT5700 / MT5700M 已从本通用配置剥离，改为独立配置层：
-#   Config/MT5700M.txt  —— MT_MODE=MT5700M 时叠加（luci-app-mt5700m + sms-tool_q + ubus-at-daemon）
-#   Config/MT5700.txt   —— MT_MODE=MT5700  时叠加（仅 luci-app-mt5700）
+# MT5700 已从本通用配置剥离，改为独立配置层：
+#   Config/MT5700.txt   —— MT_MODE=MT5700 时叠加（仅 luci-app-mt5700）
+#   ⛔ Config/MT5700M.txt **已删除**：方案 A（luci-app-mt5700m + QModem 的
+#      sms-tool_q / ubus-at-daemon）自 2026-09-15 起停用（依赖版本号对 apk 非法
+#      且功能与方案 B 重复）。删掉配置文件是**有意为之的 fail-fast** ——
+#      误选 MT5700M 会在 Scripts/ApplyMTMode.sh 阶段明确报错终止，
+#      而不是静默编出一套没人验证过的固件。
 # 未设置 MT_MODE 时不自动安装任何 MT 插件（见 Scripts/ApplyMTMode.sh）。
 
 # USB 核心支持

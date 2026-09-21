@@ -1,5 +1,44 @@
 # 更新日志
 
+## [2026-09-22] 还原 MT5700M 的 fail-fast 守卫（删除误补回的配置层 + 清理死代码）
+
+### 背景：一次判断失误的纠正
+
+`Config/MT5700M.txt` 的 git 史是 `f659ca9 建 → 93bb168 删 → 456ed7b 补回`。
+第二次"补回"是错的：原设计**故意删掉该配置文件**，让 `ApplyMTMode.sh` 的 MT5700M
+分支充当守卫 —— 误选即 `::error::缺少 Config/MT5700M.txt` 终止，避免静默编出半残固件
+（见 `FIRMWARE_OPTIMIZATION_REPORT.md` 的「产物收敛」节）。当时把"脚本要求文件存在、
+而文件不在"读成了缺文件的 bug，补回去等于**把安全网拆了**：误选 MT5700M 不再立即
+报错，而是真的会去克隆 QModem、折叠 `luci-app-mt5700m`、白烧几分钟到几小时，
+最后产出一套**从未真机验证**的固件。
+
+### 本次改动
+
+- **删除** `Config/MT5700M.txt`，恢复"缺文件即 fail-fast"的原设计。
+- `Scripts/ApplyMTMode.sh`：MT5700M 分支改为**明确报错终止**（报清原因：方案 A 依赖
+  QModem 的 `sms-tool_q` / `ubus-at-daemon`，其版本号 `3.4.0-rc.3` 对 apk 非法，
+  且功能与方案 B 重复），并删掉第二个 case 里已不可达的叠加分支。
+- `Scripts/VerifyMTMode.sh`：MT5700M 分支从"校验必须选中"改为**守卫式报错**
+  （防有人绕过 ApplyMTMode 直接手改 `.config` 或 workflow）。
+- `Scripts/Packages.sh`：清理**永不执行**的死代码 —— QModem feed 克隆、
+  `FIX_QMODEM_VERSION`（为 `-rc.N` 版本号改写写的补丁，随方案 A 一起无用）、
+  `FOLD_MT5700M`（75 行 monorepo 折叠 + cargo 交叉编译，整段删除）、
+  case 里的 MT5700M 克隆分支；合法值白名单收敛为 `""|MT5700`。
+- 注释同步：`Config/GENERAL.txt` 与 `.github/workflows/WRT-CORE.yml` 的 MT_MODE 说明
+  标注 MT5700M 已停用 + 守卫语义；`README.md` 显式写明"没有 MT5700M.txt 是有意的，
+  别再补回来"。
+
+### 验证（本地 dry-run，非真机）
+
+- `bash -n` 三个脚本均通过。
+- `ApplyMTMode.sh`：`MT5700M` → rc=1 且报「已停用」；`MT5700` → rc=0，正确叠加
+  `Config/MT5700.txt` 并把 `luci-app-mt5700m` / `sms-tool_q` 置 n；空模式 rc=0；
+  非法值 rc=1。
+- `VerifyMTMode.sh` 六个场景：MT5700 干净通过；MT5700 被 `mt5700m=y` 或被
+  `sms-tool_q=y` 污染时分别拦截；MT5700M 报「已停用」；空模式干净通过、被污染拦截。
+- `Packages.sh` 残留检查：`UPDATE_PACKAGE "qmodem"` / `FOLD_MT5700M` /
+  `FIX_QMODEM_VERSION` 均为 0 处。
+
 ## [2026-09-21] 借鉴分析：ATang007ZH/Action-237-immortalwrt-mt798x-24.10
 
 对该仓库做了全量核查（README、14 个 workflow、6 个 diy 脚本、`files/`、343KB 的

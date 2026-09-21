@@ -54,8 +54,11 @@ on:
         default: OWrt
       # MT 插件模式（独立配置层，全机型复用）：
       #   ""      —— 不安装任何 MT 插件（默认，保持普通 CI 行为）
-      #   MT5700  —— 仅 luci-app-mt5700（方案 B）
-      #   MT5700M —— luci-app-mt5700m + sms-tool_q + ubus-at-daemon（方案 A）
+      #   MT5700  —— 仅 luci-app-mt5700（方案 B，单包自含 Rust 后端）
+      #   MT5700M —— ⛔ 已停用（方案 A：luci-app-mt5700m + QModem 的 sms-tool_q /
+      #              ubus-at-daemon；sms-tool_q 版本号对 apk 非法且功能与方案 B 重复）。
+      #              ApplyMTMode / VerifyMTMode 里保留该分支作为 **fail-fast 守卫**：
+      #              误选会明确报错终止，不会静默编出没人验证过的固件。
       # 其他值在 ApplyMTMode / VerifyMTMode / Packages.sh 中报错并终止。
       MT_MODE:
         required: false
