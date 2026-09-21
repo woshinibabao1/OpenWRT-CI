@@ -1,5 +1,92 @@
 # 更新日志
 
+## [2026-09-22 · 编译前全仓审查] 5 项加固（含 1 项纯浪费清理）
+
+触发：用户「准备编译了，全面检查优化下我的项目」。方法：配方层／脚本层／CI 层／覆盖层
+四路交叉核对 + 真机取证，逐条**回读原文件**核实（不采信扫描结论）。
+
+**总体结论：全仓 LF 无 BOM、Config 无 `=y/`=n` 冲突、workflow 引用的本地文件无缺失、
+克隆重试与缓存 save 拆分均已到位。** 本轮发现的 5 项如下。
+
+### 1. `INSTALL_NET_TUNING` 的完整性断言只覆盖 5/12 个覆盖层文件 —— 补齐
+
+原文手写 5 条 `[ -f ]`（net / wan / nft / rps / hotplug-rps），**漏掉 7 个**，
+其中包括后来新增的 `sysctl.d/99-mt5700-conntrack.conf` 与 `99-mt5700-tcp.conf`
+—— BBR / fq / 16M 缓冲 / NAT 端口段**全在这两份里**，漏铺就整套网络调优静默失效，
+而固件照样能编能刷。
+
+改为**逐文件比对源目录**（`find "$SRC_DIR" -type f` → 每个 `REL` 都必须在 `$DST_DIR` 存在），
+白名单随 `Files/` 演进自动更新，不会再漏。
+
+### 2. 可执行位从「按目录写死三条 chmod」改为「按 shebang 判定」
+
+原来只 chmod `uci-defaults/`、`init.d/`、`hotplug.d/net/` 三个目录 —— 将来往
+`Files/etc` 下新增目录（如 `hotplug.d/iface/`）就会漏，而漏掉的后果**全是静默的**
+（rc.common / uci-defaults / hotplug 直接跳过，都不报错）。
+现改为：**凡首行是 `#!` 的覆盖层文件一律 +x**，与目录无关；`.conf`/`.nft`/文本保持 0644。
+
+**验证（隔离测试台，非"看起来对"）**：抽出函数在临时目录跑两种情形 ——
+正常路径 `rc=0`、识别脚本 `7` 个、12 个文件全到位；故意让一个文件无法就位时
+`rc=1` 且报错**指向具体文件名**（`etc/sysctl.d/99-mt5700-tcp.conf`）。守卫确实能检出。
+
+### 3. `Settings.sh` 三处静默失效风险
+
+- **wifi 配置两个分支都没有 `else`**：若上游同时移走 `*set-wireless.sh` 与
+  `mac80211.uc`，SSID / 密码 / 加密方式 / 国家码 / 频宽**全部沿用上游默认**且不报错
+  —— 正是本文件开头 `EDIT_FILES` 注释要防的那类。现补 `else` → `::error::` + `exit 1`
+  （与该文件既有约定一致：`EDIT_FILES` 找不到目标即硬失败）。
+- **判据 `[ -f "$WIFI_SH" ]` 是错的**：`find` 可能返回**多个**路径，而 `[ -f "a\nb" ]`
+  恒为假 → 会静默掉到 `elif`、甚至两个分支都不进。改为 `[ -n "$WIFI_SH" ]`
+  （下面的 `sed -i ... $WIFI_SH` 本来就支持多文件）。
+- **`config_generate` 的 4 条 sed 是本文件里唯一没有守卫的**：文件不存在时 sed 报错但
+  脚本无 `set -e`、退出码仍是 0；锚点变了时 GNU sed 零匹配也返回 0 —— 两种都 CI 全绿，
+  而后果是"刷完默认 IP 不是 `$WRT_IP`"（这台机器整套 LuCI/SSH/部署都按它连）。
+  现补：文件缺失 → 硬失败；锚点不匹配 → `::warning::`（与 `Handles.sh` 的 htmode 检查同规）。
+
+  **真机核实过锚点当前有效**（不是凭猜加断言）：固件内 `/bin/config_generate` 实测含
+  `set system.@system[-1].hostname='OWRT'`、`timezone='CST-8'`、`zonename='Asia/Shanghai'`、
+  `lan) ipad=${ipaddr:-"192.168.10.1"}` —— 4 条 sed 都真的写进去了。故本轮是**纯防御**。
+
+### 4. `.gitattributes` 覆盖不到固件覆盖层（无扩展名脚本）
+
+原规则只有 `*.txt` / `*.sh` / `*.patch`。而 `Files/etc/**` 里大量是
+**无扩展名** 的 init.d / uci-defaults / hotplug 脚本，以及 `.conf` / `.nft` ——
+一个都不匹配。在 `core.autocrlf=true` 的 Windows 检出上会被翻成 CRLF，
+而 `#!/bin/sh\r` 在设备上的失败方式正是"静默不执行"。
+新增 `Files/** text eol=lf`，按目录整片声明，新增文件自动纳入。
+
+（实测当前工作区**全仓 LF、无 BOM、行尾完整**，即尚无实际故障。）
+
+### 5. git 索引 exec 位落实 100755（14 个文件）
+
+`Files/etc/init.d/*`、`Files/etc/uci-defaults/*`、`Files/etc/hotplug.d/net/*` 与
+`Scripts/*.sh` 之前都是 `100644`，靠 CI 的 chmod 兜底。按本仓既有约定
+（记忆红线：动过 `init.d/*`、`*.sh` 后核对 100755）已在索引里改为 `100755`；
+数据文件（`sysctl.d/*.conf`、`*.nft`、`mt5700/flow-offload`）保持 `100644`。
+
+### 6. 停克隆 `VIKINGYFY/packages`（纯浪费，按其自身标准）
+
+穷举核对：上游 8 个目录里，`axonhub`/`luci-app-axonhub`/`gecoosac`/`luci-app-gecoosac`/
+`luci-app-wolultra` 在四个 Config 文件里**一次都没出现**，`sing-box`/`luci-app-homeproxy`
+明确 `=n` —— **一个包都不进固件**；且第 5 参数名单里的 `luci-app-timewol`/`luci-app-wolplus`
+**上游已不存在**，说明名单本身也已过期。与 momo / nikki / openclash / passwall 同属
+「克隆了却不编入」，按同一标准停掉。紧邻的那句 `rm -rf ./packages/sing-box …` 保留并
+标注「与 viking 克隆配套，别单独删」（重新启用时必须一起恢复）。
+
+### 本轮检查过、判定**无问题**的项（存档，避免下轮重复挖）
+
+| 项 | 核对结果 |
+| :-- | :-- |
+| `save-always` 是否还在用 | ✅ 3 处**全在注释里**；实际代码已是 `actions/cache/restore@v4` + 显式 `actions/cache/save@v4`，判据 `if: always() && …cache-hit != 'true'`，与官方 action.yml 的正确用法一致 |
+| 并发互踩 | ✅ `concurrency.group` 按 CONFIG+MT_MODE 分组、`cancel-in-progress: false`（排队而非互杀） |
+| 定时清理后留空窗 | ✅ `Auto-Clean` 在 `schedule` 触发时强制 `KEEP_LATEST=true`（每机型留最新一个）；`H5000M-MT-AUTO` 的 `workflow_run` 还判了 `conclusion == 'success'` |
+| 每周全量清缓存导致冷编译 | ✅ `Cache-Clean` 已从定时改为仅手动 `workflow_dispatch` |
+| 网络步骤裸奔 | ✅ `Clone Code` 与 `UPDATE_PACKAGE` 各 3 次重试且重试前清残留；curl 均带 `--retry 5 --retry-all-errors` |
+| 覆盖层引用已停用包 | ✅ 提到 `irqbalance`/`qmodem` 的位置**全在注释**；唯一实际调用（`mt5700-smp` 停 irqbalance）有 `[ -x ]` 守卫 |
+| Config 自冲突 | ✅ 156 个符号、124 个 `=y`，无同一符号既 `=y` 又 `=n` |
+| workflow 引用的本地文件 | ✅ 无缺失 |
+| WED / HNAT | ✅ 上一轮已归档（见优化报告「附A」），本轮不再重复 |
+
 ## [2026-09-22 · 第二轮] 软件转发收包路径与 NAT 端口段补齐（4 项）
 
 基准同上一轮（`好用的固件V0.18.bin`）。本轮把它的 `/etc` 全部摊开逐文件比对：

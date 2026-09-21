@@ -135,20 +135,30 @@ esac
 
 # UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
 # UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"
-# viking feed：仍克隆（其余包可能用到），第 5 参数会在克隆前把 feeds 里已停用包的
-# 目录清掉。
-# ⚠️ 精确说明它到底清了哪里：UPDATE_PACKAGE 的删除循环只 find `../feeds/luci/` 与
-#    `../feeds/packages/`，所以 axonhub / gecoosac / timewol / wolplus / wolultra 会
-#    留在克隆出来的 `./packages/` 里（它们没被任何 Config 层选中，不进固件，只是多几个
-#    目录被 package/ 扫描）。真正需要"物理删掉"的只有 sing-box / luci-app-homeproxy，
-#    由下面那行 rm 处理。
-UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-box luci-app-homeproxy luci-app-timewol luci-app-wolplus luci-app-wolultra"
 
-# P06（加固，非必需）：viking feed 克隆到 ./packages/（git clone 的目录名取 URL 仓库名
-# VIKINGYFY/packages → packages；第 4 参数为空故无 pkg/name/all 整理，原样保留），
-# 其内仍含 sing-box / luci-app-homeproxy 子目录，会被 OpenWrt 的 package/ 扫描拾起。
-# 纵深防御式删掉这两个子目录（cwd 为 wrt/package/，见 WRT-CORE.yml:242）。
-# 真正防线仍是 Config/GENERAL.txt 的 =n + VerifyNoSingBox.sh 双重断言。
+# ===== 已停克隆（2026-09-22）：viking feed =====
+# 判定方式与上面几行同一套，这次做了穷举核对：
+#   ① 拉 VIKINGYFY/packages 顶层目录清单（共 8 个），逐个回查四个 Config 文件：
+#        axonhub / luci-app-axonhub / gecoosac / luci-app-gecoosac / luci-app-wolultra
+#        —— 四个 Config 文件里**一次都没出现**（连 =n 都没写）；
+#        sing-box / luci-app-homeproxy —— 明确 =n（用户要求移除）。
+#      即：一个包都不会进固件。
+#   ② 下面第 5 参数删除名单里列的 luci-app-timewol / luci-app-wolplus 在上游仓库
+#      **已经不存在**了（只剩上面 8 个目录）—— 说明这份名单本身也已过期。
+#   ③ 它带进来的 6 个包目录只会被 package/ 扫描一遍（纯耗时），不进产物。
+# 结论：与 momo / nikki / openclash / passwall 同属「克隆了却不编入」，按同一标准停掉。
+# 需要时恢复：取消下面这行注释，并在对应 Config 里补 =y；同时**必须**恢复紧随其后的
+#   那句 rm —— 两行是配套的（见该行注释）。
+# UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-box luci-app-homeproxy luci-app-timewol luci-app-wolplus luci-app-wolultra"
+
+# P06（纵深防御）—— ★ 与上面 viking 克隆是**配套**的，别单独删：
+#   viking 克隆到 ./packages/（git clone 目录名取 URL 仓库名，第 4 参数为空故原样保留），
+#   其内含 sing-box / luci-app-homeproxy 子目录，会被 OpenWrt 的 package/ 扫描拾起。
+#   ⚠️ UPDATE_PACKAGE 的删除循环只 find `../feeds/luci/`、`../feeds/packages/`，
+#      清不到刚克隆出来的 ./packages/ —— 所以这里必须物理删（cwd 为 wrt/package/）。
+#   真正防线仍是 Config/GENERAL.txt 的 =n + VerifyNoSingBox.sh 双重断言。
+#   ★ 2026-09-22 起 viking 已停克隆，本行当前是 no-op；保留它是因为重新启用 viking 时
+#     必须同时恢复到这一行，删掉就等于把那个安全网弄丢了。
 rm -rf ./packages/sing-box ./packages/luci-app-homeproxy
 
 # UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
@@ -218,26 +228,51 @@ INSTALL_NET_TUNING() {
 
 	mkdir -p "$DST_DIR/etc/uci-defaults" "$DST_DIR/etc/sysctl.d" "$DST_DIR/etc/nftables.d" "$DST_DIR/etc/hotplug.d/net"
 	cp -rf "$SRC_DIR/etc/." "$DST_DIR/etc/"
-	chmod 0755 "$DST_DIR/etc/uci-defaults/"* 2>/dev/null || true
-	# init.d 脚本必须带可执行位，否则 rc.common 不会执行它（git 不保存 exec 位，
-	# 所以必须在这一步补，不能依赖仓库里的文件权限）。
-	chmod 0755 "$DST_DIR/etc/init.d/"* 2>/dev/null || true
-	# hotplug 脚本同理：没有执行位时 hotplug.d 会直接跳过它（静默）。
-	chmod 0755 "$DST_DIR/etc/hotplug.d/net/"* 2>/dev/null || true
-	echo "net-tuning: 已注入 Files/etc → wrt/files/etc"
 
+	# ---- 可执行位（2026-09-22 改为按内容判定）--------------------------------
+	# 原来按目录写死三条 chmod（uci-defaults / init.d / hotplug.d/net）。那样只覆盖
+	# "当时已知的三个目录" —— 将来往 Files/etc 下新增一个目录（例如 hotplug.d/iface/、
+	# lib/…）就会漏掉，而漏掉的后果**全是静默的**：
+	#   · init.d / uci-defaults：rc.common 与开机脚本直接跳过，不报错；
+	#   · hotplug.d：内核热插拔事件里被跳过，同样不报错；
+	#   · git 也不保存 exec 位，所以不能指望仓库里的文件权限。
+	# 现改为：**凡是首行是 shebang（#!）的覆盖层文件一律 +x**，与它放在哪个目录无关；
+	# 非脚本（sysctl 的 .conf / nftables 的 .nft / flow-offload 文本）保持 0644 ——
+	# 给数据文件乱加 +x 反而会让"这个目录里哪些是脚本"变得不可读。
+	local EXEC_N=0
+	while IFS= read -r F; do
+		[ "$(head -c 2 "$F" 2>/dev/null)" = '#!' ] || continue
+		chmod 0755 "$F" && EXEC_N=$((EXEC_N + 1))
+	done < <(find "$DST_DIR" -type f)
+	echo "net-tuning: 已注入 Files/etc → wrt/files/etc（识别为脚本并 +x 的 ${EXEC_N} 个）"
+
+	# ---- 完整性断言 ----------------------------------------------------------
 	# P08：复制后无断言，调优脚本丢了没人知道（直接后果：刷完没网）。
-	# 缺失即明确失败，而不是静默带着不完整的覆盖层出固件。
-	[ -f "$DST_DIR/etc/uci-defaults/99-mt5700-net" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/uci-defaults/99-mt5700-net"; exit 1; }
-	[ -f "$DST_DIR/etc/uci-defaults/99-mt5700-wan" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/uci-defaults/99-mt5700-wan"; exit 1; }
-	# nft 规则文件缺失/损坏会让 fw4 加载失败 —— 后果是刷完直接没网，必须硬断言。
-	[ -f "$DST_DIR/etc/nftables.d/12-mangle-ttl-128.nft" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/nftables.d/12-mangle-ttl-128.nft"; exit 1; }
-	# mt5700-rps：收包软中断四核分摊。缺了它 rps_cpus 会停在单核掩码，
-	# 「四核平均分」静默失效（不报错、不崩溃，只是吞吐上不去），必须硬断言。
-	[ -f "$DST_DIR/etc/init.d/mt5700-rps" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/init.d/mt5700-rps"; exit 1; }
-	# hotplug 补设 RPS：init.d 在 S95 跑时无线接口还没建出来（wpad 更晚），
-	# 缺了它无线 RPS 就是静默失效 —— 同样是"不报错但功能没生效"，必须硬断言。
-	[ -f "$DST_DIR/etc/hotplug.d/net/30-mt5700-rps" ] || { echo "::error::net-tuning: 缺失 $DST_DIR/etc/hotplug.d/net/30-mt5700-rps"; exit 1; }
+	# ★ 2026-09-22 改为**逐文件比对源目录**，不再手写白名单。理由：手写清单会随
+	#   Files/ 演进而失效 —— 本轮实测就发现白名单只覆盖 5 个、另有 7 个漏网，
+	#   其中包括后来新增的 sysctl.d/99-mt5700-conntrack.conf 与 99-mt5700-tcp.conf
+	#   （BBR / fq / 16M 缓冲 / NAT 端口段全在这两份里）。它们一旦没铺进去，
+	#   固件照样能编能刷，只是所有网络调优**静默失效**。
+	#   改为"源里有什么、目标就必须有什么"后，新增文件自动纳入断言，不会再漏。
+	#
+	#   各文件缺失的具体后果（为啥不能只 warn）：
+	#     · uci-defaults/99-mt5700-net       —— 首次开机全部网络配置（含 flow offload 选型）
+	#     · uci-defaults/99-mt5700-wan       —— MT5700M 接口 / DNS / 防火墙 wan 区 → 刷完没网
+	#     · nftables.d/12-mangle-ttl-128.nft —— TTL 统一，缺失会被运营商丢 TCP 包
+	#     · init.d/mt5700-rps + hotplug/30-mt5700-rps —— 四核 RPS 分摊（缺了不报错、只是慢）
+	#     · init.d/mt5700-smp                —— 中断亲和 + 关 GRO fraglist
+	#     · sysctl.d/99-mt5700-*.conf        —— BBR / fq / 16M / conntrack / NAT 端口段
+	local SRC_N=0 MISS_N=0 REL
+	while IFS= read -r F; do
+		SRC_N=$((SRC_N + 1))
+		REL="${F#"$SRC_DIR"/}"
+		[ -f "$DST_DIR/$REL" ] || {
+			echo "::error::net-tuning: 覆盖层缺失 $REL（源 $F）—— 固件会能编能刷，但该项静默失效"
+			MISS_N=$((MISS_N + 1))
+		}
+	done < <(find "$SRC_DIR" -type f)
+	[ "$MISS_N" -eq 0 ] || exit 1
+	echo "net-tuning: 覆盖层完整性断言通过（${SRC_N} 个文件逐个比对，与源目录一致）"
 }
 
 case "$MT_MODE" in

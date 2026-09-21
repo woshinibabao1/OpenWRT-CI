@@ -2,3 +2,14 @@
 *.sh text eol=lf
 
 *.patch text eol=lf
+
+# 固件覆盖层（Files/）：里面既有 .conf / .nft，也有**无扩展名**的 init.d、
+# uci-defaults、hotplug.d 脚本。它们最终在设备上以 shell 执行，一旦是 CRLF，
+# `#!/bin/sh` 会变成 `#!/bin/sh\r` —— 轻则找不到解释器，重则被
+# rc.common / uci-defaults / hotplug 直接跳过，**两种失败都不报错**。
+#
+# 上面两条规则覆盖不到它们（.conf、.nft 与无扩展名文件全不匹配），
+# 所以在 core.autocrlf=true 的 Windows 检出上会被翻成 CRLF。
+# CI 跑在 Linux（不受 autocrlf 影响），但本地检出 + 手工往设备传文件时会踩到。
+# 按目录整片声明为 LF，将来往 Files/ 里新增文件自动纳入，不会漏。
+Files/** text eol=lf
