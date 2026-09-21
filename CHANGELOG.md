@@ -1,5 +1,69 @@
 # 更新日志
 
+## [2026-09-21] 移除 OpenClash / MosDNS；与 higowrt + Mwrt 双基准核准
+
+按用户要求移除 OpenClash 与 MosDNS，并以两个厂家基准做了最优性核准。
+
+**移除（`Config/GENERAL.txt` 5 个符号转 `=n` + `Scripts/Packages.sh` 停克隆）**
+
+| 符号 | 处置 |
+|---|---|
+| `luci-app-openclash` / `luci-i18n-openclash-zh-cn` | `=n` |
+| `luci-app-mosdns` / `luci-i18n-mosdns-zh-cn` / `v2dat` | `=n` |
+
+依据（三条独立证据，非仅凭口头要求）：
+1. **厂家基准里就没有** —— Mwrt 固件的 `/etc/init.d`（67 项）与 `/etc/config`（32 项）
+   中无 openclash / mosdns（其代理能力走 `sing-box` + `xray`）；higowrt 的
+   `defconfig/mt7987_mt7992.config` 里 157 个 `=y` 包同样一个都没有。
+2. **真机确实装着**（移除前 `apk list --installed` 实测）：`luci-app-openclash-0.47.165`、
+   `luci-app-mosdns-1.7.14-r1` + `mosdns-5.3.4-r14` + `geo2txt`。
+3. **两者在真机上都是负面收益** —— openclash 是「僵尸服务」（init 已 enable 但无进程，
+   fw4 每次报 unreachable path）；mosdns 被关成 `enabled='0'` 后 dnsmasq 仍指向
+   `127.0.0.1#5335` 死端口 → 冷域名解析 ~3 秒（2026-09-21 真事故）。
+
+**`dnsmasq-full` 保留**：它当初是为 OpenClash 的 nftset/ipset 而换的，但真机正在运行
+`dnsmasq-full 2.93`，换回精简版是无收益的行为变更，且 nftset 能力日后仍可能用到。
+`Config/GENERAL.txt` 的注释已改写，不再声称「因为 OpenClash 才留」。
+
+**双基准核准结论（本轮做的最优性核对）**
+
+| 维度 | 结论 |
+|---|---|
+| 硬件加速 / 闭源驱动 | 不可搬（vermagic 6.6.94 vs 6.18.52）；MT7987 的 WED 属上游未完成。详见 `CLOSED_SOURCE_AUDIT.md` |
+| 内核网络栈 | BBR / CAKE / fq_codel / SQM / flow offload 取舍 / TTL 归一 / conntrack / TCP 参数 —— 齐备且均已真机验证 |
+| CPU·中断 | `mt5700-smp`（硬中断亲和）+ `mt5700-rps`（RPS 多核掩码）已取代 irqbalance |
+| 插件集 | 与厂家基准比**无缺失项**；多出 zram、ttyd、SQM、argon、风扇控制、netmode、MT5700 插件等实用项 |
+| 特有加速 | EIP-197 硬件加密已就位（`kmod-crypto-hw-safexcel` + `eip197-mini-firmware`，真机 `/lib/firmware/inside-secure` 存在） |
+
+**顺带清理一：停掉 14 个「克隆了但从未编入固件」的包**（用户确认）
+
+`Scripts/Packages.sh` 里以下 14 项此前每次构建都在克隆，但 `Config/*.txt` 四个文件全量
+扫描无对应 `CONFIG_PACKAGE_*=y`，真机 `apk list --installed` 也确认从未安装
+—— 纯浪费时间与 CI 机时（每次 clone 5~30 秒）：
+
+`momo`、`nikki`、`passwall`、`passwall2`、`luci-app-tailscale`、`ddns-go`、`diskman`、
+`easytier`、`netspeedtest`、`netwizard`、`openlist2`、`quickfile`、`timecontrol`、`vnt`
+
+停克隆**不影响任何固件产物**（本来就没编进去）。保留的克隆 = 真机确实在用的
+（`argon`、`diskmanager`→mini-diskmanager、`partexp`、`h5000m-fancontrol`、
+`h5000m-netmode`）+ 纵深防御用途的 `viking`（其内 sing-box/homeproxy 目录需被删除）。
+
+**顺带清理二：移除 irqbalance 三件套（`irqbalance` / `luci-app-irqbalance` / 中文包）**
+
+依据（真机 2026-09-21 实测）：irqbalance 对负载最大的两个中断**毫无作为** ——
+无线 mt7996e（IRQ 79，186 万次）与 USB 5G 模组（IRQ 74）从未被迁移，它全程只动了
+以太网两个中断（67→CPU1、68→CPU3）；且 `99-mt5700-net` 每次开机都把它停用，
+属「编了也永远不跑」。硬中断亲和已由 `mt5700-smp` 接管。
+
+配套删除的死代码 / 过时描述：
+- `Files/etc/uci-defaults/99-mt5700-net` 第 3 节的「停用 irqbalance」逻辑（固件里已无该包）
+- `.github/workflows/WRT-CORE.yml` 关键包自检列表里的 `irqbalance|luci-app-irqbalance`
+  （否则会打印出 `=n` 的行，看起来像包还在）
+- `99-mt5700-net` 第 4 节「配合上面的 irqbalance」→ 改为 mt5700-smp
+
+`Files/etc/init.d/mt5700-smp` 里**运行时**停用 irqbalance 的逻辑**保留**：那不是死代码，
+而是「用户日后自行安装时」的防护（两者同写 smp_affinity 会互相覆盖）。
+
 ## [2026-09-21] 以厂家固件为基准筛查优化项：conntrack 容量 / rpcd 无限重启
 
 以 `Mwrt-H5000M-1139-24-20260921.bin` 为基准做了一轮全量取证（自行解析 squashfs，

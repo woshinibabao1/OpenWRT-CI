@@ -62,16 +62,17 @@
 | --- | --- |
 | `luci-theme-argon` + `luci-app-argon-config` | 由 `WRT_THEME: argon` 驱动（`H5000M-MT-AUTO.yml` / `WRT-BUILD.yml` 已改） |
 | `luci-i18n-argon-config-zh-cn` | 中文语言包 |
-| `luci-app-openclash` + 中文包 | 同时把 `dnsmasq` 换成 **`dnsmasq-full`**：OpenClash 的 nftset/ipset 分流依赖它，用默认 dnsmasq 会出现规则不生效 |
+| ~~`luci-app-openclash` + 中文包~~ | **2026-09-21 已移除**（用户要求）。当时同时把 `dnsmasq` 换成 `dnsmasq-full` 以支持 OpenClash 的 nftset/ipset 分流；OpenClash 移除后 `dnsmasq-full` **保留**（真机在用 + nftset 能力备用），见 `Config/GENERAL.txt` |
 
 | 卸载 | 说明 |
 | --- | --- |
 | `luci-app-homeproxy` / `easytier` / `luci-app-easytier` / `luci-app-gecoosac` / `luci-app-wolultra` / `luci-app-samba4` / `luci-app-upnp` / `luci-theme-aurora` / `luci-app-aurora-config` | 按你的清单 |
 | `sing-box`（内核） | **顺带处理孤儿**：它原本只为 HomeProxy 服务，界面一走就是白占空间，一并不编 |
+| `luci-app-openclash` + 中文包 / `luci-app-mosdns` + 中文包 + `v2dat` | **2026-09-21 移除**（用户要求）。依据：① 厂家基准（Mwrt 1139-24 的服务集合、higowrt defconfig 157 个 =y 包）二者皆无；② 真机实测装了 `luci-app-openclash-0.47.165`、`luci-app-mosdns-1.7.14`+`mosdns-5.3.4`；③ 二者在真机上均为负面收益（openclash 僵尸服务致 fw4 告警；mosdns 关闭后 dnsmasq 指向 5335 死端口致解析 ~3 秒） |
 
-| **补回**（这条不在你清单里，是我按「别把在用的东西弄丢」加的） | 说明 |
+| **补回** | 说明 |
 | --- | --- |
-| `luci-app-mosdns` + 中文包 + `v2dat` | 真机上 **MosDNS 正在跑**（init.d 里有、配置在用），但 09-15 之后的配方把它丢了。不补回来，下次刷新固件会直接没有 MosDNS —— 那是功能回退，不是优化 |
+| ~~`luci-app-mosdns` + 中文包 + `v2dat`~~ | 2026-09-15 补回，**2026-09-21 按用户要求再度移除**（原因见上表）。教训：以「真机在跑」为由补回插件前，先确认它是否真的被用户需要 —— 真机在跑可能是因为它当初就是被默认装进去的 |
 
 ### D. 网络加速 / 稳定性（核心改动，落在首次开机脚本）
 
@@ -82,7 +83,7 @@
 - 回滚：网络 → 防火墙 → 常规设置，取消「Flow Offloading」；或
   `uci set firewall.@defaults[0].flow_offloading=0; uci commit firewall; /etc/init.d/firewall restart`
 
-**2）显式兜底 packet steering**（同脚本）：与 irqbalance 配合，避免收包软中断全压 CPU0。
+**2）显式兜底 packet steering**（同脚本）：netifd 的 packet steering 必须由 **uci** 驱动（`network.globals.packet_steering='1'`），光有 init 脚本不生效；再由首次开机启用的 `mt5700-rps` 强制多核掩码兜底。硬件中断亲和改由 `mt5700-smp` 接管，**irqbalance 在本脚本中被显式停用**（实测对负载最大的无线 IRQ 79 与 USB 5G IRQ 74 毫无作为，且两者同写 `smp_affinity` 会互相覆盖，必须二选一）。
 
 **3）内核参数补三项低风险项**（`Files/etc/sysctl.d/99-mt5700-tcp.conf`）
 

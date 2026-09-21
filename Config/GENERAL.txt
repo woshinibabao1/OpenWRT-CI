@@ -1,22 +1,32 @@
-# ===== 代理 / DNS（用户指定组合）=====
-# OpenClash（Clash 客户端）。其规则分流依赖 dnsmasq-full 提供的 ipset/nftset 能力，
-# 故同时把默认的 dnsmasq 换成 dnsmasq-full（OpenWrt 中两者互斥，dnsmasq-full 会
-# Provides: dnsmasq，写 =n/=y 一对是上游推荐写法，避免出现两个 DNS 服务抢 53 端口）。
-CONFIG_PACKAGE_luci-app-openclash=y
-CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=y
+# ===== 代理 / DNS =====
+# ★ 已按用户要求移除 OpenClash 与 MosDNS（2026-09-21）。
+# 依据（三条独立证据，不只凭"用户说不要"）：
+#   1) 厂家基准里就没有：Mwrt 固件（1139-24）的 /etc/init.d 与 /etc/config 中
+#      无 openclash / mosdns（其代理能力走 sing-box + xray）；higowrt 的
+#      defconfig/mt7987_mt7992.config 里 157 个 =y 包同样一个都没有。
+#   2) 真机确实装着（移除前实测）：luci-app-openclash-0.47.165、
+#      luci-app-mosdns-1.7.14-r1 + mosdns-5.3.4-r14 + geo2txt。
+#   3) 两者在真机上都是负面收益：openclash 是「僵尸服务」（init 已 enable 但无
+#      进程，fw4 每次报 unreachable path 告警）；mosdns 被关成 enabled='0' 后
+#      dnsmasq 仍指向 127.0.0.1#5335 死端口 → 冷域名解析 ~3 秒（2026-09-21 真事故）。
+#
+# 恢复方法（如需重新编入）：把下面 5 行的 =n 改回 =y，并恢复 Scripts/Packages.sh
+#   里 openclash / mosdns 两行 UPDATE_PACKAGE 克隆。
+CONFIG_PACKAGE_luci-app-openclash=n
+CONFIG_PACKAGE_luci-i18n-openclash-zh-cn=n
+CONFIG_PACKAGE_luci-app-mosdns=n
+CONFIG_PACKAGE_luci-i18n-mosdns-zh-cn=n
+CONFIG_PACKAGE_v2dat=n
 
 # Argon 主题：主题包与配置页由 Settings.sh 依 WRT_THEME=argon 自动写入，
 # 这里补中文语言包（Scripts/Handles.sh 里还有 argon 的配色/字体修正）。
 CONFIG_PACKAGE_luci-i18n-argon-config-zh-cn=y
+# dnsmasq-full：★ 保留（不是"因为 OpenClash 才留"）。
+#   理由：① 真机运行的就是 dnsmasq-full 2.93，换回精简版属于无收益的行为变更；
+#        ② 它额外提供 nftset/ipset 能力，nft 规则或日后的 DNS 分流仍可能用到；
+#        ③ 与 dnsmasq 互斥，成对写 =n/=y 可避免两个 DNS 抢 53 端口。
 CONFIG_PACKAGE_dnsmasq=n
 CONFIG_PACKAGE_dnsmasq-full=y
-
-# MosDNS：国内外 DNS 分流与防污染。
-# 补回原因：真机（r0-3e24625）上正在用，而 09-15 之后的配方把它丢了 ——
-# 不写回来，下次刷新固件会直接没有 MosDNS（属于功能回退，不是优化）。
-CONFIG_PACKAGE_luci-app-mosdns=y
-CONFIG_PACKAGE_luci-i18n-mosdns-zh-cn=y
-CONFIG_PACKAGE_v2dat=y
 
 # 已卸载（用户明确要求移除）：HomeProxy / EasyTier / GecoosAC / WOL Ultra /
 # Samba4 / UPnP。其中 sing-box 内核原先只为 HomeProxy 服务，界面不在即孤儿，
@@ -254,9 +264,17 @@ CONFIG_PACKAGE_ip-full=y
 CONFIG_PACKAGE_tc-full=y
 # ethtool：查看/调整网卡参数（驱动队列、offload 等），排查 5G 网卡问题的必备工具
 CONFIG_PACKAGE_ethtool=y
-# irqbalance：实测 mt7996e 与 USB 5G 模组中断全压 CPU0（590 万次），其余三核为 0
-CONFIG_PACKAGE_irqbalance=y
-CONFIG_PACKAGE_luci-app-irqbalance=y
+# irqbalance：★ 已从编译中移除（2026-09-21，用户确认）。
+# 实测结论（真机 2026-09-21）：它对负载最大的两个中断完全没作为 ——
+#   无线 mt7996e（IRQ 79，186 万次）与 USB 5G 模组（IRQ 74）从未被迁移过，
+#   irqbalance 全程只动了以太网的两个中断（67/68）。
+#   且 Files/etc/uci-defaults/99-mt5700-net 每次开机都会把它停用（改由
+#   mt5700-smp 接管硬中断亲和）；两者都写 /proc/irq/*/smp_affinity，
+#   同时开启会互相覆盖 —— 属「编了也永远不跑」的纯负担。
+# 恢复：改回 =y，并删除 99-mt5700-net 第 3 节的停用逻辑。
+CONFIG_PACKAGE_irqbalance=n
+CONFIG_PACKAGE_luci-app-irqbalance=n
+CONFIG_PACKAGE_luci-i18n-irqbalance-zh-cn=n
 # SQM：CAKE / HTB 整形的前端脚本（依赖上面的 tc 与 kmod，均已启用）
 #      注意：SQM 的限速速率需要真实带宽，固件不预设，刷机后到「网络 → SQM QoS」填写。
 CONFIG_PACKAGE_sqm-scripts=y

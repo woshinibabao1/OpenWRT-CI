@@ -72,27 +72,42 @@ UPDATE_PACKAGE() {
 # 主题由工作流的 WRT_THEME=argon 决定，Settings.sh 会写入 luci-theme-argon 与 luci-app-argon-config。
 UPDATE_PACKAGE "argon" "sbwml/luci-theme-argon" "openwrt-25.12"
 
-UPDATE_PACKAGE "momo" "nikkinikki-org/OpenWrt-momo" "main"
-UPDATE_PACKAGE "nikki" "nikkinikki-org/OpenWrt-nikki" "main"
-UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "dev" "pkg"
-UPDATE_PACKAGE "passwall" "Openwrt-Passwall/openwrt-passwall" "main" "pkg"
-UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "main" "pkg"
+# ===== 已停克隆（2026-09-21）=====
+# 下面这些包此前被克隆，但 Config/*.txt 里从来没有对应的 CONFIG_PACKAGE_*=y，
+# 真机 `apk list --installed` 也确认它们**从未进入固件** —— 纯浪费 CI 机时
+# （每次 clone 5~30 秒）。停掉它们不影响任何固件产物。
+# 判定依据不是「看起来没用」，而是三份独立证据：
+#   ① Config/*.txt 四个配置文件全量扫描无该符号；
+#   ② 真机已装包清单里没有它们；
+#   ③ 与厂家基准（Mwrt / higowrt）对比，厂家同样不装。
+# 需要时恢复：取消对应行注释，并在 Config 里补 =y。
+# UPDATE_PACKAGE "momo" "nikkinikki-org/OpenWrt-momo" "main"
+# UPDATE_PACKAGE "nikki" "nikkinikki-org/OpenWrt-nikki" "main"
+# 已按用户要求移除 OpenClash 与 MosDNS（2026-09-21）：不再克隆它们的源码，
+# 同时 Config/GENERAL.txt 里对应 5 个符号已写 =n。两处必须同时改，只改一处
+# 会出现「克隆了却不装」的纯浪费（每次 clone 5~30 秒的 CI 机时）。
+# UPDATE_PACKAGE "openclash" "vernesong/OpenClash" "dev" "pkg"
+# UPDATE_PACKAGE "passwall" "Openwrt-Passwall/openwrt-passwall" "main" "pkg"
+# UPDATE_PACKAGE "passwall2" "Openwrt-Passwall/openwrt-passwall2" "main" "pkg"
 
 # Honk eBPF 透明代理：使用上游预编译 APK（见下方 INSTALL_HONK_PREBUILT）
 # 说明：honk 为 Rust/eBPF 架构，从源码编译会超过 GitHub 6 小时上限导致构建取消，
 # 因此改为下载上游发布的预编译包，并在首次开机时离线安装进固件。
 
-UPDATE_PACKAGE "luci-app-tailscale" "asvow/luci-app-tailscale" "main"
+# UPDATE_PACKAGE "luci-app-tailscale" "asvow/luci-app-tailscale" "main"
 
 #UPDATE_PACKAGE "athena-led" "unraveloop/JDC-AX6600-Athena-LED-Controller" "main"
-UPDATE_PACKAGE "ddns-go" "sirpdboy/luci-app-ddns-go" "main"
-UPDATE_PACKAGE "diskman" "sbwml/luci-app-diskman" "main"
+# UPDATE_PACKAGE "ddns-go" "sirpdboy/luci-app-ddns-go" "main"
+# UPDATE_PACKAGE "diskman" "sbwml/luci-app-diskman" "main"
 UPDATE_PACKAGE "diskmanager" "4IceG/luci-app-mini-diskmanager" "main"
-UPDATE_PACKAGE "easytier" "EasyTier/luci-app-easytier" "main"
-UPDATE_PACKAGE "mosdns" "sbwml/luci-app-mosdns" "v5" "" "v2dat"
-UPDATE_PACKAGE "netspeedtest" "sirpdboy/netspeedtest" "main" "" "homebox ookla-speedtest"
-UPDATE_PACKAGE "netwizard" "sirpdboy/luci-app-netwizard" "main"
-UPDATE_PACKAGE "openlist2" "sbwml/luci-app-openlist2" "main"
+# UPDATE_PACKAGE "easytier" "EasyTier/luci-app-easytier" "main"
+# 已按用户要求移除 MosDNS（2026-09-21）：与 Config/GENERAL.txt 的 5 个 =n 配套。
+# 注意本行第 5 参数原本还会从 feeds 删掉 v2dat 目录；不再克隆后 v2dat 也不再被删，
+# 但 Config 里 v2dat=n，不会进固件。
+# UPDATE_PACKAGE "mosdns" "sbwml/luci-app-mosdns" "v5" "" "v2dat"
+# UPDATE_PACKAGE "netspeedtest" "sirpdboy/netspeedtest" "main" "" "homebox ookla-speedtest"
+# UPDATE_PACKAGE "netwizard" "sirpdboy/luci-app-netwizard" "main"
+# UPDATE_PACKAGE "openlist2" "sbwml/luci-app-openlist2" "main"
 UPDATE_PACKAGE "partexp" "sirpdboy/luci-app-partexp" "main"
 # P17：qbittorrent 未出现在 Config/GENERAL.txt 任何 =y 里，克隆与删 qt6 都是净损失；
 # 且其第 5 参数会顺手从 feeds 删掉 qt6base/qt6tools（可能被其它包需要）。故整行禁用。
@@ -136,8 +151,8 @@ if [ "$MT_MODE" = "MT5700M" ]; then
 	}
 	FIX_QMODEM_VERSION
 fi
-UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
-UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"
+# UPDATE_PACKAGE "quickfile" "sbwml/luci-app-quickfile" "main"
+# UPDATE_PACKAGE "timecontrol" "sirpdboy/luci-app-timecontrol" "main"
 # viking feed：仍克隆（其余包可能用到），但把已停用的包目录一并清掉，
 # 避免它们出现在 package/ 里被意外选中或拖慢 feeds 扫描。
 UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-box luci-app-homeproxy luci-app-timewol luci-app-wolplus luci-app-wolultra"
@@ -149,7 +164,7 @@ UPDATE_PACKAGE "viking" "VIKINGYFY/packages" "main" "" "axonhub gecoosac sing-bo
 # 真正防线仍是 Config/GENERAL.txt 的 =n + VerifyNoSingBox.sh 双重断言。
 rm -rf ./packages/sing-box ./packages/luci-app-homeproxy
 
-UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
+# UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
 
 # FAN789 插件及其他专用硬件插件
 UPDATE_PACKAGE "luci-app-h5000m-fancontrol" "FAN789/luci-app-h5000m-fancontrol" "main"

@@ -199,10 +199,12 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 
 得益于 ImmortalWrt 优秀的底包基础，Hiveton H5000M 不仅具备卓越的基础路由性能，还将扩展性推向极致：
 
-* **内核级加解密加速**：开启 `kmod-cryptodev` 与 `kmod-tls`，大幅提升代理工具（如 OpenClash）和加密隧道的吞吐量，降低 CPU 占用。
+* **内核级加解密加速**：开启 `kmod-cryptodev` 与 `kmod-tls`，大幅提升加密隧道（WireGuard、HTTPS 等）的吞吐量，降低 CPU 占用；EIP-197 硬件加密引擎（`kmod-crypto-hw-safexcel` + `eip197-mini-firmware`）已就位。
 * **USB 驱动栈扩展**：包含 `kmod-usb-core`, `kmod-usb3` 及 `kmod-usb-net-qmi-wwan` 等丰富驱动，确保系统准确识别各类移动通信模组。
 * **轻量级 NAS 存储**：支持 NVMe 固态硬盘（`kmod-nvme`）挂载，结合 BTRFS 文件系统，轻松打造家庭数据中心。
-* **安全异地组网**：内置 Tailscale 等主流 SD-WAN 工具，轻松实现内网设备的远程安全访问。
+* **安全异地组网**：内置 WireGuard（`kmod-wireguard` + `luci-proto-relay`），轻松实现内网设备的远程安全访问。
+
+> ⚠️ 本清单与 `Config/*.txt` 严格一致：`Scripts/Packages.sh` 里克隆但未写 `CONFIG_PACKAGE_*=y` 的包**不会**进入固件，别把它们算作固件能力。
 
 <br>
 

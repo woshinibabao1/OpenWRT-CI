@@ -101,30 +101,24 @@ if [ -f /etc/sysctl.d/99-mt5700-tcp.conf ]; then
 fi
 
 # ---------- 3. 中断均衡（硬件中断亲和）----------
-# 实测（2026-09-21）：无线 mt7996e（IRQ 79）与 USB 5G 模组（IRQ 74）
-#   **100% 压在 CPU0**，累计 186 万次从未迁移过；irqbalance 全程只动了
-#   以太网的两个中断（67→CPU1、68→CPU3）。
-#   ★ 关键认知：**smp_affinity 写成全核 f 不等于分摊** —— 单条 MSI 中断
-#     每次仍由内核选定的一个核响应，实测固定 CPU0。要搬走必须写**单核**掩码。
-# 责任划分：
-#   mt5700-smp —— 硬件中断亲和（在 99-mt5700-sys 里启用，本文件负责停用 irqbalance）
-#   mt5700-rps —— 收包软中断散列 RPS（见第 4 节）
-#
-# 这里显式**停用 irqbalance**，改由 mt5700-smp 接管硬件中断亲和：
-#   实测 irqbalance 对负载最大的无线（IRQ 79，186 万次）与 USB 5G（IRQ 74）
-#   毫无作为，只动了以太网两个中断；mt5700-smp 能把 74 也搬走。
-#   两者都写 /proc/irq/*/smp_affinity，同时开会互相覆盖，必须二选一。
-# ⚠️ 即便如此也做不到完全均分：IRQ 79 的亲和驱动不支持写入
+# 由 mt5700-smp 接管（在 99-mt5700-sys 里启用）。
+# 本文件原先在此显式停用 irqbalance，2026-09-21 起该逻辑已删除：
+# irqbalance 已从编译配方中移除（Config/GENERAL.txt 里三个符号 =n），固件中不存在，
+# 「停用一个不存在的服务」是死代码。
+# 移除依据（真机实测，当时还装着 irqbalance）：无线 mt7996e（IRQ 79）与 USB 5G 模组
+#   （IRQ 74）**100% 压在 CPU0**，累计 186 万次从未迁移过；irqbalance 全程只动了
+#   以太网的两个中断（67→CPU1、68→CPU3），对负载最大的两个毫无作为。
+#   ★ 关键认知：**smp_affinity 写成全核 f 不等于分摊** —— 单条 MSI 中断每次仍由
+#     内核选定的一个核响应，实测固定 CPU0。要搬走必须写**单核**掩码。
+# ⚠️ 即便换用 mt5700-smp 也做不到完全均分：IRQ 79 的亲和驱动不支持写入
 #    （echo 返回 RC=1、effective_affinity=0），只能留在 CPU0。
-if [ -f /etc/config/irqbalance ]; then
-	uci -q set irqbalance.@irqbalance[0].enabled='0'
-	uci -q commit irqbalance
-	/etc/init.d/irqbalance disable 2>/dev/null || true
-fi
+# 若日后手动安装 irqbalance，必须自行执行 /etc/init.d/irqbalance disable：
+#   它与 mt5700-smp 都写 /proc/irq/*/smp_affinity，同时开启会互相覆盖。
+# 责任划分：mt5700-smp = 硬件中断亲和；mt5700-rps = 收包软中断 RPS（见第 4 节）
 
 # ---------- 4. 数据包引导（packet steering / RPS）----------
-# 把收包软中断按流散列到多个核，配合上面的 irqbalance 一起打破
-# 「中断全压 CPU0」的格局。
+# 把收包软中断按流散列到多个核，与 mt5700-smp（硬中断亲和）配合打破
+# 「中断全压 CPU0」的格局。两者不冲突：RPS 写 RPS 掩码，mt5700-smp 写 smp_affinity。
 #
 # ⚠️ 2026-09-21 实测更正：这里原来只写了
 #       if [ -f /etc/init.d/packet_steering ]; then ... enable; fi
