@@ -1,5 +1,42 @@
 # 更新日志
 
+## [2026-09-21] 以厂家固件为基准筛查优化项：conntrack 容量 / rpcd 无限重启
+
+以 `Mwrt-H5000M-1139-24-20260921.bin` 为基准做了一轮全量取证（自行解析 squashfs，
+偏移 `0x45DC00`，xz，7300 节点），逐项比对后筛出可搬的项。
+
+**新增 `Files/etc/sysctl.d/99-mt5700-conntrack.conf`**
+- `nf_conntrack_max` 63488 → **100000**（厂家 `/etc/sysctl.d/11-nf-conntrack.conf` 实测值）。
+  表满时会静默丢新连接，日志只有一行 `table full, dropping packet`，极易误判成运营商问题。
+- `buckets` **不改**：本机 6.18 实测可写，但写入会重建哈希表，63488 与 65536 只差 3%，不值当。
+- `nf_conntrack_tcp_timeout_established = 7440` 显式写出（防止上游默认值漂移）。
+
+**新增 `Files/etc/uci-defaults/99-mt5700-stability`**
+- rpcd 改 `procd_set_param respawn 3600 5 0`（厂家 `99-be3600-fixups` 实测取证）。
+  procd 默认一小时内崩 5 次就永久放弃，而 rpcd 一死连登录都拿不到 session，
+  界面表现为「密码错误」——**密码从来没错**。改后约 5 秒自愈。
+- 串口 AT 超时那条**只留注释不改代码**：本固件由 at-webserver 独占串口，不存在抢串口问题。
+
+### 筛查中确认「两边一致、无需改」的项（避免重复劳动）
+
+| 项 | 本机 | 厂家 | 结论 |
+|---|---|---|---|
+| dnsmasq cachesize / min_cache_ttl / use_stale_cache / ednspacket_max / nonegcache / authoritative / dns_redirect | 8000 / 3600 / 3600 / 1232 / 1 / 1 / 1 | 完全相同 | 都是 ImmortalWrt 上游默认，非厂家优化 |
+| conntrack checksum / tcp_timeout_established / acct | 0 / 7440 / 1 | 相同 | — |
+| tcp_fin_timeout / tcp_keepalive_time / kernel.panic / igmp_max_memberships | 30 / 120 / 3 / 100 | 相同 | — |
+| zram swapon 优先级 | 100 | 相同 | — |
+| fullcone | **已为 1** | 1 | 无需改（`nft_fullcone` 已加载、2 条规则在跑） |
+
+### 确认不可搬的项（附证据）
+
+- **闭源内核模块 vermagic = `6.6.94 SMP mod_unload aarch64`，本机 6.18.52** ——
+  `insmod` 直接拒绝。依赖链 `mtk_warp→mtkhnat`、`mtk_wed→mtk_warp,mtk_hwifi`、
+  `mt7992(3.9MB)→mt_hwifi,mt_wifi_cmn` 缺一不可。详见 README「闭源驱动」小节。
+- **H5000M 的 LAN 是 `eth0 hnat`**（`board.d/02_network` 实测）——
+  厂家把 hnat 虚拟接口桥进 LAN 才有 s2s（内网到内网加速）。本机无该驱动，s2s 无从谈起。
+- HNAT 参数走 debugfs：`echo "7 <bind_rate>" > /sys/kernel/debug/hnat/hnat_setting`
+  （**type 7 = bind_rate**，非此前记录的 11），`hook_toggle` 控制开关。本机无此目录。
+
 ## [2026-09-21] 四核调度：对照厂家实现重写中断亲和与 RPS
 
 参照 **higowrt 固件的 `/sbin/smp.sh`**（`/etc/init.d/mtk_smp` 只是个壳，真正干活的是它）

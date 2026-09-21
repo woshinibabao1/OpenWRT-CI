@@ -1,0 +1,37 @@
+#!/bin/sh
+# MT5700 / H5000M —— 管理与服务自愈（首次开机执行一次）
+#
+# 本文件只做「提升可用性」的改动，不动任何网络/无线/防火墙策略。
+# 每项都标注了依据：来自厂家固件 Mwrt-H5000M-1139-24 的实测取证。
+
+# ---------- 1. rpcd 崩溃后无限重启 ----------
+# 依据：厂家固件 /etc/uci-defaults/99-be3600-fixups 第 83~100 行（原文注释）：
+#   procd 默认 `respawn 3600 5 5` —— 一小时内崩 5 次就**永久放弃**。
+#   rpcd 一死，session / uci / iwinfo / file 这些 ubus 对象全没了，
+#   LuCI 会跳回登录页；而 procd 放弃后连登录本身都拿不到 session，
+#   界面上表现为「密码错误」——但密码从来没错。
+#   retry 改成 0 = 不限次数，rpcd 约 5 秒内自己回来。
+#
+# 这条与硬件无关，是纯粹的可用性兜底：任何原因导致的 rpcd 崩溃
+# （厂家遇到过 UniCmdPerStaGetSNR 的 3 字节栈溢出）都不会把你锁在门外。
+#
+# sed 只匹配**裸的** `procd_set_param respawn`（行尾即结束），
+# 已经改过的行不会再命中，重复执行安全。
+if [ -f /etc/init.d/rpcd ] && grep -q '^	procd_set_param respawn$' /etc/init.d/rpcd; then
+	sed -i 's|^\tprocd_set_param respawn$|\tprocd_set_param respawn 3600 5 0|' /etc/init.d/rpcd
+	logger -t mt5700-stability "rpcd 已改为无限重启（procd respawn 3600 5 0）"
+fi
+
+# ---------- 2. 串口 AT 调用必须有墙钟超时 ----------
+# 依据：厂家固件 /etc/uci-defaults/98-tom_modem-timeout-wrap（原文注释）：
+#   qmodem 与 5700 协议栈都轮询 /dev/ttyUSB1 发 AT，而 tom_modem 没有
+#   墙钟超时、也不与 sendat 共用锁，阻塞调用从开机起一路堆积，
+#   直到 PID 表被耗尽（约 32k 个进程）—— 症状是 LuCI 502、
+#   SSH 报 "kex_exchange_identification: closed"、cellular_data 页面拖死整个界面。
+#
+# 本固件架构不同：/dev/ttyUSB1 由 at-webserver（Rust 服务）独占持有，
+# 不存在两个调用方抢串口的问题，因此**这里不做任何包装**。
+# 保留这段注释是为了把原因固化下来：将来若新增任何直接开串口的组件，
+# 必须自带超时，否则会复现上面那个「进程表耗尽」的故障。
+
+exit 0
