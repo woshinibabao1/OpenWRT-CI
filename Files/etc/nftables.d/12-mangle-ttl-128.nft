@@ -27,15 +27,26 @@
 ## 300 大于 fw4 的 srcnat（nat 类型，priority 100），保证在 SNAT 之后再改 TTL，
 ## 不会干扰 nat 链里的接口判定。
 ##
-## ── 两个已知前提（不是猜的，是本机实测/既有策略）─────────────────────
-## 1. **开了 flow offload 时本规则对快转连接不生效。**
-##    软件/硬件卸载把连接从 nftables 路径上摘走（与 UA2F 必须关卸载同理）。
-##    本固件 auto 模式下 SQM 未启用时会开软件卸载 —— 若要 TTL 统一稳定生效，
-##    需在「网络 → 防火墙 → 常规设置」关闭路由/NAT 卸载，
-##    或 `uci set firewall.@defaults[0].flow_offloading=0 && uci commit firewall`。
-## 2. **5G 模组（eth2）自身会再做一层 NAT**（实测 wan_subnets = 100.0.0.0/8，
-##    是 CGNAT 地址段）。路由器这侧改完的 TTL 会不会被模组重新生成 IP 头时
-##    重置，取决于模组固件行为，需抓包确认；有线 WAN（eth1）一定生效。
+## ── 两条已实测确认的前提（2026-09-21 真机，H5000M / kernel 6.18.52）──────
+## 1. **必须关闭 flow offload，否则本规则完全不生效。**
+##    软件卸载把连接从 nftables 路径上摘走（与 UA2F 必须关卸载同理）。实测：
+##      · 卸载开：客户端 HTTP 25s 超时；conntrack 条目带 [OFFLOAD]；
+##        正向 10 包 / 951B，反向只回收 1 包 / 52B（仅 SYN-ACK）；
+##        postrouting 计数器 packets 0 —— 本规则一个包都没处理。
+##      · 卸载关：同一请求 HTTP 200 / 1.02s / 2381B，连接进出各 13 包、无 OFFLOAD 标记。
+##    故 CI 侧 flow-offload 默认值已由 auto 改为 off（见 Scripts/ApplyFlowOffload.sh）。
+## 2. **5G 模组（eth2）不会把 TTL 改回去。** 模组自身确实再做一层 NAT
+##    （eth2 = 100.76.8.240/8，CGNAT 段），但出口抓包实测为 TTL=128：
+##      TTLFIN IN=br-lan OUT=eth2 SRC=100.76.8.240 DST=111.45.11.5 ... TTL=128
+##    即 SNAT 重建 IP 头后 TTL 沿用我们写入的值。此前的"需抓包确认"已结案。
+##    附带发现：SNAT 重建 IP 头后 IPID 由路由器统一生成（实测 12678/12679/12680 递增），
+##    所以博客提到的 IPID 指纹问题在本拓扑下天然不存在，kmod-rkp-ipid 无必要。
+##
+## ── 验证方法备忘（别再用错匹配条件）───────────────────────────────────
+## postrouting priority > 100 时 SNAT 已完成，`ip saddr <内网IP>` 匹配不到任何包
+##   （实测总计数 1325 包而客户端 0 包）—— 要用 oifname 或 `ip daddr` 匹配。
+## 抓 TTL 用：`nft add rule inet fw4 <链> "oifname eth2 ip daddr <目标> log prefix X"`，
+##   然后 `logread | grep X`，日志里 TTL= 字段即出口 TTL。
 ##
 ## 验证：`nft list ruleset | grep -A 5 mangle_ttl_unify`
 ## 回滚：删掉本文件后 `service firewall restart`

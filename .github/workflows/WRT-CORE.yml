@@ -62,16 +62,22 @@ on:
         type: string
         default: ""
       # Flow Offload 选型（独立配置层，全机型复用）：
-      #   auto —— 默认：SQM 未启用时开软件卸载，启用时关（二者互斥）
-      #   off  —— 始终关闭
+      #   auto —— SQM 未启用时开软件卸载，启用时关（二者互斥）；
+      #           ★ 若固件带 TTL 统一规则（/etc/nftables.d/*.nft 含 ip ttl set）则一律关，
+      #             因为 offload 绕过 nftables 会让 TTL 规则完全失效
+      #   off  —— 始终关闭【默认】
       #   on   —— 强制开软件卸载（SQM 启用时仍执行，但记一条警告：offload 会让 SQM 失效）
       #   on-hw —— 强制开软件 + 硬件卸载
       # 非法值在编译期即 ::error:: + exit 1（见 Scripts/ApplyFlowOffload.sh），绝不带进固件。
-      # 默认值 auto 保证老调用方（WRT-BUILD / H5000M-MT-AUTO）不传也能跑（红线1）。
+      # 默认值 off（不是 auto）：固件自带 TTL 统一规则，而 flow offload 会把连接从 nftables
+      # 路径上摘走，TTL 规则对快转包完全不执行。真机实证（2026-09-21 / kernel 6.18.52）：
+      #   卸载开 → 客户端 HTTP 25s 超时，conntrack 带 [OFFLOAD]，正向 10 包仅回收 1 包；
+      #   卸载关 → 同一请求 HTTP 200 / 1.0s，出口抓到 TTL=128。
+      # 老调用方（WRT-BUILD / H5000M-MT-AUTO）不传也能跑（红线1）。
       WRT_FLOW_OFFLOAD:
         required: false
         type: string
-        default: 'auto'
+        default: 'off'
 
 env:
   GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}

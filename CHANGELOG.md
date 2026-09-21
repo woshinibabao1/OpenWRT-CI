@@ -1,4 +1,50 @@
 # 更新日志
+## [2026-09-21] TTL 绕过实测落地：flow offload 默认关闭（真机 A/B 实证）
+
+### 结论先行
+
+固件自带的 TTL 统一规则（`Files/etc/nftables.d/12-mangle-ttl-128.nft`）**必须配合关闭
+flow offload 才生效**。此前两者并存，规则形同虚设、客户端实际上不了网。本轮真机 A/B
+实测后把默认改为 `off`，并在 `auto` 分支加了自动判定。
+
+### 真机证据（H5000M / kernel 6.18.52，客户端 192.168.10.202）
+
+| | flow offload 开 | flow offload 关 |
+|---|---|---|
+| 客户端 HTTP | **25s 超时，0 字节** | **HTTP 200 / 1.02s / 2381B** |
+| conntrack | `[OFFLOAD]` 标记；正向 10 包/951B，**反向仅 1 包/52B**（只有 SYN-ACK） | 无 OFFLOAD；进出各 13 包 |
+| postrouting 计数器 | `packets 0` —— 规则一个包都没处理 | 正常计数 |
+| 出口 TTL | 未改写 | `IN=br-lan OUT=eth2 ... TTL=128` |
+
+抓包日志（关闭卸载后，eth2 出口）：
+
+```
+TTLFIN IN=br-lan OUT=eth2 SRC=100.76.8.240 DST=111.45.11.5 ... TTL=128 ... SPT=62258 DPT=80
+```
+
+### 一并结案的两个悬而未决项
+
+- **5G 模组会不会把 TTL 改回去** → **不会**。模组虽再做一层 NAT（eth2 = 100.76.8.240/8，
+  CGNAT），但出口实测 TTL 仍是 128，SNAT 重建 IP 头后沿用写入值。
+- **IPID 指纹（博客提到的第三个检测维度）** → 本拓扑天然不存在。SNAT 重建 IP 头后
+  IPID 由路由器统一生成（实测 12678/12679/12680 递增），`kmod-rkp-ipid` 更无必要。
+
+### 改动
+
+1. `Files/etc/mt5700/flow-offload`：`MODE=auto` → `MODE=off`
+2. `Scripts/ApplyFlowOffload.sh`：默认 `${WRT_FLOW_OFFLOAD:-auto}` → `off`
+3. 三个 workflow 的 `FLOW_OFFLOAD` input `default: 'auto'` → `'off'`
+   （`WRT-CORE` / `WRT-BUILD` / `H5000M-MT-AUTO`），同步更正描述与注释
+4. `Files/etc/uci-defaults/99-mt5700-net`：`auto` 分支新增 TTL 规则探测 ——
+   只要 `/etc/nftables.d/*.nft` 含 `ip ttl set` 就关闭卸载（优先级高于 SQM 判定），
+   保证用户手选 `auto` 时也不会踩坑
+5. `12-mangle-ttl-128.nft`：注释里两条「存疑」改为实证结论，并补验证方法
+
+### 代价（如实说明）
+
+关闭软件卸载后转发全部走 CPU。本机型四核 MT7987A，5G 实际速率下未见瓶颈，
+但未做满速压测。**若要峰值吞吐，可在构建时显式选 `on`，代价是 TTL 统一失效。**
+
 ## [2026-09-21] 全项目审计：设备选择硬断言 / 5G 接口 DNS / 缓存与克隆稳定性 / 文档纠偏
 
 ### 背景

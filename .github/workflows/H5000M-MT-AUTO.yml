@@ -24,8 +24,8 @@ on:
         required: false
         type: string
       FLOW_OFFLOAD:
-        description: 'Flow Offload 选型（默认 auto；workflow_run 触发时取空，走默认 auto）'
-        default: 'auto'
+        description: 'Flow Offload 选型（默认 off；workflow_run 触发时取空，走默认 off）'
+        default: 'off'
         required: false
         type: choice
         options:
@@ -77,6 +77,6 @@ jobs:
       WRT_PACKAGE: ${{ inputs.PACKAGE }}
       WRT_TEST: 'false'
       # Flow Offload 选型透传：workflow_dispatch 时取输入；workflow_run 触发时 inputs 为空，
-      # 取值为空字符串，CORE 侧 default 'auto' 兜底（满足红线1：老调用方不传也能跑）。
+      # 取值为空字符串，CORE 侧 default 'off' 兜底（满足红线1：老调用方不传也能跑）。
       WRT_FLOW_OFFLOAD: ${{ inputs.FLOW_OFFLOAD }}
       MT_MODE: ${{ matrix.MT_MODE }}

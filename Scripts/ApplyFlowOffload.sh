@@ -14,13 +14,16 @@
 #   1 = MODE 非法（编译期即失败，绝不带进固件）
 #   2 = 目标目录不可写（wrt/ 软链未建好等环境异常）
 #
-# 环境变量：
-#   WRT_FLOW_OFFLOAD  GHA input（string，required:false，default:'auto'）
-#   GITHUB_WORKSPACE  仓库根（CI 注入；本地测试可导出）
+# 默认 off（不是 auto）：固件自带 WAN 侧 TTL 统一规则（/etc/nftables.d/12-mangle-ttl-128.nft），
+# 而 flow offload 会把连接从 nftables 路径上摘走 → TTL 规则对快转包完全不执行。
+# 真机实证（2026-09-21，H5000M / kernel 6.18.52）：offload 开着时客户端 HTTP 25 秒超时、
+# conntrack 里连接带 [OFFLOAD] 标记、正向 10 包只回收 1 包（仅 SYN-ACK）；
+# 关掉后同一请求 HTTP 200 / 1.0 秒。故默认必须是 off。
+# 想要卸载加速请显式选 on / on-hw，代价是 TTL 统一失效。
 
 set -u
 
-MODE="${WRT_FLOW_OFFLOAD:-auto}"
+MODE="${WRT_FLOW_OFFLOAD:-off}"
 # 大小写不敏感：归一化为小写再校验
 MODE="$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')"
 
