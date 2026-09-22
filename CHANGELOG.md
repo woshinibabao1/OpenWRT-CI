@@ -1,5 +1,39 @@
 # 更新日志
 
+## [2026-09-22 · 编译失败修复] 常见依赖断言拦下 3 个包：crc32c 撤销、`xz` 必须与 `xz-utils` 成对
+
+触发：`WRT-BUILD` 在 defconfig 之后的断言步骤失败 ——
+
+> `以下常见依赖未进 .config（包名被 kconfig 静默丢弃，或上游改名）： kmod-lib-crc32c xz tar`
+
+### 1. `kmod-lib-crc32c` —— 撤销：这个符号在本树根本不存在
+
+- 上一轮是照"两套基线都有"加进来的。基线（内核 6.12 / 6.6）那时它还是模块，
+  本树内核 **6.18 已把 crc32c 编成内建**，内建之后就没有对应的 `kmod-*` 包了。
+- 证据：上次成功构建产出的完整 `.config` 里搜不到 `CONFIG_PACKAGE_kmod-lib-crc32c`，
+  连 `CONFIG_LIBCRC32C` 都没有；真机 `/lib/modules/6.18.52/` 下没有 `libcrc32c.ko`，
+  而依赖它的 `kmod-fs-btrfs` 照常工作。
+- 这一类包**加不上去** —— 写进 Config 会被 defconfig 丢掉，随即被 CI 断言拦下。
+  已改成注释说明并移出断言区。
+
+### 2. `xz` / `tar` —— 根因是上一轮把 `xz-utils` 删掉了
+
+- 上游 `utils/xz/Makefile`：`Package/xz` 是模板生成的子包，`DEPENDS:=xz-utils +liblzma`。
+  上一轮为了修"空 meta"，只写了 `xz=y` 却把 `xz-utils=y` 删掉 —— 等于把 `xz` 的
+  **硬依赖**抽走，defconfig 于是静默丢弃 `CONFIG_PACKAGE_xz=y`。
+- `tar` 是连带受害者：`Package/tar` 的 DEPENDS 含 `+PACKAGE_TAR_XZ:xz`，
+  而 `PACKAGE_TAR_XZ` 默认 `y` ⇒ `xz` 掉了，`tar` 也一起被丢。
+- 修法：**两行都留** `CONFIG_PACKAGE_xz-utils=y` + `CONFIG_PACKAGE_xz=y`
+  （meta 包本身只有 782 字节，代价可忽略）。
+
+### 3. 断言本身按预期工作
+
+30 项里精确点名 3 项、其余 27 项通过 —— 说明「整行标记 + awk 自动提取 + 逐个 grep `.config`」
+的守卫是有效的。kconfig 对不存在的包名是**静默丢弃**（defconfig 照样成功、不报错），
+没有这道断言的话，"以为配上了其实没配上"会一路带到刷机之后才发现。
+
+---
+
 ## [2026-09-22 · 常见依赖补全 第二轮] 以 V0.18 + Mwrt 双基线交集再补 14 项，并修掉一处「空 meta」配置
 
 触发：要求以**两套基线固件**（好用的固件 V0.18、Mwrt-H5000M-1139-24）为基准再补全一次。

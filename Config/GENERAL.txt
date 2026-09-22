@@ -290,19 +290,28 @@ CONFIG_PACKAGE_kmod-nf-nat6=y
 CONFIG_PACKAGE_kmod-br-netfilter=y
 # usb-acm：USB CDC-ACM 串口，插 USB 串口/模组设备时的通用兜底（基线带）。
 CONFIG_PACKAGE_kmod-usb-acm=y
-# lib-crc32c：极小，多个 kmod 的传递依赖（基线带）——
-#   它是**包级依赖**：本机内核把它编成了内建，所以现在功能上有、但 `apk` 找不到
-#   名为 kmod-lib-crc32c 的包，日后有插件声明依赖它时仍会卡住。
-CONFIG_PACKAGE_kmod-lib-crc32c=y
+# lib-crc32c：★ **2026-09-22 撤销**（原本按"基线都有"加进来，实测加不上）：
+#   本树里 `CONFIG_PACKAGE_kmod-lib-crc32c` **这个符号不存在** —— 上一次成功构建
+#   产出的完整 .config 里搜不到它，连 `CONFIG_LIBCRC32C` 都没有；真机
+#   `/lib/modules/6.18.52/` 里也没有 `libcrc32c.ko`，而依赖它的 `kmod-fs-btrfs`
+#   照常工作 ⇒ 内核 6.18 已把 crc32c 编成内建，这一类"内建后不存在的 kmod 符号"
+#   是加不上去的（强行写进 Config 会被 defconfig 丢掉，CI 的断言会拦下）。
+#   基线（内核 6.12 / 6.6）当时还是模块，所以它们有。
+# CONFIG_PACKAGE_kmod-lib-crc32c=y
 
 # ④ 用户态配套（2026-09-22 第二轮：以 V0.18 + Mwrt 两个基线的**交集**为准筛出）
 # 判据：两套基线固件都有、而我方没有 —— 两个不同来源的固件都装，说明不是某家的偏好。
 #   xz：★ 这一项是**真缺陷修复**，不是补全 —— 上方「常用工具」区原先写的是
-#       `xz-utils`，而上游 openwrt/packages `utils/xz/Makefile` 里 `Package/xz-utils`
-#       只有 TITLE、**没有 DEPENDS**（空 meta）；真正带二进制的是 `xz`（由模板生成，
-#       `DEPENDS:=xz-utils`，即 xz 会反过来把 meta 拉进来）。真机已证实：`xz-utils`
-#       处于已装状态但 `/usr/bin/xz` **不存在**，该包全部内容只有一个 782 字节的
+#       `xz-utils`，而上游 `utils/xz/Makefile` 里 `Package/xz-utils` 只有 TITLE、
+#       **没有 DEPENDS**（空 meta）；真正带二进制的是 `xz`（模板生成，`DEPENDS:=xz-utils`，
+#       即 xz 会反过来把 meta 拉进来）。真机已证实：`xz-utils` 处于已装状态但
+#       `/usr/bin/xz` **不存在**，该包全部内容只有一个 782 字节的
 #       `lib/apk/packages/xz-utils.list`。两套基线装的都是 `xz`。
+#    ⚠️ **两行都要留**：`xz-utils` 是 `MENU:=1` 的宿主包，只写 `xz=y` 而删掉
+#       `xz-utils=y` 时，上一轮 CI 实测 `CONFIG_PACKAGE_xz=y` 被 defconfig 丢掉
+#       （连带 `tar` 一起挂——tar 的 `+PACKAGE_TAR_XZ:xz` 会 select 它）。
+#       保留 `xz-utils=y` 才能让 xz / tar 都落地。
+CONFIG_PACKAGE_xz-utils=y
 CONFIG_PACKAGE_xz=y
 #   bash：很多第三方插件的脚本是 `#!/bin/bash`（`[[ ]]`、数组、`local -n` 等），
 #         busybox ash 跑不了；"插件装上了但脚本报错"多半是这个。
@@ -313,6 +322,9 @@ CONFIG_PACKAGE_jq=y
 CONFIG_PACKAGE_wget-ssl=y
 #   tar / unzip / bzip2 + liblzma / libzstd：解包类插件与安装脚本的常见依赖
 #   （下载 geo 数据、释放插件自带资源包都要用；这几项在两套基线里都在）。
+#   注：两基线里的 `xz` **不是自己选的，而是被 `tar` 拉进来的**（tar 的
+#   `+PACKAGE_TAR_XZ:xz`）；而两基线的 tar 又是被 iStoreOS 的 `luci-app-store`
+#   拉进来的 —— 我们不装商店，所以这里显式选 tar。
 CONFIG_PACKAGE_tar=y
 CONFIG_PACKAGE_unzip=y
 CONFIG_PACKAGE_bzip2=y
@@ -416,9 +428,10 @@ CONFIG_PACKAGE_exfat-mkfs=y
 CONFIG_PACKAGE_openssh-keygen=y
 CONFIG_PACKAGE_openssh-sftp-server=y
 CONFIG_PACKAGE_openssl-util=y
-# 压缩工具 xz：原先这里写的是 `xz-utils`，**那是个空 meta 包（装了等于没装）** ——
-# 已换成 `xz` 并移入**上方**的 plugin-deps 标记区，放那里才能被 CI 的「常见依赖断言」
-# 自动覆盖（"配了等于没配"这类问题最该被断言）。详细原因见标记区注释。
+# 压缩工具 xz：原先这里只写 `xz-utils`，**那是个空 meta 包（装了等于没装）** ——
+# 已改为在**上方**的 plugin-deps 标记区同时保留 `xz-utils=y` 与 `xz=y`（两个都要：
+# xz 的 DEPENDS 含 `xz-utils`，只写 xz 会被 defconfig 丢掉，还会连带 tar 一起挂）。
+# 放标记区才能被 CI 的「常见依赖断言」自动覆盖（"配了等于没配"这类问题最该被断言）。
 
 # LuCI 基础组件
 CONFIG_PACKAGE_luci-base=y
