@@ -188,7 +188,9 @@ Release 页面顶部就顶出一个巨大标题，内容是"当初为什么改�
 3. **`net.core.netdev_budget`：默认 300 → 600**（同上）
 
    RPS 把包分散到四核后，每核单轮 300 包成为瓶颈：包没处理完就被下一轮抢占，
-   CPU 时间耗在反复进出软中断上。有 `netdev_budget_usecs`(2000μs) 兜底，不会无界占 CPU。
+   CPU 时间耗在反复进出软中断上。有 `netdev_budget_usecs` 兜底，不会无界占 CPU。
+   （⚠️ 2026-09-22 更正：此处原写 2000μs，是照抄内核文档的印象值；本机 6.18.52
+   实测 `sysctl net.core.netdev_budget_usecs` = **20000μs**。结论不变，数字已订正。）
 
 4. **修正 `99-mt5700-conntrack.conf` 里一个错误数字**（注释，非功能）
 
