@@ -1,5 +1,64 @@
 # 更新日志
 
+## [2026-09-22 · 常见依赖补全] 补 16 个插件常见依赖 + CI 自动断言
+
+触发：装第三方插件时报「依赖缺失 `kmod-inet-diag`」。
+
+### 1. 定位：谁在要它
+
+V0.18 基线固件的 apk 数据库里，**`mihomo-alpha` 的依赖正是**
+`ca-bundle ip-full kmod-inet-diag kmod-tun libc`；**`nikki` 的更长**（含同一个
+`kmod-inet-diag`）。即上游插件把它写进了依赖，而本固件从来没编过 → 于是"装插件卡住"。
+
+### 2. 为什么这类包必须编进镜像，而不能等缺了再 `apk add`
+
+`kmod-*` 的依赖串里带**内核指纹**（形如 `kernel=6.18.52~<build-hash>`）。
+本固件是自编译内核 —— `cat /proc/version` 显示 `runner@runnervmlun5p ... #0 SMP`，
+即带我们自己构建的指纹。在线仓库里的同名 kmod 是给**官方内核**编的：
+装上去要么被 apk 直接拒绝，要么装上因 vermagic 不一致而 `modprobe` 失败
+（症状是"包在、功能没有"）。**用户态包没有这个问题**（可直接在线装），
+所以「装插件缺依赖」这类问题，**只有 kmod 这一类需要预置进镜像**。
+
+### 3. 补了什么（16 个，每个都核过上游定义）
+
+选包依据：与 V0.18 基线做差集（基线 113 个 kmod，真机现在 167 个，多数只是版本不同），
+差集里属于"第三方插件常见依赖"的那批；并逐个在**上游源码**里核对过符号存在
+（immortalwrt master 的 `package/kernel/linux/modules/*.mk`，共 1188 个 KernelPackage 定义）。
+
+| 分组 | 包 | 为什么 |
+| :-- | :-- | :-- |
+| 代理/隧道插件直接声明 | `kmod-inet-diag` | netlink SOCK_DIAG，socket→进程反查；代理插件"按进程分流"必需（本次触发项） |
+| 〃 | `kmod-nft-compat` | xtables 老匹配模块接到 nft 的兼容层，iptables-nft 靠它 |
+| iptables 兼容层 | `kmod-ipt-core` `kmod-ipt-conntrack` `kmod-ipt-nat` `kmod-ipt-nat6` `kmod-ipt-extra` `kmod-ipt-physdev` `kmod-ip6tables` `kmod-nf-ipt` `kmod-nf-ipt6` | V0.18 基线全带；老插件与社区脚本仍普遍直接用 iptables |
+| 〃（走 iptables 模式的代理插件） | `kmod-ipt-tproxy` `kmod-ipt-ipset` | 透明代理（xt_TPROXY）与 ipset 集合匹配；本固件自身用 nft 的 tproxy/set，这两个只为插件按 iptables 模式跑时兜底 |
+| 桥接/串口/兜底 | `kmod-br-netfilter` | netfilter 过滤**桥接**流量；真机此前 `/proc/sys/net/bridge` 目录都不存在 |
+| 〃 | `kmod-usb-acm` | USB CDC-ACM 串口通用兜底（基线带） |
+| 〃 | `kmod-lib-crc32c` | 多个 kmod 的**包级**传递依赖（本机内核把它编成内建 → 功能有、`apk` 找不到该包名） |
+
+**真机核实过"不是白加"**：`/sys/module/inet_diag`、`/sys/module/br_netfilter`、
+`/sys/module/nft_compat` 三个都不存在，`/lib/modules/6.18.52` 里也无对应 `.ko`。
+
+### 4. 明确**没**加的（都属于别的设备/场景）
+
+`kmod-crypto-eip`（MTK 老平台加密引擎，本机用 EIP197/safexcel）、
+`kmod-mt7987-2p5g-phy`（本机已由 `kmod-phy-mediatek-2p5g` 覆盖，只是包名不同）、
+`kmod-qmi_wwan_f/q/s`、`kmod-usb-serial-qualcomm`、`kmod-usb-net-huawei-cdc-ncm`
+（别的模组的驱动；本机 MT5700 走 CDC-NCM/option）、
+`kmod-nf-ipvs`（IPVS，本机不跑）、`kmod-nf-conntrack6`（新版已并入 `kmod-nf-conntrack`）。
+
+### 5. 配套：CI 自动断言（防止"配了等于没配"）
+
+kconfig 对**不存在或依赖不满足**的符号是**静默丢弃** —— 「defconfig 成功」完全
+不能证明包名有效。在 `WRT-CORE.yml` 的 `Custom Settings` 里加了断言：
+
+- **清单从配置里提取，不抄第二份**：`Config/GENERAL.txt` 里用
+  `# >>> plugin-deps:begin` / `# >>> plugin-deps:end` 两行圈出标记区，
+  CI 用 awk 按**整行**匹配提取区内的所有 `CONFIG_PACKAGE_*`，逐个断言必须为 `=y`。
+  以后往这一段加包 = 自动纳入断言（手抄两份清单必然漂移，这是本项目踩过的坑）。
+- **标记被改也拦得住**：提取数量 < 10 直接 `::error::`（否则标记丢了就等于断言空跑）。
+- **反向验证过**（不是"看起来对"）：正常 16 个全 `=y` → rc=0；故意少一个 →
+  rc=1 且**报出具体包名**；把 begin 标记改名 → rc=1 报"提取数为 0"。
+
 ## [2026-09-22 · 风扇温控换源] `luci-app-h5000m-fancontrol` 改用自有 fork（补 5G 模组取温）
 
 触发：上游取 5G 模组温度的路在本机是死的（见下），故把编译来源从

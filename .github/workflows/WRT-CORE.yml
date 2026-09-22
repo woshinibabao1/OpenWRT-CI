@@ -355,6 +355,30 @@ jobs:
           grep -E '^(CONFIG_TARGET_MULTI_PROFILE|CONFIG_TARGET_ALL_PROFILES|CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_hiveton_h5000m)=' .config || true
           grep -E '^CONFIG_(DEFAULT_TCP_CONG|TCP_CONG_BBR|KERNEL_TCP_CONG_BBR|KERNEL_NET_SCH_CAKE|KERNEL_NET_SCH_FQ)=' .config || true
 
+          # 常见依赖断言（2026-09-22）：把 Config/GENERAL.txt 里 plugin-deps 标记区
+          # （形如 `# >>> plugin-deps:begin` … `# >>> plugin-deps:end` 两行，awk 按整行匹配）
+          # 之间的每个 CONFIG_PACKAGE_* 逐个断言必须真的进了最终 .config。
+          # 起因：第三方插件报「依赖缺失 kmod-inet-diag」，而它必须随镜像编入
+          # （kmod 的依赖串带内核 build 指纹，在线仓库的同名包与自编译内核对不上）。
+          # ★ 为什么断言而不是只打印：kconfig 对不存在的包名是**静默丢弃**，
+          #   「defconfig 成功」完全不能证明包名有效 —— 漏了就是又出一版
+          #   「装插件时才发现缺依赖」的固件。
+          # ★ 为什么从 Config 提取而不是在这里再抄一份清单：清单抄两份必然漂移
+          #   （加包的人只改一处、断言永远是绿的），这里让断言跟着配置自动生长。
+          DEPS_LIST="$(awk '/^# >>> plugin-deps:begin/{f=1;next} /^# >>> plugin-deps:end/{f=0} f && /^CONFIG_PACKAGE_/ {sub(/=.*/,""); sub(/^CONFIG_PACKAGE_/,""); print}' "$GITHUB_WORKSPACE/Config/GENERAL.txt")"
+          DEPS_TOTAL="$(printf '%s\n' "$DEPS_LIST" | grep -c . || true)"
+          DEPS_MISSING=""
+          for dep in $DEPS_LIST; do
+            grep -q "^CONFIG_PACKAGE_${dep}=y$" .config || DEPS_MISSING="$DEPS_MISSING $dep"
+          done
+          echo "常见依赖断言区：提取到 ${DEPS_TOTAL:-0} 个包"
+          if [ -n "$DEPS_MISSING" ]; then
+            echo "::error::以下常见依赖未进入 .config（包名被 kconfig 静默丢弃，或上游改名）：$DEPS_MISSING"
+            exit 1
+          fi
+          # 标记被误删/改名时 awk 提取为空 —— 那种情况下上面是"零个包全过"，必须显式拦下。
+          [ "${DEPS_TOTAL:-0}" -ge 10 ] || { echo "::error::通用配置里只提取到 ${DEPS_TOTAL:-0} 个常见依赖，plugin-deps 标记可能被改动"; exit 1; }
+
           # R04（P03 收口）：luci-app-firewall 是「页面上改 flow offload」的前提（网络→防火墙→常规设置页）。
           # 这条不是 || true：包名无效（被 kconfig 静默丢弃）时 CI 必须红掉，而不是带着缺页的固件发版。
           grep -q '^CONFIG_PACKAGE_luci-app-firewall=y' .config || { echo "::error::luci-app-firewall 未进入 .config，「页面上改 flow offload」不可用"; exit 1; }

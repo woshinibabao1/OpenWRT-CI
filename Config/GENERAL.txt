@@ -208,6 +208,80 @@ CONFIG_PACKAGE_kmod-nft-fib=y
 CONFIG_PACKAGE_kmod-nft-netdev=y
 CONFIG_PACKAGE_kmod-nft-xfrm=y
 
+# ===== 常见第三方插件依赖（2026-09-22 补全）=====
+# 起因：装第三方插件时卡在「依赖缺失 kmod-inet-diag」。核实 V0.18 基线固件的
+#   apk 数据库证实：mihomo-alpha 的依赖里就写着 `ca-bundle ip-full kmod-inet-diag
+#   kmod-tun libc`，nikki 的更长（也含 kmod-inet-diag）。即上游插件**明确声明了它**，
+#   而本固件一直没有。
+#
+# ★ 为什么这类包必须随镜像编入，而不能等缺了再 apk add：
+#   kmod-* 的依赖串里带**内核指纹**（形如 `kernel=6.18.52~<build-hash>`）。
+#   本固件是自编译内核（`cat /proc/version` 里带我们自己 runner 的 build 号），
+#   在线仓库里的同名 kmod 是给官方内核编的 —— 装上去要么被 apk 直接拒绝，
+#   要么装上因 vermagic 不一致而 modprobe 失败（症状：包在、功能没有）。
+#   用户态包没有这个问题（可以直接在线装），所以**只有 kmod 必须预置进镜像**。
+#
+# 选包依据（不是"能想到的都加上"）：
+#   ① 与 V0.18 基线做差集：基线装了 113 个 kmod，真机现在 167 个（多数只是版本不同），
+#      其中"基线有、本机确实没有"的 24 个里，属于第三方插件常见依赖的都在下面；
+#   ② 每个符号都在上游源码里逐个核过（immortalwrt master 的
+#      package/kernel/linux/modules/*.mk，共 1188 个 KernelPackage 定义）——
+#      ★ 因为 kconfig 对**不存在或依赖不满足**的符号是**静默丢弃**：写错名字不报错、
+#      只是"配了等于没配"。CI 里另加了一条断言复核本段（见 WRT-CORE.yml「常见依赖断言」）；
+#   ③ 真机核过这些能力**确实没有**（不是已内建）：/sys/module/inet_diag、
+#      /sys/module/br_netfilter、/sys/module/nft_compat 三个都不存在，
+#      /lib/modules/6.18.52 里也没有对应 .ko —— 所以不是白加；
+#   ④ 明确**不加**的（都属于"别的设备 / 别的场景"）：
+#      kmod-crypto-eip（MTK 老平台加密引擎；本机用 EIP197/safexcel）、
+#      kmod-mt7987-2p5g-phy（本机已由 kmod-phy-mediatek-2p5g 覆盖，只是包名不同）、
+#      kmod-qmi_wwan_f/q/s、kmod-usb-serial-qualcomm、kmod-usb-net-huawei-cdc-ncm
+#      （都是别的模组的驱动；本机 MT5700 走 CDC-NCM/option，通用 QMI 也已编入）、
+#      kmod-nf-ipvs（IPVS 负载均衡，本机不跑）、
+#      kmod-nf-conntrack6（新版已并入 kmod-nf-conntrack，上游没有这个独立包名）。
+#
+# ⚠️ 下面这段被 WRT-CORE.yml 的「常见依赖断言」按**整行标记**自动提取
+#    （`# >>>` 开头的那两行，begin 与 end 之间）：标记区里的每个
+#    CONFIG_PACKAGE_* 都会被逐个断言必须为 =y。
+#    往这一段里加包 = 自动纳入断言，不需要另外同步任何清单；
+#    但**别改这两行标记本身**，改了断言会提取为空并被 CI 拒绝。
+# >>> plugin-deps:begin
+
+# ① 代理 / 隧道类插件直接声明的两个
+# inet-diag：netlink SOCK_DIAG，把 socket 反查回所属进程 —— 代理插件做
+#   「按进程分流」时必需（nikki / mihomo-alpha / sing-box / honk 均直接依赖）。
+CONFIG_PACKAGE_kmod-inet-diag=y
+# nft-compat：xtables 老匹配模块接到 nft 上的兼容层，iptables-nft 靠它才能用老匹配器。
+CONFIG_PACKAGE_kmod-nft-compat=y
+
+# ② iptables 兼容层（V0.18 基线全带；老插件与社区脚本仍普遍直接用 iptables）
+# 注：本固件自身规则走 nft/fw4，这一段纯粹是为了让第三方插件装得上、跑得起来。
+CONFIG_PACKAGE_kmod-ipt-core=y
+CONFIG_PACKAGE_kmod-ipt-conntrack=y
+CONFIG_PACKAGE_kmod-ipt-nat=y
+CONFIG_PACKAGE_kmod-ipt-nat6=y
+CONFIG_PACKAGE_kmod-ipt-extra=y
+CONFIG_PACKAGE_kmod-ipt-physdev=y
+CONFIG_PACKAGE_kmod-ip6tables=y
+CONFIG_PACKAGE_kmod-nf-ipt=y
+CONFIG_PACKAGE_kmod-nf-ipt6=y
+# 走 iptables 模式的代理插件要的两个：透明代理（xt_TPROXY）与 ipset 集合匹配。
+# 本固件自身用 nft 的 tproxy/set，这两个只为"插件按 iptables 模式跑"时兜底。
+CONFIG_PACKAGE_kmod-ipt-tproxy=y
+CONFIG_PACKAGE_kmod-ipt-ipset=y
+
+# ③ 桥接 / 串口 / 通用依赖兜底
+# br-netfilter：让 netfilter 能过滤**桥接**流量（V0.18 基线上带了它并配套
+#   11-br-netfilter.conf）。真机现在 /proc/sys/net/bridge 目录都不存在，
+#   即桥接上的过滤规则此前完全没生效。
+CONFIG_PACKAGE_kmod-br-netfilter=y
+# usb-acm：USB CDC-ACM 串口，插 USB 串口/模组设备时的通用兜底（基线带）。
+CONFIG_PACKAGE_kmod-usb-acm=y
+# lib-crc32c：极小，多个 kmod 的传递依赖（基线带）——
+#   它是**包级依赖**：本机内核把它编成了内建，所以现在功能上有、但 `apk` 找不到
+#   名为 kmod-lib-crc32c 的包，日后有插件声明依赖它时仍会卡住。
+CONFIG_PACKAGE_kmod-lib-crc32c=y
+# >>> plugin-deps:end
+
 # 内核模块 - USB 设备
 CONFIG_PACKAGE_kmod-usb3=y
 CONFIG_PACKAGE_kmod-usb-core=y
