@@ -16,19 +16,25 @@
 | --- | --- | --- |
 | MediaTek **PPE**（Packet Processing Engine，硬件转发表） | ✅ 存在且已注册 | `/sys/kernel/debug/ppe0`、`ppe1` 均存在 |
 | 以太网口硬件卸载能力 | ✅ 支持 | `ethtool -k eth0/eth1` → `hw-tc-offload: on` |
-| **WED**（Wi-Fi 到 PPE 的硬件转发，MTK 的无线加速） | ❌ 缺失 | `/lib/modules/6.18.44/` 下无 `mtk_wed.ko`；`lsmod` 无 `mtk_wed` |
+| **WED**（Wi-Fi 到 PPE 的硬件转发，MTK 的无线加速） | ❌ **不可用** | `/lib/modules/…` 下无 `mtk_wed.ko`、`modules.builtin` 无 wed、`/sys/bus/platform/drivers/` 下无 `mtk-wed`；且缺 WO 固件。完整取证与三条阻断链见 **附A** |
 | **HNAT**（`mtk_hnat`，联发科 tree 外驱动） | ❌ 不在本基线 | 无 `mtk_hnat.ko`，`dmesg` 无 hnat 记录 |
 | EIP197 硬件加密（SAFExcel） | ✅ 已加载 | `lsmod` 有 `crypto_safexcel`、`cryptodev` |
 | 中断均衡 | ✅ 在跑 | `/usr/sbin/irqbalance -f -c 2 -t 10`，`uci irqbalance.enabled=1` |
 | 数据包引导（packet steering） | ⛔ **已停用**（2026-09-22 反转，见下） | 与 `mt5700-rps` 抢同一个 `rps_cpus`，且会把它改回最差的单核掩码 |
 | BBR 拥塞控制 | ✅ 已生效 | `/etc/sysctl.d/12-tcp-bbr.conf` + `99-mt5700-tcp.conf` |
 | CAKE / SQM | ⚪ 默认关闭（不限速） | `sqm.eth1.enabled='0'` |
-| flow offload | ❌ **关闭**（本次改为默认开） | 防火墙 defaults 里没有 `flow_offloading` 项 |
+| flow offload | ❌ **默认关闭**（2026-09-22 反转：软件卸载也关，理由见第八节） | `Files/etc/mt5700/flow-offload` = `MODE=off`（验收见第五节） |
 
 **关键判断**：上网出口是 **eth2（5G 模组，USB CDC-NCM）**，而 PPE 只挂在 SoC 以太网口（eth0/eth1）上，
 **管不到 USB 口**；Wi-Fi 侧想走 PPE 又必须要有 WED，而 WED 模块本基线没有。
-所以：**硬件卸载在这台机器上几乎命中不到**（只有「有线 LAN ↔ 有线 LAN」这类流量），
-真正拿得到、且对所有接口（含 5G WAN）都有效的是**软件 flow offload（nf_flow_table 快转路径）**。
+所以：**硬件卸载在这台机器上几乎命中不到**（只有「有线 LAN ↔ 有线 LAN」这类流量）。
+
+> ⚠️ **2026-09-22 更正**：本段原先接了一句"真正拿得到、且对所有接口（含 5G WAN）
+> 都有效的是**软件 flow offload**"，并据此把它设为默认开启 —— **这个结论已作废**。
+> 软件卸载确实对所有接口生效，但它和本固件的 **TTL 统一规则互斥**：flow offload 会把
+> 连接从 nftables 路径上摘走 → `mangle_ttl_unify` 零命中 → 运营商按「多设备共享」丢弃
+> 客户端 TCP 包 → 客户端完全没网（真机实测：卸载开时 HTTP 25 秒超时、conntrack 带
+> `[OFFLOAD]`、postrouting 计数器为 0）。**故软件卸载同样默认关闭**，详见第八节。
 
 ---
 
@@ -82,12 +88,24 @@
 
 ### D. 网络加速 / 稳定性（核心改动，落在首次开机脚本）
 
-**1）默认开启软件 flow offload**（`Files/etc/uci-defaults/99-mt5700-net`）
+**1）~~默认开启软件 flow offload~~ → 已于 2026-09-22 反转：改为**默认关闭**（两种卸载都关）**
 
-- 之前是**无条件关闭**；现在改成：**SQM 没开就打开软件卸载，SQM 开了就保持关闭**，二者互斥（被卸载的连接绕过 qdisc，CAKE/HTB 会失效）。
-- 硬件卸载（`flow_offloading_hw`）**仍然关闭**，理由见第一节：没有 WED、WAN 是 USB，开了命中率≈0 还会让 nft 计数器看不到流量、排障变难。脚本里写清了「等固件带 `mtk_wed` 再开」。
-- 回滚：网络 → 防火墙 → 常规设置，取消「Flow Offloading」；或
-  `uci set firewall.@defaults[0].flow_offloading=0; uci commit firewall; /etc/init.d/firewall restart`
+> ⚠️ 原结论「SQM 没开就打开软件卸载」已被实测推翻，**别照着恢复**。
+>
+> 触发点：当天发现**软件卸载同样会绕过 nftables**，而本固件靠 nft 在 WAN 出口统一
+> 改写 TTL（`Files/etc/nftables.d/12-mangle-ttl-128.nft`）。卸载一开，TTL 规则零命中，
+> 运营商按「多设备共享」丢弃客户端 TCP 包 —— 症状是「路由器自己能上网、手机电脑全断」，
+> 与 DNS 故障、信号问题极像，极难定位。真机实测对照：
+> 卸载开 → 客户端 HTTP 25 秒超时、conntrack 条目带 `[OFFLOAD]`、`postrouting` 计数器 0；
+> 卸载关 → 同一请求 HTTP 200 / 1.0 秒。
+>
+> 现在的取值：`Files/etc/mt5700/flow-offload` = `MODE=off`，
+> `Scripts/ApplyFlowOffload.sh` 的默认值也是 `off`；想要卸载加速须在编译入口显式选
+> `on` / `on-hw`，代价是 TTL 统一失效（该脚本头部写清了这一点）。
+> 硬件卸载（`flow_offloading_hw`）**仍然关闭**，理由见第一节：没有 WED、WAN 是 USB，
+> 开了命中率≈0 还会让 nft 计数器看不到流量、排障变难。
+> 回滚/核对：`cat /etc/mt5700/flow-offload` 期望 `MODE=off`；
+> `uci get firewall.@defaults[0].flow_offloading` 期望 `0`。
 
 **2）~~显式兜底 packet steering~~ → 已于 2026-09-22 反转：改为**停用**（同脚本第 4 节）**
 
@@ -127,9 +145,9 @@
 
 | 你提到的 / 常见的 | 不做的理由 |
 | --- | --- |
-| **turboacc**（`luci-app-turboacc` / `kmod-fast-classifier` / `shortcut-fe`） | 这东西是给 **Qualcomm / 老内核**的树外加速，路径和 `nf_flow_table` 抢同一批 hook。在 6.18 + Filogic 上：① SFE/FC 基本编译不过；② 就算编过，和已开启的 flow offload 并存会互相打架，典型症状是随机断流。而 turboacc 在 filogic 上剩下的「BBR + FullCone」两项**本固件早就默认开了**（BBR 在 sysctl，fullcone 在 firewall defaults=1）。加它 = 纯亏体积 + 引入冲突 |
+| **turboacc**（`luci-app-turboacc` / `kmod-fast-classifier` / `shortcut-fe`） | 这东西是给 **Qualcomm / 老内核**的树外加速，路径和 `nf_flow_table` 抢同一批 hook。在 6.18 + Filogic 上：① SFE/FC 基本编译不过；② 就算编过，**一旦启用 flow offload** 两者会互相打架，典型症状是随机断流（注意 flow offload 本固件默认是关的，见第八节）。而 turboacc 在 filogic 上剩下的「BBR + FullCone」两项**本固件早就默认开了**（BBR 在 sysctl，fullcone 在 firewall defaults=1）。加它 = 纯亏体积 + 引入冲突 |
 | **`mtk_hnat`（联发科 HNAT 驱动）** | 这是 **mtk-openwrt-feeds 的树外驱动**，immortalwrt master（你现在的基线）没收录 —— 真机 `/lib/modules` 里根本没这个 .ko。主线用的是新一代 **PPE**（就是 `/sys/kernel/debug/ppe0`、ppe1 那个）。再叠一套 tree 外 HNAT 会和 PPE **抢同一张硬件转发表**，属于教科书级负优化 |
-| **WED（Wi-Fi 硬件转发）** | 本基线没有 `mtk_wed.ko`。要拿到需要引入 mtk-openwrt-feeds 的 WED 补丁（你这仓库 2026-08 曾注入过 `999-mtk7987-wed-v31.patch`，后来被移除了），且**必须真机验证 Wi-Fi 起得来**。盲加的风险是 AP 直接起不来 —— 属于「需人工决策 + 真机验证」项，见第四节 |
+| **WED（Wi-Fi 硬件转发）** | 本基线没有 `mtk_wed.ko`。要拿到需要引入 mtk-openwrt-feeds 的 WED 补丁（你这仓库 2026-08 曾注入过 `999-mtk7987-wed-v31.patch`，后来被移除了）。→ ⛔ **2026-09-22 已定案：不做**，三条阻断链与完整取证见 **附A**（不只是"需真机验证"，而是即使补齐也只剩断开 TTL 统一这一条死路） |
 | **zram / swap** | 1GB DDR4，实测 free 477MB、buff/cache 265MB，没有内存压力。加 zram 是拿 CPU 换内存，在这台机器上净亏 |
 | **netdev_max_backlog / TCP 缓冲区放大** | ⚠️ **2026-09-22 已撤销此结论**（原判据有两处错，详见第七节）：① 范畴错 —— `netdev_max_backlog` 是**每 CPU 的收包积压**（NAPI 与协议栈之间的 skb 指针队列），不是出口 qdisc 队列，fq_codel/CAKE 作用的不是这里；② 前提反转 —— 当时假设「flow offload 默认开、转发走快路」，而现在默认已是 `off`（TTL 统一规则要求），软件转发路径成为常态。已按新前提重新取值 |
 | **改 CPU 调度器 / 锁定高频** | 实测 governor 已是 `schedutil`，档位 0.5/1.3/1.6/2.0 GHz 正常。锁 `performance` 只增加发热（这台机器还有温控风扇） |
@@ -138,13 +156,17 @@
 
 ## 四、需要你拍板的三件事
 
-1. **要不要 Wi-Fi 硬件转发（WED）？**
-   真·加速就靠它（Wi-Fi ↔ 有线走 PPE，CPU 基本不参与）。代价是引入 mtk-openwrt-feeds 的 WED 补丁，
-   **有 Wi-Fi 起不来的风险**，必须刷机实测。要做的话我建议单独开一个分支试，别直接进日常产物。
+> ℹ️ 本节是**当时**的待决清单。三项此后都已定案，结论见下（详细依据见附A / 第七节）。
 
-2. **要不要把 flow offload 的开关做成可见配置？**
-   现在是「首次开机自动决定」，用户改过就不再覆盖。如果你希望刷完就能在界面上看见/切换，
-   我可以把它写进 `/etc/config/firewall` 并在 Release 说明里标注。
+1. **要不要 Wi-Fi 硬件转发（WED）？** → ⛔ **已定案：不做**（附A）。
+   当时以为"真·加速就靠它"，但真机取证后三条阻断链同时成立：缺 WO 固件、
+   缺 `nf_flow_table_hw`/`flow_offload_hw_*` 钩子、且 WED 只在硬件卸载开启时工作
+   而硬件卸载会破坏 TTL 统一（=客户端断网）。**别再注入 WED 补丁**（历史见 A.5）。
+
+2. **要不要把 flow offload 的开关做成可见配置？** — 现状已满足需求：
+   选型由编译入口 `WRT_FLOW_OFFLOAD`（默认 off）决定并写进 `/etc/mt5700/flow-offload`，
+   Release 说明里已写明默认值与代价（第八节）。用户仍可在 LuCI 防火墙页自行改。
+   （注意：本次文案纠偏撤掉了原 Release 里"默认开软件卸载"的错误说法。）
 
 3. **sing-box 内核彻底不编，你 OK 吗？**
    已确认并落地：用户本次已回答「要」。`Config/GENERAL.txt` 显式写死 `CONFIG_PACKAGE_sing-box=n` /
@@ -183,6 +205,9 @@ cat /proc/interrupts | head -20                        # 对比 CPU0..CPU3 是�
 
 ## 六、改动文件清单
 
+> ℹ️ 本节记录**当时那一轮**改了哪些文件，是历史快照。其中 flow offload 与 packet steering
+> 两项此后已被实测反转，逐条修正见第八节。
+
 | 文件 | 动作 |
 | --- | --- |
 | `.github/workflows/H5000M-MT-AUTO.yml` | 改：主题 argon、新增 `WRT_MARK: OWrt` |
@@ -191,7 +216,7 @@ cat /proc/interrupts | head -20                        # 对比 CPU0..CPU3 是�
 | `.github/workflows/AP3000M-MT-AUTO.yml`、`X86-MT-AUTO.yml` | 删 |
 | `Config/GENERAL.txt` | 改：插件增删 + 硬件加速段 |
 | `Config/AP3000M.txt`、`X86.txt`、`MT5700M.txt` | 删 |
-| `Files/etc/uci-defaults/99-mt5700-net` | 改：flow offload 默认开（SQM 互斥）、packet steering 兜底 |
+| `Files/etc/uci-defaults/99-mt5700-net` | 改：flow offload 默认开（SQM 互斥）、packet steering 兜底 —— ⚠️ **两项均已于 2026-09-22 反转**（改为默认关 / 改为停用），见第八节 |
 | `Files/etc/sysctl.d/99-mt5700-tcp.conf` | 改：TFO / backlog / rp_filter 三项 |
 | `Scripts/Packages.sh` | 改：去 aurora、homeproxy 改写、airpi |
 | `Scripts/Handles.sh` | 改：删 homeproxy / aurora / AP3000M EEPROM / dockerd 四段 |
@@ -322,4 +347,82 @@ DMA 直送 PPE 的通道。**一句话：HNAT 是引擎，WED 是给引擎接上
 → `f2096b6` → `a678400` 多轮修编译，最终以 `341b87c`、`0b10213`
 （"Remove kernel-side WED v3.1 patch that broke mt76 build"）移除。
 **别再重来** —— 就算编译过了，A.3 的三条阻断链依然成立。
+
+---
+
+## 八、文档纠偏：Release 说明泄露内部笔记 + flow offload 文案与代码相反（2026-09-22）
+
+### 8.1 问题一：Release 正文里混进了 3 行"内部工作笔记"
+
+`WRT-CORE.yml` 的 Release 步骤原先写成：
+
+```yaml
+body: |
+  # 文案按实际产物写：单 profile 编译，只此一个设备；加速只开软件卸载。
+  # 原「内含多个设备 / 全系带开源硬件加速」与实际不符 —— …（另 1 行）
+  本 Release 只含 Hiveton H5000M …
+```
+
+**这里的 `#` 不是 YAML 注释。** `body: |` 是块标量（literal block scalar），
+其内部每一行都是**字面内容** —— 注释必须写在标量的缩进之外才生效。
+所以这 3 行会原样进入发布说明；而 markdown 里行首 `#` 是一级标题，
+Release 页面顶部会顶出一个巨大的标题，内容是"改文案的理由"这类内部笔记。
+
+**判据（可直接复用，别靠肉眼）**：
+
+```python
+import yaml
+d = yaml.safe_load(open('.github/workflows/WRT-CORE.yml'))
+body = [s for s in d['jobs']['core']['steps'] if s.get('name') == 'Release Firmware'][0]['with']['body']
+print(body[:200])
+```
+改前打印出的前 3 行正是那 3 条笔记；改后消失。
+
+**修法**：把笔记移出 `body`（要留就留在 `body:` 键的上一行、缩进与键对齐），
+标量内部只放面向使用者的正文。
+
+### 8.2 问题二：文案写"默认开软件 flow offload"，与代码相反
+
+同一段文案写着「加速现状（勿误读）：默认开「软件 flow offload」（nf_flow_table）」。
+实际默认值是 **off**，三处独立取值可证：
+
+| 位置 | 实际值 |
+| :-- | :-- |
+| `Files/etc/mt5700/flow-offload` | `MODE=off` |
+| `Scripts/ApplyFlowOffload.sh` | `MODE="${WRT_FLOW_OFFLOAD:-off}"` |
+| `WRT-BUILD.yml` / `H5000M-MT-AUTO.yml` 的 `FLOW_OFFLOAD` 输入 | `default: 'off'` |
+
+**为什么必须关**：任何 flow offload（软件的一样）都会把连接从 nftables 路径上摘走，
+而本固件依赖 nft 在 WAN 出口统一改写 TTL → 卸载一开，TTL 规则零命中 → 运营商按
+「多设备共享」丢弃客户端 TCP 包 → **客户端完全没网**（真机实测：卸载开时客户端
+HTTP 25 秒超时、conntrack 带 `[OFFLOAD]`、`postrouting` 计数器为 0；关掉后同请求
+HTTP 200 / 1.0 秒）。
+
+原文案不但说反了，还**漏掉了这条最关键的警告** —— 照它做的人把卸载打开就会断网，
+而症状（路由器自己能上网、客户端全断）极易被误判成 DNS 或信号问题。
+
+### 8.3 一并修掉的其他残留（同一处决策被反转、文档没跟上）
+
+| 位置 | 原文 | 改为 |
+| :-- | :-- | :-- |
+| `Config/GENERAL.txt` 硬件加速段 | "默认开「软件 flow offload」" | 明确两种卸载默认都关 + 说明与 TTL 互斥 |
+| 本报告第一节表格 flow offload 行 | "❌ 关闭（本次改为默认开）"（自相矛盾） | "❌ 默认关闭（2026-09-22 反转…）" |
+| 本报告第一节"关键判断"段 | 推荐"软件 flow offload 是对所有接口都有效的路径" | 加更正框：该结论已作废 |
+| 本报告第二节 D-1 | "默认开启软件 flow offload" | 按本报告既有"反转"体例标注作废 + 写清新取值 |
+| 本报告第六节改动文件清单 | 无标注 | 加"历史快照"说明 + 该行就地标注两项已反转 |
+
+`CHANGELOG.md` 里的历史条目**不改**（那是按日期记录"当时是什么"），纠偏只记在本轮新增条目里。
+
+### 8.4 教训（可复用）
+
+- **YAML 块标量里的 `#` 是内容，不是注释。** 想在 `body: |` 里写说明，必须放在标量
+  缩进之外；否则会跟着一起发布出去（本例还是一级标题，最显眼）。
+  验证一律用解析器打印实际取值，别靠肉眼看 YAML。
+- **"默认值"这类事实要以代码为唯一准绳。** 同一件事在 `Files/`、`Scripts/`、workflow
+  输入三处各写过一次默认值 —— 任一处改了都必须同步校验另外两处，否则用户读到的说明
+  会和产物行为分叉。（本次三处取值一致，分歧只在文案，属于"只改了代码没改说明"。）
+- **决策反转后要按"结论句"而非参数名全仓 grep。** `flow offload` 默认值反转后一天，
+  仍有 5 处文档写着旧结论。搜索关键词不能只用参数名，还要搜旧结论的自然语言形态
+  （`默认开` + `offload`、`软件 flow offload`），否则漏得干干净净。
+
 
