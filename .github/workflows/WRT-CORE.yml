@@ -319,11 +319,16 @@ jobs:
         run: |
           cd ./wrt/
 
+          # DEPS_EXPECT：只有"叠加了 GENERAL.txt"的配置才该有下面那批常见依赖。
+          # TEST 配置只叠机型配置、不叠 GENERAL，必须跳过断言，否则会整片误报。
           if [[ "${WRT_CONFIG,,}" == *"test"* ]]; then
             cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt >> .config
+            DEPS_EXPECT=0
           else
             cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt $GITHUB_WORKSPACE/Config/GENERAL.txt >> .config
+            DEPS_EXPECT=1
           fi
+          export DEPS_EXPECT
 
           # 显式启用 ccache：缓存落到 ./.ccache，与上面缓存的 path 对应。
           # 重复编译、仅改配置或插件时可大幅缩短耗时。
@@ -365,19 +370,25 @@ jobs:
           #   「装插件时才发现缺依赖」的固件。
           # ★ 为什么从 Config 提取而不是在这里再抄一份清单：清单抄两份必然漂移
           #   （加包的人只改一处、断言永远是绿的），这里让断言跟着配置自动生长。
-          DEPS_LIST="$(awk '/^# >>> plugin-deps:begin/{f=1;next} /^# >>> plugin-deps:end/{f=0} f && /^CONFIG_PACKAGE_/ {sub(/=.*/,""); sub(/^CONFIG_PACKAGE_/,""); print}' "$GITHUB_WORKSPACE/Config/GENERAL.txt")"
-          DEPS_TOTAL="$(printf '%s\n' "$DEPS_LIST" | grep -c . || true)"
-          DEPS_MISSING=""
-          for dep in $DEPS_LIST; do
-            grep -q "^CONFIG_PACKAGE_${dep}=y$" .config || DEPS_MISSING="$DEPS_MISSING $dep"
-          done
-          echo "常见依赖断言区：提取到 ${DEPS_TOTAL:-0} 个包"
-          if [ -n "$DEPS_MISSING" ]; then
-            echo "::error::以下常见依赖未进入 .config（包名被 kconfig 静默丢弃，或上游改名）：$DEPS_MISSING"
-            exit 1
+          # ★ 只有叠加了 GENERAL.txt 的配置才断言（见上面 DEPS_EXPECT）：
+          #   TEST 配置不叠 GENERAL，若照断会整片误报。
+          if [ "${DEPS_EXPECT:-0}" = "1" ]; then
+            DEPS_LIST="$(awk '/^# >>> plugin-deps:begin/{f=1;next} /^# >>> plugin-deps:end/{f=0} f && /^CONFIG_PACKAGE_/ {sub(/=.*/,""); sub(/^CONFIG_PACKAGE_/,""); print}' "$GITHUB_WORKSPACE/Config/GENERAL.txt")"
+            DEPS_TOTAL="$(printf '%s\n' "$DEPS_LIST" | grep -c . || true)"
+            DEPS_MISSING=""
+            for dep in $DEPS_LIST; do
+              grep -q "^CONFIG_PACKAGE_${dep}=y$" .config || DEPS_MISSING="$DEPS_MISSING $dep"
+            done
+            echo "常见依赖断言区：提取到 ${DEPS_TOTAL:-0} 个包"
+            if [ -n "$DEPS_MISSING" ]; then
+              echo "::error::以下常见依赖未进入 .config（包名被 kconfig 静默丢弃，或上游改名）：$DEPS_MISSING"
+              exit 1
+            fi
+            # 标记被误删/改名时 awk 提取为空 —— 那种情况下上面是"零个包全过"，必须显式拦下。
+            [ "${DEPS_TOTAL:-0}" -ge 10 ] || { echo "::error::通用配置里只提取到 ${DEPS_TOTAL:-0} 个常见依赖，plugin-deps 标记可能被改动"; exit 1; }
+          else
+            echo "常见依赖断言：本配置未叠加 GENERAL.txt，跳过"
           fi
-          # 标记被误删/改名时 awk 提取为空 —— 那种情况下上面是"零个包全过"，必须显式拦下。
-          [ "${DEPS_TOTAL:-0}" -ge 10 ] || { echo "::error::通用配置里只提取到 ${DEPS_TOTAL:-0} 个常见依赖，plugin-deps 标记可能被改动"; exit 1; }
 
           # R04（P03 收口）：luci-app-firewall 是「页面上改 flow offload」的前提（网络→防火墙→常规设置页）。
           # 这条不是 || true：包名无效（被 kconfig 静默丢弃）时 CI 必须红掉，而不是带着缺页的固件发版。

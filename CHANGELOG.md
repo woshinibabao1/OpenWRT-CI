@@ -1,5 +1,72 @@
 # 更新日志
 
+## [2026-09-22 · 常见依赖补全 第二轮] 以 V0.18 + Mwrt 双基线交集再补 14 项，并修掉一处「空 meta」配置
+
+触发：要求以**两套基线固件**（好用的固件 V0.18、Mwrt-H5000M-1139-24）为基准再补全一次。
+
+### 1. 新增第二个基线：Mwrt（opkg 时代）
+
+- 镜像 squashfs 偏移 **4578304**（0x45D000，全盘只有一个 `hsqs` 魔数）；
+  包数据库是 `/usr/lib/opkg/status`（**opkg 而非 apk**，651 个包）。
+- 三方对比：V0.18 = 361 包，Mwrt = 651 包，我方真机 = 400 包；
+  **两基线共有 284 个**，其中我方没有的 68 个逐个判定。
+- 判据用**交集**而不是并集：两套来源完全不同的固件都装，才说明不是哪一家的偏好。
+  （并集里有 287 项是 Mwrt 单方带的，多数是它自己的产品栈：iStoreOS 应用商店、
+  docker/containerd、haproxy、dbus/avahi/openldap 等。）
+
+### 2. ★★ 顺带查出一处**真缺陷**：`xz-utils` 是个空 meta 包，装了等于没装
+
+`Config/GENERAL.txt` 的「常用工具」区一直写着 `CONFIG_PACKAGE_xz-utils=y`，但：
+
+| 证据 | 内容 |
+| :-- | :-- |
+| 上游 Makefile | `openwrt/packages` 的 `utils/xz/Makefile` 里 `Package/xz-utils` 只有 TITLE、**没有 DEPENDS**；真正带二进制的是 `xz`（模板生成，`DEPENDS:=xz-utils`，即 xz 反过来拉 meta） |
+| 真机包库 | `xz-utils-5.8.3-r1` 已装，`D:` 只有 `libc`，包内容只有 `lib/apk/packages/xz-utils.list`（782 字节） |
+| 真机文件系统 | `/usr/bin/xz` **不存在** —— 也就是说固件里从来没有 xz 命令 |
+| 两套基线 | 装的都是 `xz`，不是 `xz-utils` |
+
+已改为 `CONFIG_PACKAGE_xz=y`，并把它**移进 plugin-deps 断言区**
+（"配了等于没配"正是最该被断言的一类）。
+
+### 3. 本轮补的 14 项
+
+| 分组 | 包 | 为什么 |
+| :-- | :-- | :-- |
+| 修空 meta | `xz` | 见上；两基线都有 |
+| 用户态（两基线都有的常用件） | `bash` | 很多插件脚本是 `#!/bin/bash`（`[[ ]]`/数组/`local -n`），busybox ash 跑不了 |
+| 〃 | `jq` | 脚本解析 JSON 的事实标准（honk 的依赖里就有 jq） |
+| 〃 | `wget-ssl` | busybox wget 不支持 HTTPS；很多脚本写死 `wget` |
+| 〃 | `tar` `unzip` `bzip2` `liblzma` `libzstd` | 解包类插件/安装脚本的常见依赖（下载 geo 数据、释放资源包） |
+| iptables **用户态**（补上一轮的另一半） | `iptables-nft` `ip6tables-nft` `xtables-nft` `iptables-mod-extra` | 上一轮只补了内核侧 `xt_*` 模块，但没有命令一样跑不起来；两者齐了"走 iptables 模式的插件"才真能用 |
+| kmod 配套 | `kmod-nf-nat6` | 与 `kmod-ipt-nat6` 配套的 IPv6 NAT 后端（两基线都有） |
+
+### 4. 明确**不加**（写进 Config 注释，附理由）
+
+- **别的模组驱动**：`kmod-qmi_wwan_f/q/s`、`kmod-usb-serial-qualcomm`、
+  `kmod-usb-net-huawei-cdc-ncm`（本机 MT5700 走 CDC-NCM/option；换模组再加）。
+- **别的场景**：`kmod-nf-ipvs`（只服务容器编排）、`kmod-crypto-eip`、
+  `kmod-mt7987-2p5g-phy`（已被 `kmod-phy-mediatek-2p5g` 覆盖）、
+  `kmod-nf-conntrack6`（上游已并入 `kmod-nf-conntrack`）。
+- **产品级选择**：docker/containerd/runc/tini、`taskd`/`luci-app-store`/
+  `luci-lib-taskd`/`luci-lib-xterm`/`luci-theme-bootstrap`（iStoreOS 那套）、
+  `miniupnpd-nftables`（用户已明确移除 UPnP）、QModem 全家桶（已按方案 B 移除）、
+  `opkg`（我方用 apk）。
+- **传递依赖**：`coreutils*`/`script-utils`/`mount-utils`/`libacl`/`libcap-ng`/
+  `libsqlite3-0`/`libpcre2`/`libseccomp`/`libuci-lua`/`libpcap1`/`ndisc6`
+  （缺父组件就无意义）、`ca-certificates`（与已装的 `ca-bundle` 冗余，两者都
+  PROVIDES `@ca-certs`）。
+
+### 5. 断言补了一个必要分支：TEST 配置必须跳过
+
+第一轮加的断言对**所有**配置生效，但 TEST 配置只叠机型配置、**不叠 `GENERAL.txt`**
+（见 `Custom Settings` 的 if/else）—— 照断会整片误报成"缺 30 个包"。
+已在同一处加 `DEPS_EXPECT` 标记：只有叠加过 GENERAL 的配置才断言，否则打印跳过。
+
+验证（三情形）：`DEPS_EXPECT=1` + 30 个全 `=y` → rc=0；
+故意少一个 → rc=1 并**报出包名**；`DEPS_EXPECT=0` → 跳过且 rc=0。
+标记被改名时提取数为 0 → 由"< 10 即报错"拦下。
+所有新增包名都在真机的 apk 在线索引里核过存在性（避免 kconfig 静默丢弃）。
+
 ## [2026-09-22 · 常见依赖补全] 补 16 个插件常见依赖 + CI 自动断言
 
 触发：装第三方插件时报「依赖缺失 `kmod-inet-diag`」。

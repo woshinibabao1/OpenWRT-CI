@@ -222,8 +222,10 @@ CONFIG_PACKAGE_kmod-nft-xfrm=y
 #   用户态包没有这个问题（可以直接在线装），所以**只有 kmod 必须预置进镜像**。
 #
 # 选包依据（不是"能想到的都加上"）：
-#   ① 与 V0.18 基线做差集：基线装了 113 个 kmod，真机现在 167 个（多数只是版本不同），
-#      其中"基线有、本机确实没有"的 24 个里，属于第三方插件常见依赖的都在下面；
+#   ① 与**两套基线固件**做差集后取**交集**：V0.18（apk 时代）与
+#      Mwrt-H5000M-1139-24（opkg 时代）共有 284 个包，其中我方没有的逐个过了一遍 —
+#      两套不同来源的固件都装，说明不是哪一家的偏好。kmod 部分另与真机逐项核对。
+#      （真机当前 167 个 kmod；两基线都有的那批见下。）
 #   ② 每个符号都在上游源码里逐个核过（immortalwrt master 的
 #      package/kernel/linux/modules/*.mk，共 1188 个 KernelPackage 定义）——
 #      ★ 因为 kconfig 对**不存在或依赖不满足**的符号是**静默丢弃**：写错名字不报错、
@@ -231,13 +233,23 @@ CONFIG_PACKAGE_kmod-nft-xfrm=y
 #   ③ 真机核过这些能力**确实没有**（不是已内建）：/sys/module/inet_diag、
 #      /sys/module/br_netfilter、/sys/module/nft_compat 三个都不存在，
 #      /lib/modules/6.18.52 里也没有对应 .ko —— 所以不是白加；
-#   ④ 明确**不加**的（都属于"别的设备 / 别的场景"）：
-#      kmod-crypto-eip（MTK 老平台加密引擎；本机用 EIP197/safexcel）、
-#      kmod-mt7987-2p5g-phy（本机已由 kmod-phy-mediatek-2p5g 覆盖，只是包名不同）、
-#      kmod-qmi_wwan_f/q/s、kmod-usb-serial-qualcomm、kmod-usb-net-huawei-cdc-ncm
-#      （都是别的模组的驱动；本机 MT5700 走 CDC-NCM/option，通用 QMI 也已编入）、
-#      kmod-nf-ipvs（IPVS 负载均衡，本机不跑）、
-#      kmod-nf-conntrack6（新版已并入 kmod-nf-conntrack，上游没有这个独立包名）。
+#   ⑤ 明确**不加**的 —— 分两类：
+#      (a) 别的设备/别的场景：kmod-crypto-eip（MTK 老平台加密引擎；本机用 EIP197/safexcel）、
+#          kmod-mt7987-2p5g-phy（本机已由 kmod-phy-mediatek-2p5g 覆盖，只是包名不同）、
+#          kmod-qmi_wwan_f/q/s、kmod-usb-serial-qualcomm、kmod-usb-net-huawei-cdc-ncm
+#          （都是别的模组的驱动；本机 MT5700 走 CDC-NCM/option，通用 QMI 也已编入）、
+#          kmod-nf-ipvs（只服务容器编排，本机没有 docker/kube-proxy）、
+#          kmod-nf-conntrack6（新版已并入 kmod-nf-conntrack，上游没有这个独立包名）。
+#      (b) 两基线里属于"产品级选择"或"传递依赖"的，不因基线有就照抄：
+#          docker/containerd/runc/tini/dockerd、taskd/luci-app-store/luci-lib-taskd/
+#          luci-lib-xterm/luci-theme-bootstrap（iStoreOS 应用商店与容器栈）、
+#          miniupnpd-nftables（用户已明确移除 UPnP）、qmodem/sms-tool_q/ubus-at-daemon/
+#          quectel-CM-5G-M/tom_modem（QModem 全家桶，已按方案 B 移除）、opkg（我方用 apk）、
+#          coreutils*/script-utils/mount-utils/libacl/libcap-ng/libsqlite3-0/libpcre2/
+#          libseccomp/libuci-lua/libpcap1/ndisc6（都是别的组件带进来的传递依赖，
+#          没有父组件就无意义）、ca-certificates（与已装的 ca-bundle 冗余，两者都
+#          PROVIDES `@ca-certs`；真需要字面名依赖时再加）。
+#          需要其中任何一项时说一声，单点打开即可。
 #
 # ⚠️ 下面这段被 WRT-CORE.yml 的「常见依赖断言」按**整行标记**自动提取
 #    （`# >>>` 开头的那两行，begin 与 end 之间）：标记区里的每个
@@ -268,6 +280,8 @@ CONFIG_PACKAGE_kmod-nf-ipt6=y
 # 本固件自身用 nft 的 tproxy/set，这两个只为"插件按 iptables 模式跑"时兜底。
 CONFIG_PACKAGE_kmod-ipt-tproxy=y
 CONFIG_PACKAGE_kmod-ipt-ipset=y
+# 与 kmod-ipt-nat6 配套的 IPv6 NAT 后端（两基线都有；某些插件/脚本在 v6 上做 NAT 时声明它）。
+CONFIG_PACKAGE_kmod-nf-nat6=y
 
 # ③ 桥接 / 串口 / 通用依赖兜底
 # br-netfilter：让 netfilter 能过滤**桥接**流量（V0.18 基线上带了它并配套
@@ -280,6 +294,37 @@ CONFIG_PACKAGE_kmod-usb-acm=y
 #   它是**包级依赖**：本机内核把它编成了内建，所以现在功能上有、但 `apk` 找不到
 #   名为 kmod-lib-crc32c 的包，日后有插件声明依赖它时仍会卡住。
 CONFIG_PACKAGE_kmod-lib-crc32c=y
+
+# ④ 用户态配套（2026-09-22 第二轮：以 V0.18 + Mwrt 两个基线的**交集**为准筛出）
+# 判据：两套基线固件都有、而我方没有 —— 两个不同来源的固件都装，说明不是某家的偏好。
+#   xz：★ 这一项是**真缺陷修复**，不是补全 —— 上方「常用工具」区原先写的是
+#       `xz-utils`，而上游 openwrt/packages `utils/xz/Makefile` 里 `Package/xz-utils`
+#       只有 TITLE、**没有 DEPENDS**（空 meta）；真正带二进制的是 `xz`（由模板生成，
+#       `DEPENDS:=xz-utils`，即 xz 会反过来把 meta 拉进来）。真机已证实：`xz-utils`
+#       处于已装状态但 `/usr/bin/xz` **不存在**，该包全部内容只有一个 782 字节的
+#       `lib/apk/packages/xz-utils.list`。两套基线装的都是 `xz`。
+CONFIG_PACKAGE_xz=y
+#   bash：很多第三方插件的脚本是 `#!/bin/bash`（`[[ ]]`、数组、`local -n` 等），
+#         busybox ash 跑不了；"插件装上了但脚本报错"多半是这个。
+CONFIG_PACKAGE_bash=y
+#   jq：脚本/插件解析 JSON 的事实标准（honk 的依赖里就有 jq，本文件 honk 段也留着注释行）。
+CONFIG_PACKAGE_jq=y
+#   wget-ssl：busybox 的 wget 不支持 HTTPS，脚本下载在线资源必用（curl 已有，但很多脚本写死 wget）。
+CONFIG_PACKAGE_wget-ssl=y
+#   tar / unzip / bzip2 + liblzma / libzstd：解包类插件与安装脚本的常见依赖
+#   （下载 geo 数据、释放插件自带资源包都要用；这几项在两套基线里都在）。
+CONFIG_PACKAGE_tar=y
+CONFIG_PACKAGE_unzip=y
+CONFIG_PACKAGE_bzip2=y
+CONFIG_PACKAGE_liblzma=y
+CONFIG_PACKAGE_libzstd=y
+#   iptables 的**用户态**：上一轮补的是内核侧（`xt_*` 模块），但没有任何 iptables 命令
+#   一样跑不起来 —— 两者齐了，"走 iptables 模式的插件"才真能用。这四个是两套基线
+#   都带的组合（`xtables-nft` 提供 libxtables 与 nft 后端，另两个是命令本体与扩展集）。
+CONFIG_PACKAGE_iptables-nft=y
+CONFIG_PACKAGE_ip6tables-nft=y
+CONFIG_PACKAGE_xtables-nft=y
+CONFIG_PACKAGE_iptables-mod-extra=y
 # >>> plugin-deps:end
 
 # 内核模块 - USB 设备
@@ -371,7 +416,9 @@ CONFIG_PACKAGE_exfat-mkfs=y
 CONFIG_PACKAGE_openssh-keygen=y
 CONFIG_PACKAGE_openssh-sftp-server=y
 CONFIG_PACKAGE_openssl-util=y
-CONFIG_PACKAGE_xz-utils=y
+# 压缩工具 xz：原先这里写的是 `xz-utils`，**那是个空 meta 包（装了等于没装）** ——
+# 已换成 `xz` 并移入**上方**的 plugin-deps 标记区，放那里才能被 CI 的「常见依赖断言」
+# 自动覆盖（"配了等于没配"这类问题最该被断言）。详细原因见标记区注释。
 
 # LuCI 基础组件
 CONFIG_PACKAGE_luci-base=y
