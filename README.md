@@ -129,7 +129,7 @@ OpenWRT-CI/
 > 感谢作者为 Hiveton H5000M 及 MT5700M 模组开发的系列核心控制插件，赋予了该设备真正的 5G CPE 灵魂。
 > * 🔗 **主页链接**：[https://github.com/FAN789](https://github.com/FAN789)
 > * 📦 **5G 模组控制**：[luci-app-mt5700m](https://github.com/LianXia233/luci-app-mt5700m)
-> * ❄️ **智能风扇温控**：[luci-app-h5000m-fancontrol](https://github.com/FAN789/luci-app-h5000m-fancontrol)
+> * ❄️ **智能风扇温控**：[luci-app-h5000m-fancontrol](https://github.com/FAN789/luci-app-h5000m-fancontrol)（本固件编的是[其 fork](https://github.com/woshinibabao1/luci-app-h5000m-fancontrol)，仅补上 5G 模组取温，见第二节）
 > * 🔀 **网络模式切换**：[luci-app-h5000m-netmode](https://github.com/LianXia233/luci-app-h5000m-netmode)
 
 ---
@@ -166,9 +166,16 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 ### 2. 硬件级风扇温控 (`luci-app-h5000m-fancontrol`)
 仅 Hiveton H5000M 固件包含此插件。5G 高速传输伴随显著发热，该插件确保设备在满负荷运作下的温控稳定。
 
-* **🌡️ 智能监测**：实时读取 CPU 和 MT5700 模组的双路温度传感器数据。
+* **🌡️ 智能监测**：实时读取 CPU、以太网 PHY、Wi-Fi 射频与 MT5700 模组的温度。
 * **🌀 多档调速**：根据设定的温度阈值（如阈值 A、B、C），自动调节风扇的 PWM 转速百分比，兼顾低负载静音与高负载散热。
 * **🛠️ 自定义配置**：用户可自由调整启动温度、目标温度，打造个性化的散热策略。
+
+> **关于 5G 模组取温（本固件用的是 fork）**：上游版本读 `/var/run/mt5700m/temperature`
+> （别的模组管理软件生成的缓存），本机没有这个文件 —— 模组温度实际上从未参与过取热。
+> 因此本固件改用 [woshinibabao1/luci-app-h5000m-fancontrol](https://github.com/woshinibabao1/luci-app-h5000m-fancontrol)
+> （基于上游 v2.1.0，包名与配置符号不变）：新增经 `ubus call mt5700 at '{"cmd":"AT^CHIPTEMP?"}'`
+> 向 **MT5700 Console 的 Rust 后端**取温的通道（只读，默认 30 秒一次），取到后按上游格式回写缓存。
+> 没有该后端时自动退回旧缓存，不会报错。
 
 ### 3. 网络模式无缝切换 (`luci-app-h5000m-netmode`)
 所有配置均包含此插件，用于应对复杂的网络接入环境（5G 蜂窝与传统有线宽带双接入），提供极简的管理体验。

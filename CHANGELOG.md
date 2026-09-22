@@ -1,5 +1,46 @@
 # 更新日志
 
+## [2026-09-22 · 风扇温控换源] `luci-app-h5000m-fancontrol` 改用自有 fork（补 5G 模组取温）
+
+触发：上游取 5G 模组温度的路在本机是死的（见下），故把编译来源从
+`FAN789/luci-app-h5000m-fancontrol` 换成 `woshinibabao1/luci-app-h5000m-fancontrol`。
+
+### 1. 为什么换：上游那条取温路在本机恒空
+
+上游 `find_module_temp()` 只读 `/var/run/mt5700m/temperature` —— 那是**别的模组管理
+软件**生成的缓存文件。真机取证：`/var/run/mt5700m/` **目录不存在**，`/tmp/cache_*`
+也没有 → `module_temp` 恒为空，**5G 模组温度从未参与过取热**（"最高温度"模式实际
+只看 CPU/PHY/Wi-Fi）。
+
+而本机已有现成通道：`ubus call mt5700 at '{"cmd":"AT^CHIPTEMP?"}'` 直接返回 12 路
+温度（`401,400,396,402,370,370,400,400,400,410,380,380`，单位 0.1℃）。真机对照：
+
+| | 上游版 | fork 版 |
+| :-- | :-- | :-- |
+| `module_temp` | **空** | **41** |
+| `module_sensor` | 无此字段 | **modem2**（第 10 路最热） |
+
+### 2. 改了什么
+
+| 位置 | 改动 |
+| :-- | :-- |
+| `Scripts/Packages.sh` | 克隆源改为 `woshinibabao1/luci-app-h5000m-fancontrol`，并写明换源原因与"仅在编入 `luci-app-mt5700` 时才有意义"的前提 |
+| `Scripts/Packages.sh`（netmode 行） | 保持 `FAN789` 原版；原注释"与风扇控制同源"已不成立，改为说明两者为何不同源 |
+| `README.md` | 致谢链接补 fork；第二节补"5G 模组取温"说明（上游为何取不到、fork 怎么取、取不到时如何回退） |
+
+**包名、Config 符号、UCI 配置文件名全部不变** → `Config/H5000M-WIFI-YES.txt` 的
+`CONFIG_PACKAGE_luci-app-h5000m-fancontrol=y` 与真机升级路径都不受影响。版本由
+上游 2.1.0 升到 fork 的 **2.2.0**。
+
+### 3. 风险与回退
+
+- fork 是公开仓库（`private=false`、`default_branch=main`），CI 走
+  `https://github.com/<repo>.git` 克隆，与其余包同一路径，无额外凭据需求。
+- 新增取温通道**只在能拿到 `ubus mt5700` 时生效**；拿不到就退回旧缓存，
+  不会让风扇凭空加速，也不会报错。
+- 回退：把 `Scripts/Packages.sh` 里该行 repo 改回 `FAN789/...` 即可
+  （会退回"模组温度不参与"的旧行为）。
+
 ## [2026-09-22 · 文案纠偏] Release 说明混进内部笔记 + flow offload 默认值写反
 
 触发：用户看到 Release 页面顶部顶着一个"改文案的理由"标题，问这是什么。

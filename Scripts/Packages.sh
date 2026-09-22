@@ -164,7 +164,16 @@ rm -rf ./packages/sing-box ./packages/luci-app-homeproxy
 # UPDATE_PACKAGE "vnt" "lmq8267/luci-app-vnt" "main"
 
 # FAN789 插件及其他专用硬件插件
-UPDATE_PACKAGE "luci-app-h5000m-fancontrol" "FAN789/luci-app-h5000m-fancontrol" "main"
+# ★ 风扇温控改用**自己的 fork**（woshinibabao1/luci-app-h5000m-fancontrol，基于
+#   FAN789 原版 v2.1.0 → 2.2.0）。包名与 Config 符号（`luci-app-h5000m-fancontrol`）
+#   完全不变，因此 Config 层与真机升级路径都不受影响。
+#   换源的唯一原因：上游取 5G 模组温度只读 `/var/run/mt5700m/temperature`
+#   （别的模组管理软件生成的缓存），本机**根本没有这个文件** → `module_temp` 恒为空，
+#   5G 温度从来没参与过取热。fork 新增一条经 ubus 问 MT5700 Console 的 Rust 后端
+#   （`AT^CHIPTEMP?`，只读）的通道，并按上游格式回写缓存。真机实测：空 → 41℃。
+#   ★ 只有在编译进了 `luci-app-mt5700`（方案 B，提供 `ubus mt5700`）的固件上才有意义；
+#     没有该后端时会自动退回旧缓存，不会报错。
+UPDATE_PACKAGE "luci-app-h5000m-fancontrol" "woshinibabao1/luci-app-h5000m-fancontrol" "main"
 
 # ===== MT5700（方案 B）：luci-app-mt5700 单包（Rust 后端由包内 src/Makefile 编译）=====
 # 该包 Makefile 的 LUCI_DEPENDS 为空，不依赖 sms-tool_q / ubus-at-daemon。
@@ -293,7 +302,10 @@ case "$MT_MODE" in
 		;;
 esac
 
-# H5000M 网络模式切换到 FAN789 原版（与风扇控制同源，避免不同 fork 之间行为不一致）
+# H5000M 网络模式切换：仍用 FAN789 原版（netmode 与模组温度无关，没有要改的地方）。
+# ★ 别把这一行也跟着换成别处 fork —— 原注释写的「与风扇控制同源」已不成立：
+#   风扇温控 2026-09-22 起改用 woshinibabao1 的 fork（见上方），只有 netmode 还在上游。
+#   这里保持上游，是为了让 netmode 与厂家行为一致，避免不同 fork 之间的行为差异。
 UPDATE_PACKAGE "luci-app-h5000m-netmode" "FAN789/luci-app-h5000m-netmode" "main"
 
 #安装 Honk 预编译 APK（避免从源码编译 Rust/eBPF 导致超过 6 小时上限）
