@@ -13,24 +13,41 @@ on:
       WRT_CONFIG:
         required: true
         type: string
+      # ---- 固件身份类默认值：集中在这里，调用方不必逐字重抄 ----
+      # 2026-09-23 收敛：WRT_THEME / WRT_NAME / WRT_SSID / WRT_WORD / WRT_IP /
+      # WRT_PW 这 6 项原本在 WRT-BUILD 与 H5000M-MT-AUTO 里**各抄一遍**（两处字面量
+      # 完全相同）。抄两份的必然结果是改一处漏一处：「改了默认密码，手动编译变了、
+      # 定时自动编译还是旧的」——而这类问题只会在刷完机、拿旧密码连不上时才暴露。
+      # 现在只有**要覆盖默认值的调用方**才需要传；改默认值改这一处，两边同时生效。
+      # （WRT_MARK 同理，它的 default 就在下面。）
+      #
+      # ⚠️ MT_MODE **不在此列**：它的默认必须是 ""（不装任何 MT 插件，保持普通 CI
+      #    行为），而两个调用方都要 MT5700 —— 那是**有意的差异化**，不是重复，
+      #    故仍由调用方显式传。把它的 default 改成 MT5700 会悄悄改变「不传」的语义。
       WRT_THEME:
-        required: true
+        required: false
         type: string
+        default: argon
       WRT_NAME:
-        required: true
+        required: false
         type: string
+        default: OWRT
       WRT_SSID:
-        required: true
+        required: false
         type: string
+        default: OWRT
       WRT_WORD:
-        required: true
+        required: false
         type: string
+        default: '12345678'
       WRT_IP:
-        required: true
+        required: false
         type: string
+        default: 192.168.10.1
       WRT_PW:
-        required: true
+        required: false
         type: string
+        default: '无'
       WRT_REPO:
         required: true
         type: string
@@ -322,10 +339,10 @@ jobs:
           # DEPS_EXPECT：只有"叠加了 GENERAL.txt"的配置才该有下面那批常见依赖。
           # TEST 配置只叠机型配置、不叠 GENERAL，必须跳过断言，否则会整片误报。
           if [[ "${WRT_CONFIG,,}" == *"test"* ]]; then
-            cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt >> .config
+            cat "$GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt" >> .config
             DEPS_EXPECT=0
           else
-            cat $GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt $GITHUB_WORKSPACE/Config/GENERAL.txt >> .config
+            cat "$GITHUB_WORKSPACE/Config/$WRT_CONFIG.txt" "$GITHUB_WORKSPACE/Config/GENERAL.txt" >> .config
             DEPS_EXPECT=1
           fi
           export DEPS_EXPECT
@@ -373,7 +390,10 @@ jobs:
           # ★ 只有叠加了 GENERAL.txt 的配置才断言（见上面 DEPS_EXPECT）：
           #   TEST 配置不叠 GENERAL，若照断会整片误报。
           if [ "${DEPS_EXPECT:-0}" = "1" ]; then
-            DEPS_LIST="$(awk '/^# >>> plugin-deps:begin/{f=1;next} /^# >>> plugin-deps:end/{f=0} f && /^CONFIG_PACKAGE_/ {sub(/=.*/,""); sub(/^CONFIG_PACKAGE_/,""); print}' "$GITHUB_WORKSPACE/Config/GENERAL.txt")"
+            # ★ 标记必须锚到行尾：不加 `[[:space:]]*$` 时 `…:beginX` 也会被当成 begin，
+            #   标记改名后这里照样提取成功 → 断言看似在跑，实际早就失效（与
+            #   Scripts/SelfCheck.sh 的 C6 同一条 awk，两处必须一致）。
+            DEPS_LIST="$(awk '/^# >>> plugin-deps:begin[[:space:]]*$/{f=1;next} /^# >>> plugin-deps:end[[:space:]]*$/{f=0} f && /^CONFIG_PACKAGE_/ {sub(/=.*/,""); sub(/^CONFIG_PACKAGE_/,""); print}' "$GITHUB_WORKSPACE/Config/GENERAL.txt")"
             DEPS_TOTAL="$(printf '%s\n' "$DEPS_LIST" | grep -c . || true)"
             DEPS_MISSING=""
             for dep in $DEPS_LIST; do
@@ -558,24 +578,32 @@ jobs:
             # packages/ 目录仍删（那是 ipk 仓库，不影响刷机）。
             find ./bin/targets/ -iregex ".*\(buildinfo\|json\|packages\)$" -exec rm -rf {} +
 
-            for FILE in $(find ./bin/targets/ -type f -iname "*$WRT_TARGET*") ; do
-              EXT=$(basename $FILE | cut -d '.' -f 2-)
+            # ★ 用 while read 而不是 `for FILE in $(find ...)`：
+            #   后者按空白分词，产物名一旦含空格（上游改文件名模板就可能）会被拆成
+            #   两段，mv 报 "No such file" 且静默丢文件；while read 按行读不受影响。
+            while IFS= read -r FILE; do
+              EXT=$(basename "$FILE" | cut -d '.' -f 2-)
               # P09：grep 无匹配 exit 1，须 || true 吸收，否则 bash -e 下 errexit 让诊断打不出来。
-              NAME=$(basename $FILE | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*" || true)
+              NAME=$(basename "$FILE" | cut -d '.' -f 1 | grep -io "\($WRT_TARGET\).*" || true)
               # R06：NAME 为空时回退 basename 并告警，不 exit——避免 `CONFIG_VERSION_FILENAMES=y`
               # 等正常构建（文件名里无 WRT_TARGET 串）被误杀；只有 WRT_TARGET 那条才硬失败。
               if [ -z "$NAME" ]; then
-                NAME="$(basename $FILE | cut -d '.' -f 1)"
+                NAME="$(basename "$FILE" | cut -d '.' -f 1)"
                 echo "::warning::产物改名未匹配到 WRT_TARGET=$WRT_TARGET，回退用 basename: $NAME"
               fi
               # 文件名嵌入 MT_MODE：同一机型的 MT5700 / MT5700M 产物可并存于同一 Release
               NEW_FILE="$NAME"-"$WRT_INFO"-"$WRT_BRANCH"-"$WRT_MT"-"$WRT_WIFI"-"$WRT_DATE"."$EXT"
-              mv -f $FILE ./upload/$NEW_FILE
-            done
+              mv -f "$FILE" "./upload/$NEW_FILE"
+            done < <(find ./bin/targets/ -type f -iname "*$WRT_TARGET*")
 
             find ./bin/targets/ -type f -exec mv -f {} ./upload/ \;
-
-            make clean -j$(nproc)
+            # 2026-09-23 移除：这里原本还有一句 `make clean -j$(nproc)`。
+            #   ① 无收益 —— 产物在上面两行已全部 mv 进 ./upload/，剩下的 build_dir /
+            #      bin/targets 空壳也不再被任何后续步骤读取（下一步就是上传 Release）；
+            #   ② 有代价 —— 删几十 GB 的小文件要跑一两分钟，纯属浪费机时；
+            #   ③ 是误导 —— clean 是 rm -rf，`-j$(nproc)` 对它没有任何作用，
+            #      看着像并行清理，实际串行，容易让人误以为它很快。
+            #   缓存保存步骤在更前面（Save Caches），删它不影响任何缓存。
           fi
 
       - name: Release Firmware

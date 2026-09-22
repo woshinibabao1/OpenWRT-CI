@@ -65,13 +65,8 @@ jobs:
     uses: ./.github/workflows/WRT-CORE.yml
     with:
       WRT_CONFIG: ${{inputs.CONFIG}}
-      WRT_THEME: argon
-      WRT_MARK: OWrt
-      WRT_NAME: OWRT
-      WRT_SSID: OWRT
-      WRT_WORD: 12345678
-      WRT_IP: 192.168.10.1
-      WRT_PW: 无
+      # 主题 / 版本尾缀 / 主机名 / SSID / 密码 / 管理地址走 WRT-CORE 的 inputs.default，
+      # 这里只传本入口真正会变的值 —— 重复抄一遍只会让「改默认值」变成两处改动。
       WRT_REPO: https://github.com/${{inputs.SOURCE}}.git
       WRT_BRANCH: ${{inputs.BRANCH}}
       WRT_SOURCE: ${{inputs.SOURCE}}

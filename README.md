@@ -60,10 +60,15 @@ OpenWRT-CI/
 │       ├── uci-defaults/99-mt5700-net   # 网络调优（flow offload / TCP / 中断均衡 / 5G 无线）
 │       ├── uci-defaults/99-mt5700-wan   # 补齐 MT5700M 接口、防火墙 wan 区、关 USB autosuspend
 │       ├── uci-defaults/99-mt5700-sys   # zram 512M / 无线 isolate=0 / 国内 NTP
-│       ├── sysctl.d/99-mt5700-tcp.conf  # BBR / fq_codel / TFO / rp_filter=0
+│       ├── uci-defaults/99-mt5700-stability  # 可用性兜底（rpcd 自愈等，不动网络策略）
+│       ├── sysctl.d/99-mt5700-tcp.conf  # BBR / fq / TFO / rp_filter=0
+│       ├── sysctl.d/99-mt5700-conntrack.conf  # 连接跟踪容量（max 10 万）
 │       ├── sysctl.d/99-mt5700-lan.conf  # proxy_arp_pvlan（MLO 跨射频互通）
+│       ├── init.d/mt5700-rps            # 收包软中断多核分摊（RPS/XPS）
+│       ├── init.d/mt5700-smp            # 硬中断亲和（能搬的按负载分到四核）
+│       ├── hotplug.d/net/30-mt5700-rps  # 接口 up 时补设 RPS（无线比 S95 晚 25 秒）
 │       ├── nftables.d/12-mangle-ttl-128.nft  # WAN 出包 TTL/hoplimit 统一为 128
-│       └── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw）
+│       └── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw，默认 off）
 ├── Scripts/                  # 编译前自定义脚本
 │   ├── Packages.sh           # 拉取第三方插件与主题（含 MT 模式条件克隆/折叠）
 │   ├── ApplyMTMode.sh        # 按 MT_MODE 叠加配置层并写入互斥保护
@@ -88,7 +93,10 @@ OpenWRT-CI/
 
 ## ⚙️ 默认配置
 
-固件刷入后默认配置如下（可通过各工作流 `env` 中的 `WRT_*` 变量调整，由 `Scripts/Settings.sh` 在编译时写入）：
+固件刷入后默认配置如下（由 `Scripts/Settings.sh` 在编译时写入）：
+
+- 想改 **SSID / 密码 / 管理地址 / 主机名 / 主题**：改 `WRT-CORE.yml` 里 `workflow_call.inputs` 的 `default`（一处改，手动编译与定时编译**同时生效**；两个调用工作流都不再重复这些值）。
+- 想改 **Wi-Fi 频宽 / 加密 / 国家码**：改 `Scripts/Settings.sh`。
 
 | 项目 | 默认值 |
 | :--- | :--- |
@@ -99,14 +107,15 @@ OpenWRT-CI/
 | 主机名 | `OWRT` |
 | 国家码 | `CN` |
 | 2.4G 频宽 | 40MHz |
-| 5G 频宽 | 80MHz (HE80) |
-| Flow Offload | `auto`（SQM 未启用时开软件卸载；刷机后可在「网络 → 防火墙 → 常规设置」或 uci 改） |
+| 5G 频宽 | 160MHz（EHT160，Wi-Fi 7；仅当雷达检测导致 36-64 起不来时才退回 HE80） |
+| Flow Offload | `off`（**默认关**；刷机后可在「网络 → 防火墙 → 常规设置」或 uci 改） |
 | 时区 | `CST-8`（`Asia/Shanghai`） |
 
 > **Flow Offload 说明**（本固件最易被误解的开关，与 SQM/CAKE 互斥）：
-> 1. 四个取值通过 `WRT-BUILD` 手动页的 `FLOW_OFFLOAD` 选择（`auto` / `off` / `on` / `on-hw`），默认 `auto`；定时自动编译（`H5000M-MT-AUTO`）取默认 `auto`。
-> 2. `auto` 模式先查 SQM 是否启用：启用则关、未启用则开软件卸载，二者只能二选一（被卸载的连接绕过 qdisc，CAKE/HTB 会失效）。
-> 3. `on-hw`（硬件卸载）在本机命中率≈0：本基线无 `mtk_wed`（WiFi 侧硬件转发缺失），且 5G WAN 是 USB CDC-NCM（PPE 管不到 USB 口），开了只会让 nft 计数器看不到流量。
+> 1. 四个取值通过 `WRT-BUILD` 手动页的 `FLOW_OFFLOAD` 选择（`auto` / `off` / `on` / `on-hw`），**默认 `off`**；定时自动编译（`H5000M-MT-AUTO`）同样取 `off`。
+> 2. `auto` 模式先查 SQM 是否启用：启用则关；未启用则**再查固件是否带 TTL 统一规则**（`/etc/nftables.d/*.nft` 含 `ip ttl set`）—— 带就一律关。本固件自带该规则，所以 **`auto` 在这台机器上等价于 `off`**。
+> 3. 为什么默认宁可不开：offload 把连接从 nftables 路径上摘走，TTL 规则对快转包零命中，运营商按「多设备共享」丢弃客户端 TCP 包。真机实测（kernel 6.18.52）：卸载开 → 客户端 HTTP 25s 超时、conntrack 带 `[OFFLOAD]`；卸载关 → 同一请求 HTTP 200 / 1.0s，出口抓到 TTL=128。
+> 4. `on-hw`（硬件卸载）在本机命中率≈0：本基线无 `mtk_wed`（WiFi 侧硬件转发缺失），且 5G WAN 是 USB CDC-NCM（PPE 管不到 USB 口），开了只会让 nft 计数器看不到流量。
 
 <br>
 

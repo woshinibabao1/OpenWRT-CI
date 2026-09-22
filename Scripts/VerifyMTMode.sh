@@ -28,14 +28,9 @@ pkg_selected() {
 	grep -qE "^CONFIG_PACKAGE_${pkg}=[ym]" "$DOT_CONFIG"
 }
 
-pkg_disabled() {
-	local pkg="$1"
-	# 未出现，或显式 =n
-	if grep -qE "^CONFIG_PACKAGE_${pkg}=[ym]" "$DOT_CONFIG"; then
-		return 1
-	fi
-	return 0
-}
+# 2026-09-23 移除 pkg_disabled()：全仓 grep 确认零调用点，且它与 pkg_selected()
+# 只是返回值相反（真值表互补），留着等于同一件事两个家 —— 将来只会有人改一个忘另一个。
+# 需要反向判定时写 `! pkg_selected "$pkg"` 即可，不必再维护一份。
 
 report_pkg() {
 	local pkg="$1"

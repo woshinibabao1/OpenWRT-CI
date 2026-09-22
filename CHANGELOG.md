@@ -1,5 +1,86 @@
 # 更新日志
 
+## [2026-09-23 · 全仓走查] 收敛重复的默认值、新增静态自检闸门（C1~C7）、修 README 四处与代码矛盾
+
+主题仍是**「同一件事只留一个家」**：本仓此前最典型的重复是两个调用工作流把
+7 个固件身份类 input 逐字抄了两遍。
+
+### 1. 7 个 input 下沉到 WRT-CORE（单一真源）
+
+`WRT_THEME` / `WRT_NAME` / `WRT_SSID` / `WRT_WORD` / `WRT_IP` / `WRT_PW` / `WRT_MARK`
+原本在 `WRT-BUILD` 与 `H5000M-MT-AUTO` 里各写一遍（值完全相同）。抄两份的必然结果是
+**改一处漏一处**：改默认密码后手动编译变了、定时编译还是旧的，而这类问题只会在
+刷完机拿旧密码连不上时才暴露，排查时很难想到是编译脚本。现在改 `WRT-CORE` 的
+`inputs.default` 一处即可，两边同时生效。
+
+⚠️ `MT_MODE` **刻意不下沉**：它的默认必须是 `""`（不装 MT 插件，保持普通 CI 行为），
+两个调用方各自传 `MT5700` 属于**有意的差异化**而非重复。把它的 default 改成
+`MT5700` 会悄悄改变「调用方不传」的语义 —— 这条已写进 C7 守卫。
+
+### 2. 新增 `Scripts/SelfCheck.sh` + `.github/workflows/Guard-Check.yml`
+
+本仓此前**没有任何自动化检查**：编译脚本的副作用是拉源码 + 编几小时固件，没法 cheap 地
+跑一遍验证；能 cheap 做的是静态契约检查。七条检查项每条对应一个真踩过的坑：
+
+| 项 | 检查什么 | 出处 |
+| :-- | :-- | :-- |
+| C1 | shell 语法 + 禁 C 风格块注释 | 块注释的 `/*` 会被 glob 展开成 `/` 下文件列表并执行，`bash -n` 查不出 |
+| C2 | workflow YAML 可解析 | YAML 缩进错误在 Actions 里的报错信息极差 |
+| C3 | 调用方不许再抄 WRT-CORE 的 default | 本次 C1 节的重复，防复发 |
+| C4 | 单个 `Config/*.txt` 内 `CONFIG_*` 符号不重复 | kconfig 只认最后一条，前者静默失效 |
+| C5 | `Files/` 覆盖层必须是 LF | CRLF 下 `#!/bin/sh` + CR 找不到解释器，脚本**静默不执行** |
+| C6 | `plugin-deps` 标记区存在且 ≥10 项 | 标记被改名会让 WRT-CORE 的依赖断言退化成恒绿 |
+| C7 | `MT_MODE.default` 必须为空 | 见上 |
+
+闸门独立成 workflow（而非挂进 WRT-CORE）：编译 job 的头几步是装环境 + 拉源码，
+走到能判断配置对错已过去好几分钟；静态检查秒级反馈，也不占用编译的 345 分钟预算。
+
+### 3. README 四处与代码矛盾（会让人按文档排错走偏）
+
+| 位置 | 原写 | 实际 |
+| :-- | :-- | :-- |
+| 默认配置表 | 5G 频宽 `80MHz (HE80)` | `Settings.sh` 改的是 **EHT160**（Wi-Fi 7） |
+| 默认配置表 | Flow Offload `auto` | `WRT_FLOW_OFFLOAD` default 是 **off**，`Files/etc/mt5700/flow-offload` 也是 `MODE=off` |
+| Flow Offload 说明 | 默认 `auto`、定时编译取 `auto` | 同上，且 `auto` 在本机**等价于 `off`**（固件带 TTL 规则，auto 会查到并强制关） |
+| 项目结构树 | `fq_codel`、漏 5 个文件 | `tcp.conf` 是 **fq**；漏列 conntrack.conf / stability / init.d×2 / hotplug |
+
+### 4. 其它
+
+- **打包循环**：`for FILE in $(find …)` 改成 `while IFS= read -r`（前者按空白分词，产物名含空格会被拆成两段并丢文件），相关变量全部加引号。
+- **删 `make clean -j$(nproc)`**（打包步骤末）：产物此时已全部 `mv` 进 `upload/`，剩下的目录不再被任何后续步骤读取；`rm -rf` 几十 GB 是纯浪费机时，而 `-j` 对 `clean` 毫无作用（看着像并行，实际串行）却容易误导。
+- **`plugin-deps` 锚点**：awk 的 `/^# >>> plugin-deps:begin/` 缺行尾锚点，`…:beginX` 也会被当成 begin —— 标记改名后断言照样"通过"（恒绿）。`SelfCheck` 与 `WRT-CORE` 里那份 awk 一起修。
+- `Settings.sh` 的 `sed` 目标加引号；`$WIFI_SH` **刻意不加**（find 可能返回多个路径，需要空白分词），已在注释里写明。
+- 删 `VerifyMTMode.sh` 的 `pkg_disabled()`（全仓零调用点，且与 `pkg_selected()` 真值互补，留着就是同一件事两个家）。
+
+### 本轮新教训（可复用）
+
+1. **★★ 变异验证又抓到三处「守卫自身的缺陷」** —— 只看到「全绿」远不够，这次
+   8 条变异里第一轮就有 2 条没被检出，第二轮还额外暴露了 1 条误报：
+   - `/*` 正则写成 `(^|[[:space:]])/\*` 时，星号不转义是**量词**（"斜杠出现 0 次或多次"）→ 全仓飘红；转义后又发现**锚点太严**（缩进的块注释漏检），退化成"任意位置"又**误报合法 glob**（`/sys/class/net/*/…`、`/etc/nftables.d/*.nft`）。最终用「行首 / 空格后 / tab 后」三条显式 `-e` 分支。
+   - `plugin-deps` 缺 `$` 锚点 → 标记改名被放过（恒绿）。
+   - **不能只跑一次**：修正正则后必须同时看「基线仍绿」和「变异仍红」，两头都要。
+2. **★ Windows 的 Git-Bash grep 有两个致命坑**（写跨 Windows/Linux 的 shell 守卫必看）：
+   - **字符类恒不匹配**：`grep -Ec '^CONFIG_[A-Za-z]+='` → 0，而 `'^CONFIG_[^=]+='` 与 `'^CONFIG_.*='` → 6。`[[:space:]]`、`[[:alnum:]]` 同样失效。写了字符类等于在 Windows 上**恒绿**。
+   - **读文件时剥 CR**：造一个真 CRLF 文件（`printf 'a\r\nb\r\n'`），`grep -c` 照样报 0 → 用 grep 查行尾是**恒绿守卫**。改用 `tr -dc '\r' | wc -c`（字节级，两种环境一致）。
+   - 另：`$'\r'`（ANSI-C quoting）在该 bash 里**不展开**，且命令替换内外行为不一致（同一条命令直接跑得 0、赋给变量得 1）。生成特殊字符一律用 `printf`。
+3. **★ 代理报告的结论必须验证**：本轮两个审查代理都把 `make clean` 判成 P0（"会删掉工具链缓存"）。
+   查 OpenWrt 顶层 `Makefile` 后确认是**误报** —— `_clean` 只删 `$(STAGING_DIR)`（target 子目录），
+   而 `dirclean` 才**额外**删 `$(STAGING_DIR_HOST)`、`targetclean` 才**额外**删 `$(TOOLCHAIN_DIR)`；
+   这两个"额外"正说明 `clean` 不碰 host 与 toolchain，缓存路径 `staging_dir/host*`、`tool*` 安全。
+
+### 已定位、本轮未动
+
+- **fullcone 口径三方不一致**：`Config/GENERAL.txt` 明确 `kmod-nft-fullcone is not set`、
+  四个 uci-defaults 都没有下发 fullcone，但 `FIRMWARE_OPTIMIZATION_REPORT.md` 写
+  「fullcone 在 firewall defaults=1」。二者必有一错，但**裁决需要真机取证**
+  （`uci show firewall` + `nft list ruleset` 看 NAT 是 fullcone 还是 masquerade），
+  不凭文档推测改动 —— 历史上因"两份文档数字打架"而把对的那句改错过一次。
+- `UPDATE_VERSION()`（`Packages.sh`）无调用点但属上游模板函数，保留（理由见 2026-09-21 记录）。
+- `Handles.sh` 里 honk 修补块的 `[ -f "$HONK_FILE" ]` 当前恒为假，是「随
+  `INSTALL_HONK_PREBUILT` 一起启用」的配套修补，刻意保留，注释已说明别删。
+
+---
+
 ## [2026-09-22 · 编译失败修复] 常见依赖断言拦下 3 个包：crc32c 撤销、`xz` 必须与 `xz-utils` 成对
 
 触发：`WRT-BUILD` 在 defconfig 之后的断言步骤失败 ——

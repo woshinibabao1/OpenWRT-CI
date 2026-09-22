@@ -98,12 +98,14 @@ CFG_FILE="./package/base-files/files/bin/config_generate"
 [ -f "$CFG_FILE" ] || { echo "::error::Settings.sh: 未找到 $CFG_FILE —— 默认 IP / 主机名 / 时区都无法写入"; exit 1; }
 
 #修改默认IP地址
-sed -i "s/192\.168\.[0-9]*\.[0-9]*/$WRT_IP/g" $CFG_FILE
+# （$WIFI_SH 那边是**故意**不引：find 可能返回多个路径，要靠空白分词传给 sed；
+#   这里的 $CFG_FILE 是单个确定路径，必须引 —— 路径一旦含空格就会静默 sed 到错误文件。）
+sed -i "s/192\.168\.[0-9]*\.[0-9]*/$WRT_IP/g" "$CFG_FILE"
 #修改默认主机名
-sed -i "s/hostname='.*'/hostname='$WRT_NAME'/g" $CFG_FILE
+sed -i "s/hostname='.*'/hostname='$WRT_NAME'/g" "$CFG_FILE"
 #修改默认时区
-sed -i "s/timezone='.*'/timezone='CST-8'/g" $CFG_FILE
-sed -i "s/zonename='.*'/zonename='Asia\/Shanghai'/g" $CFG_FILE
+sed -i "s/timezone='.*'/timezone='CST-8'/g" "$CFG_FILE"
+sed -i "s/zonename='.*'/zonename='Asia\/Shanghai'/g" "$CFG_FILE"
 
 # 回读校验：判据是"内容真的变了"，不是"sed 没报错"。
 # 本条已真机确认过锚点有效（固件内 /bin/config_generate 实测含
@@ -125,7 +127,7 @@ echo "CONFIG_PACKAGE_luci-app-$WRT_THEME-config=y" >> ./.config
 #引入私有扩展配置
 if [ -f "$GITHUB_WORKSPACE/Config/PRIVATE.txt" ]; then
 	echo "Applying private configurations from PRIVATE.txt..."
-	cat $GITHUB_WORKSPACE/Config/PRIVATE.txt >> ./.config
+	cat "$GITHUB_WORKSPACE/Config/PRIVATE.txt" >> ./.config
 fi
 
 #手动调整的插件

@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026 VIKINGYFY
+
+# 静态自检闸门：在**编译开始之前**用几秒钟拦下契约违规。
+#
+# 为什么不挂在 WRT-CORE 里：
+#   WRT-CORE 的头几步是装编译环境 + 拉源码，走到「能判断配置对不对」已经过去好几分钟；
+#   而下面这些检查全是**仓库本地就能做**的静态检查，独立成 workflow 能秒级反馈，
+#   也不占用编译的 concurrency 组（编译有 345 分钟的超时预算，不该浪费在低级错误上）。
+#
+# 检查项（C1~C7）的说明与出处见 Scripts/SelfCheck.sh，本文件只负责把它跑起来。
+#
+# ⚠️ 覆盖边界：本闸门只在 push / PR / 手动时跑。定时链（Auto-Clean → H5000M-MT-AUTO）
+#    触发的编译用的是**已经合入 main** 的配置，那时 push 闸门早已跑过；
+#    真要临时绕过，用 workflow_dispatch 手动触发编译即可，不必改这个文件。
+name: Guard-Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selfcheck:
+    name: Static Contracts (C1-C7)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Projects
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install PyYAML
+        run: |
+          # SelfCheck 的 C2/C3/C7 要解析 workflow YAML。runner 自带 python3，
+          # 但**默认没有 PyYAML** —— 缺了它脚本会把这三条降级成 skip 而不是判红，
+          # 于是「YAML 写坏了」照样一路绿灯。所以在这里显式装，并在下一步验证真能 import。
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-yaml
+
+      - name: Verify PyYAML
+        run: |
+          python3 -c "import yaml; print('PyYAML', yaml.__version__)" \
+            || { echo "::error::PyYAML 不可用，C2/C3/C7 会被静默跳过（守卫失效）"; exit 1; }
+
+      - name: Run SelfCheck
+        # 用 bash 显式调用：Scripts/*.sh 在 git 索引里是 100644（无 exec 位），
+        # 直接执行在部分 runner 上会 Permission denied（与 WRT-CORE 同一处理）。
+        run: bash Scripts/SelfCheck.sh

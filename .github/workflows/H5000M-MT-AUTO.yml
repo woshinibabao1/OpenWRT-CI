@@ -60,16 +60,8 @@ jobs:
     uses: ./.github/workflows/WRT-CORE.yml
     with:
       WRT_CONFIG: ${{ matrix.CONFIG }}
-
-      WRT_THEME: argon
-      # 固件版本尾缀：状态页显示 "… / OWrt-26.09.15-17.00.22"
-      WRT_MARK: OWrt
-      WRT_NAME: OWRT
-      WRT_SSID: OWRT
-      WRT_WORD: 12345678
-      WRT_IP: 192.168.10.1
-      WRT_PW: 无
-
+      # 主题 / 版本尾缀 / 主机名 / SSID / 密码 / 管理地址走 WRT-CORE 的 inputs.default，
+      # 这里只传本入口真正会变的值（与 WRT-BUILD 同一套默认，改一处两边同时生效）。
       WRT_REPO: https://github.com/${{ matrix.SOURCE }}.git
       WRT_BRANCH: ${{ matrix.BRANCH }}
       WRT_SOURCE: ${{ matrix.SOURCE }}
