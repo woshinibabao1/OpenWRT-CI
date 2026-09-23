@@ -267,6 +267,20 @@ else
 	# 只看非注释行：注释里提到这个名字不算「启用」
 	ENA_N="$(awk '/^#/ { next } /apk-index-cache/ && /enable/ { n++ } END { print n+0 }' Files/etc/uci-defaults/* 2>/dev/null)"
 	[ "${ENA_N:-0}" -ge 1 ] || fail "C8 Files/etc/uci-defaults/ 里没有对 apk-index-cache 执行 enable：OpenWrt 不会自动启用 init.d 下的文件，脚本会在固件里躺着不动"
+
+	# ③ 入库文件模式必须是 100755：git 不继承本机的 exec 位，
+	#   在不同机器上创建的文件会默默变成 100644。
+	#   虽然 Packages.sh 会按 shebang 兜底 chmod，但仓库内保持一致
+	#   才能让人一眼看出“这是可执行文件”（现有的
+	#   mt5700-rps / mt5700-smp 都是 100755）。
+	if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+		APK_MODE="$(git ls-files -s "$APK_INIT" 2>/dev/null | awk '{print $1}')"
+		if [ -n "$APK_MODE" ] && [ "$APK_MODE" != "100755" ]; then
+			fail "C8 $APK_INIT 入库模式是 $APK_MODE（应 100755）。修法：git update-index --chmod=+x $APK_INIT"
+		fi
+	else
+		echo "  skip  不在 git 工作树内，跳过文件模式检查"
+	fi
 fi
 [ "$FAIL" -eq "$N" ] && pass "apk 索引缓存持久化：脚本存在、有 START=、已被 uci-defaults 启用"
 
