@@ -91,4 +91,23 @@ if uci -q get system.ntp >/dev/null 2>&1; then
 	uci -q commit system
 fi
 
+# ---------- 5. apk 索引缓存持久化：启用 apk-index-cache ----------
+# 症状：每次重启后 LuCI「系统 → 软件」都用不了 —— 可用包列表是空的、点安装/卸载
+#   失败，必须先手动点一次右上角「Update lists…」。
+# 根因：/var 是 tmpfs（真机 `readlink -f /var` 输出 /tmp），而 apk 的索引缓存目录
+#   /var/cache/apk 就在里面 —— 索引只活在内存里，重启必丢；丢了 apk 还不会自动补
+#   （实测：缓存为空时 `apk list -a` 返回 0 且不联网拉取，页面拿到空数组却不报错）。
+# 修法：apk-index-cache（START=96）每次开机把 /var/cache/apk 换成指向 overlay 持久
+#   目录 /usr/share/apk/cache 的软链，并在索引不齐时后台补一次 update。
+#   论证与实测数据写在该文件头部；SelfCheck 的 C8 负责守住这条启用链。
+#
+# ⚠️ 这一步不能省：Files/ 覆盖层只负责**把文件放进固件**，OpenWrt 不会因为它躺在
+#   /etc/init.d/ 下就自动启用 —— 少这一步，脚本在固件里却永不执行，故障照旧，
+#   而排查时几乎不会想到「脚本其实从来没跑过」。
+if [ -x /etc/init.d/apk-index-cache ]; then
+	chmod 0755 /etc/init.d/apk-index-cache 2>/dev/null
+	/etc/init.d/apk-index-cache enable 2>/dev/null || true
+	logger -t mt5700-sys "已启用 apk-index-cache（apk 索引跨重启保留，软件页不再每次都要手动 Update lists）"
+fi
+
 exit 0

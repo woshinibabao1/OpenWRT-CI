@@ -51,6 +51,7 @@ OpenWRT-CI/
 │   ├── H5000M-MT-AUTO.yml    # 自动编译 H5000M（MT5700）
 │   ├── Auto-Clean.yml        # 清理旧 Release / 运行记录
 │   └── Cache-Clean.yml       # 清理编译缓存
+│   └── Guard-Check.yml       # 静态自检闸门（跑 Scripts/SelfCheck.sh，编译前先自查）
 ├── Config/                   # 编译配置
 │   ├── GENERAL.txt           # 全设备通用插件与内核配置（不含 MT 插件）
 │   ├── MT5700.txt            # MT5700 独立插件层（方案 B）
@@ -66,6 +67,7 @@ OpenWRT-CI/
 │       ├── sysctl.d/99-mt5700-lan.conf  # proxy_arp_pvlan（MLO 跨射频互通）
 │       ├── init.d/mt5700-rps            # 收包软中断多核分摊（RPS/XPS）
 │       ├── init.d/mt5700-smp            # 硬中断亲和（能搬的按负载分到四核）
+│       ├── init.d/apk-index-cache       # apk 索引缓存持久化（软件页重启后不必手动 Update lists）
 │       ├── hotplug.d/net/30-mt5700-rps  # 接口 up 时补设 RPS（无线比 S95 晚 25 秒）
 │       ├── nftables.d/12-mangle-ttl-128.nft  # WAN 出包 TTL/hoplimit 统一为 128
 │       └── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw，默认 off）
@@ -77,6 +79,7 @@ OpenWRT-CI/
 │   ├── VerifyNoSingBox.sh    # 编译前后双断言 sing-box / homeproxy 未编入
 │   ├── Handles.sh            # feeds 源码修补（主题配色 / 组件冲突 / 软件页安装行为）
 │   └── Settings.sh           # 默认 IP / 主机名 / Wi-Fi / 主题
+│   └── SelfCheck.sh          # 编译前静态自检（C1~C9，见 CHANGELOG 顶部清单）
 ├── LICENSE
 └── README.md
 ```

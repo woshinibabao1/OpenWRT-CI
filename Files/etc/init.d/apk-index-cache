@@ -1,0 +1,138 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: MIT
+# apk 索引缓存持久化 —— 让 LuCI「系统 → 软件」页在重启之后仍然可用
+#
+# ── 症状（2026-09-23 真机复现）────────────────────────────────────────
+#   每次重启后打开「系统 → 软件」：可用包列表是空的，点安装 / 卸载会失败，
+#   必须先手动点一次右上角「Update lists…」才恢复正常。
+#
+# ── 根因 ──────────────────────────────────────────────────────────────
+#   OpenWrt 的 /var 是 tmpfs（真机 `readlink -f /var` 输出 /tmp），而 apk 的
+#   索引缓存目录正是 /var/cache/apk —— **索引只活在内存里，重启必丢**。
+#   把该目录挪走后的实测结果：
+#     · 页面取「可用包」的接口直接返回空数组（HTTP 200，body 只有 4 字节 `[ ]`）；
+#     · 任何 apk 操作先甩 6 条 `WARNING: opening from cache … No such file or directory`。
+#   ★ 空缓存时 apk **不会**自动把索引拉回来：`apk update --help` 说的是「索引
+#     过期后会自动刷新」，那是对**已存在**的条目而言；条目压根不存在时它把这个
+#     仓库当成空的，于是列表为空且不报错 —— 这正是故障现象难以归因的原因。
+#
+# ── 修法 ──────────────────────────────────────────────────────────────
+#   把 /var/cache/apk 换成指向 overlay 持久目录的**软链**。选软链而不是给所有
+#   调用方加 `--cache-dir`（apk 确实有这个全局选项）是因为：
+#     · 对本服务的调用方完全透明：LuCI 软件页、rpcd 的 package-manager-call、
+#       命令行敲 apk 三条路都不用改，谁也不需要先知道这条约定的存在；
+#     · 6 条 APKINDEX 合计约 1.5MB（真机 `du -sk` = 1468），放进 overlay 可接受；
+#     · 之后用户在软件页点一次 Update lists 的效果**跨重启保留**；
+#     · 做成软链而非「开机把索引从持久目录拷回 /var」：拷贝会在每次开机多做一遍
+#       1.5MB 的读改写，且 apk 之后写回的是 tmpfs，重启还是丢。
+#   首次开机（持久缓存还是空的）时后台补一次 update，不必等用户手动点。
+#
+# ── 边界 ──────────────────────────────────────────────────────────────
+#   · 只做「建软链 + 补一次索引」两件事：不改任何软件源、不动任何已装包，
+#     随时 `/etc/init.d/apk-cache disable` 即回到原行为；
+#   · sysupgrade 会丢弃这个持久目录（不在配置保留列表里）——可接受，下次联网
+#     自动补回；刻意不把它加进 /etc/sysupgrade.conf，因为跨版本保留旧索引会让
+#     软件页列出一批已经不存在的包，比留空更误导；
+#   · 这里**不做**周期性 update：索引会自然过期，而 apk 在 cache-max-age 到期时
+#     会自己联网刷新。周期拉列表既白烧流量，又会在用户没要求时反复占用 WAN。
+
+START=96
+STOP=10
+
+PERSIST_DIR='/usr/share/apk/cache'
+APK_CACHE='/var/cache/apk'
+
+log() {
+	logger -t apk-index-cache "$1"
+}
+
+# wc -l 的输出在某些 shell 里带前导空格，一律用 tr 抹掉空白再参与数值比较
+# （本仓 SelfCheck.sh 的 C5 也踩过同一条：直接拿 wc 的原输出比大小会炸）
+count_lines() {
+	tr -d '[:space:]'
+}
+
+# 已配源的条数（注释行与空行不算；customfeeds.list 默认全是注释 → 0）
+repo_count() {
+	grep -hE '^(https?|/)' /etc/apk/repositories.d/*.list 2>/dev/null | grep -c . | count_lines
+}
+
+# 缓存里已有几条索引
+index_count() {
+	ls "$PERSIST_DIR"/APKINDEX.* 2>/dev/null | wc -l | count_lines
+}
+
+# 缓存是否算「齐了」
+# ★ 必须是**条数比对**，不能用「有没有 APKINDEX.*」这种有无判定：
+#   首次那次后台 update 若只成功一部分（例如 6 个源只到位 4 个），有无判定会认为
+#   已经就绪；而 apk 只在索引**过期**时才自动联网刷新，对**缺失**的条目不补
+#   （实测：缓存全空时 `apk list -a` 返回 0 且不会联网拉）。缺的那个源就再也
+#   不会自动补齐 —— 现象是「某个 feed 的包在软件页搜不到」，且极难怀疑到这里。
+cache_complete() {
+	local want have
+	want="$(repo_count)"
+	[ "$want" -gt 0 ] || return 0
+	have="$(index_count)"
+	[ "$have" -ge "$want" ]
+}
+
+start() {
+	mkdir -p "$PERSIST_DIR" 2>/dev/null || {
+		log "无法创建 $PERSIST_DIR（只读文件系统？），保持 apk 原行为"
+		return 1
+	}
+
+	# ---- 1. 把 /var/cache/apk 换成指向持久目录的软链 --------------------------
+	# 三种起始状态都要落到同一个结果，且必须幂等（本脚本每次开机都会跑一遍）：
+	#   ① 已经是想要的软链  → 什么都不做
+	#   ② 真目录（里面可能有比本脚本更早拉到的索引）→ 先搬过去，再替换
+	#   ③ 不存在 / 是条坏链接 → 直接换
+	# ★ ②的判定必须先排除软链：`[ -d ]` 对「指向目录的软链」同样为真，
+	#   不排就会走到 rm -rf 那条分支 —— 虽然 rm -rf 不带斜杠时不删目标内容，
+	#   但会把好不容易持久化的目录当普通目录反复 cp 一遍。
+	if [ "$(readlink "$APK_CACHE" 2>/dev/null)" = "$PERSIST_DIR" ]; then
+		:
+	elif [ -d "$APK_CACHE" ] && [ ! -L "$APK_CACHE" ]; then
+		cp -a "$APK_CACHE"/. "$PERSIST_DIR"/ 2>/dev/null
+		rm -rf "$APK_CACHE" 2>/dev/null
+		ln -sfn "$PERSIST_DIR" "$APK_CACHE" 2>/dev/null
+		log "已把内存中的索引搬入 $PERSIST_DIR，并改为软链"
+	else
+		rm -f "$APK_CACHE" 2>/dev/null
+		ln -sfn "$PERSIST_DIR" "$APK_CACHE" 2>/dev/null
+	fi
+
+	if [ ! -L "$APK_CACHE" ]; then
+		log "软链创建失败，未改动 apk 行为（软件页将在下次重启后需要手动 Update lists）"
+		return 1
+	fi
+
+	# ---- 2. 索引缺失时补一次（首次开机 / 长期离线之后）------------------------
+	# 后台 + 延迟是为了两件事：S96 时 WAN 通常还没起来（本固件 WAN 是 USB 5G 模组，
+	# 起得更慢）；以及绝不能让一次网络往返拖慢开机。
+	# 失败也没关系：本脚本每次开机都会重跑，「不全」的状态不会自锁。
+	if ! cache_complete; then
+		log "索引不完整（$(index_count)/$(repo_count) 条源），30 秒后后台执行一次 apk update"
+		(
+			sleep 30
+			if apk update >/dev/null 2>&1; then
+				logger -t apk-index-cache "索引已就绪，软件页可直接安装/卸载"
+			else
+				logger -t apk-index-cache "apk update 失败（多半是此刻还没联网），软件页仍可手动 Update lists"
+			fi
+		) &
+	fi
+
+	return 0
+}
+
+stop() {
+	# rm 不带斜杠：即便这时它已经是真目录，也不会去删持久目录里的内容
+	rm -f "$APK_CACHE" 2>/dev/null
+	log "已移除缓存软链，apk 回到每次重启即失效的默认行为"
+}
+
+restart() {
+	stop
+	start
+}

@@ -16,6 +16,7 @@
 #   C5 Files/ 覆盖层必须是 LF
 #   C6 plugin-deps 标记区存在且条目数达标
 #   C7 MT_MODE 的 default 必须保持空
+#   C8 apk 索引缓存持久化：文件 / START= / enable 三者齐备
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -237,6 +238,68 @@ if [ "${DEPS_N:-0}" -lt 10 ]; then
 	fail "C6 Config/GENERAL.txt 的 plugin-deps 区只提取到 ${DEPS_N:-0} 个包（应 >= 10）—— 标记被改动会让 WRT-CORE 的依赖断言变成恒绿"
 else
 	[ "$FAIL" -eq "$N" ] && pass "plugin-deps 区提取到 ${DEPS_N} 个包"
+fi
+
+# ---------- C8：apk 索引缓存持久化的启用链 ----------
+# 出处：2026-09-23 真机 —— LuCI「系统 → 软件」页**每次重启之后**都用不了，
+#   必须手动点一次「Update lists…」才恢复。根因是 apk 的索引缓存目录
+#   /var/cache/apk 位于 tmpfs 的 /var（真机 `readlink -f /var` 输出 /tmp），
+#   索引随重启蒸发；而空缓存时 apk **不会**自动补拉（实测 `apk list -a` 返回 0
+#   且不联网），于是页面拿到空数组却不报错 —— 现象和归因之间隔了三层。
+#   修法落在 Files/etc/init.d/apk-index-cache，但**文件进了固件 ≠ 会被执行**，
+#   下面三件事缺一件都是**静默失效**：固件照出、能刷、能开机，只有软件页不可用。
+#     ① 首行是 shebang —— Packages.sh 靠它判定要不要 +x，没有就当成普通文本，
+#        留在固件里是 0644，enable 会失败；
+#     ② 声明了 START= —— rc.common 靠它排开机顺序，没有就压根不进启动序列；
+#     ③ uci-defaults 里有**非注释**行对它 enable —— OpenWrt 不会因为它躺在
+#        /etc/init.d/ 下就自动启用。
+echo "-- C8 apk 索引缓存持久化"
+N=$FAIL
+APK_INIT="Files/etc/init.d/apk-index-cache"
+if [ ! -f "$APK_INIT" ]; then
+	fail "C8 缺少 $APK_INIT —— 没有它，每次重启后 LuCI 软件页都得手动 Update lists 才能用"
+else
+	# ★ 用 awk 而不是 grep：MSYS / Git-Bash 的 grep 对**字符类**（[[:space:]] 这类）
+	#   匹配恒失败，写成 grep 会让这条守卫在 Windows 上**恒绿**（本文件 C1 已踩过同一条）。
+	[ "$(head -c 2 "$APK_INIT")" = '#!' ] || fail "C8 $APK_INIT 首行不是 shebang：Packages.sh 按 shebang 判 +x，缺了它文件会以 0644 进固件、enable 直接失败"
+	START_N="$(awk '/^#/ { next } /^START=/ { n++ } END { print n+0 }' "$APK_INIT")"
+	[ "${START_N:-0}" -ge 1 ] || fail "C8 $APK_INIT 没有 START=：rc.common 排不进开机序列，等于没写"
+	# 只看非注释行：注释里提到这个名字不算「启用」
+	ENA_N="$(awk '/^#/ { next } /apk-index-cache/ && /enable/ { n++ } END { print n+0 }' Files/etc/uci-defaults/* 2>/dev/null)"
+	[ "${ENA_N:-0}" -ge 1 ] || fail "C8 Files/etc/uci-defaults/ 里没有对 apk-index-cache 执行 enable：OpenWrt 不会自动启用 init.d 下的文件，脚本会在固件里躺着不动"
+fi
+[ "$FAIL" -eq "$N" ] && pass "apk 索引缓存持久化：脚本存在、有 START=、已被 uci-defaults 启用"
+
+# ---------- C9：README 项目结构树不得漏列实际文件 ----------
+# 出处：2026-09-23 上一轮人工修过 6 处「README 与代码矛盾」，但那种比对是**一次性**的、
+#   没有记忆 —— 同一轮里新增的 SelfCheck.sh 与 Guard-Check.yml 就都没进结构树，
+#   本轮的 apk-index-cache 要不是先写这条守卫也会漏。同一个坑踩到第三次，交给机器。
+#
+# 判据：Scripts/*.sh、Files/etc/**、.github/workflows/*.yml 里真实存在的每个文件，
+#   其文件名都必须出现在 README.md 的结构树中。
+#   ★ 按 **basename** 而不是相对路径比对：README 的树里写作 `init.d/mt5700-rps`
+#     这种带父目录的短名，按完整路径比对会全量误报。
+echo "-- C9 README 结构树完整性"
+N=$FAIL
+MISS=""
+CNT=0
+for F in $(find Scripts -maxdepth 1 -type f -name '*.sh' | sort) \
+	$(find Files/etc -type f | sort) \
+	$(find .github/workflows -type f -name '*.yml' | sort); do
+	B="${F##*/}"
+	CNT=$(( CNT + 1 ))
+	grep -qF "$B" README.md || MISS="$MISS $B"
+done
+# ★ 「扫到多少个」本身也要断言（与 C6 同一道防线）：find 的目标目录一旦改名或
+#   失效，for 循环一轮都不进 —— CNT=0、MISS 恒为空，这条守卫就退化成**永远通过**，
+#   而它恰恰是最后一道防止「文档与代码又一次走散」的检查。
+if [ "${CNT:-0}" -lt 20 ]; then
+	fail "C9 只扫描到 ${CNT:-0} 个脚本/覆盖层/workflow（应 >= 20）—— find 目标变了会让本条守卫退化成恒绿"
+fi
+if [ -n "$MISS" ]; then
+	fail "C9 README 项目结构树漏列：$MISS —— 「新增了文件却忘了同步文档」正是文档与代码矛盾的复发入口"
+else
+	[ "$FAIL" -eq "$N" ] && pass "README 结构树覆盖了全部 Scripts / Files/etc / workflow"
 fi
 
 echo "===== SelfCheck 结束 ====="
