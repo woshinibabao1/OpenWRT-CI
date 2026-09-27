@@ -253,6 +253,14 @@ fi
 #     ② 声明了 START= —— rc.common 靠它排开机顺序，没有就压根不进启动序列；
 #     ③ uci-defaults 里有**非注释**行对它 enable —— OpenWrt 不会因为它躺在
 #        /etc/init.d/ 下就自动启用。
+#     ④ 为软链的**目标父目录**建过目录 —— 本固件 /var 是指向 /tmp 的**软链**，
+#        /tmp 是 tmpfs，**每次开机 /var/cache 都不存在**；此时
+#        `ln -sfn /usr/share/apk/cache /var/cache/apk` 直接 rc=1
+#        （真机实测 `No such file or directory`），整支脚本当场 return 1，
+#        连「后台补一次索引」都不执行 —— 只留一行日志，行为与没装它一样。
+#        ★ 2026-09-23 首版就是缺这一条，而当时的验证是绿的：复位步骤把
+#          /var/cache/apk 留成了空目录，父目录被测试装置顺便建好了。
+#          「在错误的前提下验证通过」→ 所以这条必须交给机器。
 echo "-- C8 apk 索引缓存持久化"
 N=$FAIL
 APK_INIT="Files/etc/init.d/apk-index-cache"
@@ -281,8 +289,20 @@ else
 	else
 		echo "  skip  不在 git 工作树内，跳过文件模式检查"
 	fi
+
+	# ④ 必须为软链的**目标父目录**建目录（见上方 C8 注释 ④）。
+	#   ★ 判据锚在 `dirname ... APK_CACHE` 上，而不是写死 /var/cache/apk：
+	#     写死的话，哪天有人改了 $APK_CACHE 的取值，守卫会跟着代码一起走偏、
+	#     继续报绿 —— 「守卫与实现各自漂移」是本仓 C6/C9 反复踩过的坑。
+	#     代价是这条属于**结构性钉死**：若将来重构这行，守卫必须同步改
+	#     （与①②③同性质，均无法在 CI 里跑真机）。
+	if [ "$(awk '/^[[:space:]]*#/ { next } /mkdir/ && /dirname/ && /APK_CACHE/ { n++ } END { print n+0 }' "$APK_INIT")" -ge 1 ]; then
+		:
+	else
+		fail "C8 $APK_INIT 没有为软链目标的父目录 mkdir -p：“/var” 是指向 tmpfs 的软链，开机时 /var/cache 不存在，ln 会失败 —— 脚本进固件、被 enable、却只留一行日志，apk 行为与没装它一样"
+	fi
 fi
-[ "$FAIL" -eq "$N" ] && pass "apk 索引缓存持久化：脚本存在、有 START=、已被 uci-defaults 启用"
+[ "$FAIL" -eq "$N" ] && pass "apk 索引缓存持久化：脚本存在、有 START=、已被 uci-defaults 启用、已为软链父目录建目录"
 
 # ---------- C9：README 项目结构树不得漏列实际文件 ----------
 # 出处：2026-09-23 上一轮人工修过 6 处「README 与代码矛盾」，但那种比对是**一次性**的、

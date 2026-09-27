@@ -82,6 +82,23 @@ start() {
 		return 1
 	}
 
+	# ★★★ 链接目标的**父目录**也必须先建出来 —— 少了这一步整支脚本等于没写。
+	#   本固件 /var 是指向 /tmp 的**软链**（真机 `ls -ld /var` → `var -> tmp`），
+	#   而 /tmp 是 tmpfs：**每次开机 /var/cache 都不存在**。此时
+	#       ln -sfn /usr/share/apk/cache /var/cache/apk
+	#   直接失败（真机实测 `ln: /var/cache/apk: No such file or directory`，rc=1），
+	#   于是软链建不成、下面 `[ ! -L "$APK_CACHE" ]` 当场 return 1，
+	#   连「后台补一次索引」都不会执行 —— 症状是脚本在固件里、被 enable、
+	#   每次开机只留一行 `软链创建失败`，apk 行为与没装它完全一致。
+	#   2026-09-23 首次验证之所以全绿，是因为当次复位步骤把 /var/cache/apk 留成了
+	#   一个**空目录**（走 else-if 的搬迁分支），父目录被我自己的测试装置顺便建好了。
+	#   → 教训：验证这类脚本必须**从真正的空 tmpfs 起步**，
+	#     不能留着上一次运行留下的父目录。
+	mkdir -p "$(dirname "$APK_CACHE")" 2>/dev/null || {
+		log "无法创建 $(dirname "$APK_CACHE")，保持 apk 原行为"
+		return 1
+	}
+
 	# ---- 1. 把 /var/cache/apk 换成指向持久目录的软链 --------------------------
 	# 三种起始状态都要落到同一个结果，且必须幂等（本脚本每次开机都会跑一遍）：
 	#   ① 已经是想要的软链  → 什么都不做
@@ -115,10 +132,15 @@ start() {
 		log "索引不完整（$(index_count)/$(repo_count) 条源），30 秒后后台执行一次 apk update"
 		(
 			sleep 30
-			if apk update >/dev/null 2>&1; then
+			# ★ 失败时**不猜原因**，把 apk 的原话记下来。
+			#   首版这里写的是「多半是此刻还没联网」—— 2026-09-27 真机实测，
+			#   当时真实的失败原因是**数据库锁被占用**（另一支 apk update 尚未退出，
+			#   `ERROR: Unable to lock database: Resource temporarily unavailable`），
+			#   与网络毫无关系。带着一个错误的结论去排障，会让人白查一遍 WAN。
+			if ERR="$(apk update 2>&1)"; then
 				logger -t apk-index-cache "索引已就绪，软件页可直接安装/卸载"
 			else
-				logger -t apk-index-cache "apk update 失败（多半是此刻还没联网），软件页仍可手动 Update lists"
+				logger -t apk-index-cache "apk update 未成功，apk 原话：$(printf '%s' "$ERR" | tr '\n' ' ' | cut -c1-200)"
 			fi
 		) &
 	fi

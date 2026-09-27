@@ -1,5 +1,94 @@
 # 更新日志
 
+## [2026-09-27] 修 apk-index-cache：软链从来就没建成过（脚本进了固件、被 enable，却什么都没做）
+
+起因是用户问「你是不是改了我的 apk 源」。**核查结论：源一行都没动。**
+
+| 核查点 | 结果 |
+| :-- | :-- |
+| 仓库 HEAD / 工作区 | `f38b4ae`（2026-09-23 14:56）· 干净 · 无 stash · 无其它分支领先 |
+| GitHub 远端 main | `f38b4aee87fab2d4a630d6bcfe36190438f81539`（API 核对，与本地同一 SHA） |
+| 仓内 `repositories.d` / `distfeeds` 字样 | **全部出现在注释与文档里**；唯一功能性代码是一句**只读** `grep` 数源条数 |
+| 真机 `/etc/apk/repositories.d/` | `distfeeds.list` 仍是原厂 6 条 immortalwrt snapshot 源；`customfeeds.list` 只有注释 |
+| 编译上游源 `immortalwrt/immortalwrt` | 2026-08-29 由 LianXia233 切换，与本次无关 |
+
+但顺着这条线复查 2026-09-23 上线的 `apk-index-cache`，**发现它自上线起每一次开机都失败** ——
+等于没生效。所以「改回原样」在行为上其实早就成立了，只是仓里多了一段不工作的代码。
+
+### 1. 根因：少建了一层父目录
+
+真机（2026-09-27）：
+
+```
+logread          →  user.notice apk-index-cache: 软链创建失败，未改动 apk 行为
+/usr/share/apk/cache  →  空                # 持久目录里一个索引都没有
+/var/cache/apk        →  真目录（不是软链） # 这个目录是 apk 自己建的
+/etc/rc.d/S96apk-index-cache  →  存在      # 脚本确实进了固件、确实被 enable
+```
+
+`ls -ld /var` → `var -> tmp`：**本固件 /var 是指向 /tmp 的软链**，而 /tmp 是 tmpfs，
+于是**每次开机 /var/cache 都不存在**。设备上的对照实验：
+
+```
+父目录 /var/cache 存在   → ln -sfn rc=0，软链建成
+父目录 /var/cache 不存在 → ln: /var/cache/apk: No such file or directory，rc=1
+```
+
+脚本只 `mkdir -p` 了持久目录，**没建链接目标的父目录** `/var/cache`。ln 一失败，
+下面 `[ ! -L "$APK_CACHE" ]` 当场 `return 1` —— 连「后台补一次索引」都不会执行。
+
+### 2. 为什么 09-23 我的验证是绿的（教训）
+
+当次复位步骤是「清持久目录 + 把 `/var/cache/apk` 留成**空目录**」→ 走搬迁分支：
+cp → `rm -rf /var/cache/apk` → `ln`。而此时 `/var/cache` **因为我刚建过 apk 目录而必然存在**
+—— 失败的前置条件被测试装置自己消掉了。**「在错误的前提下验证通过」**，
+所以这次把这条判据交给机器（C8-④）。
+
+### 3. 改动
+
+| 位置 | 改动 |
+| :-- | :-- |
+| `Files/etc/init.d/apk-index-cache` | `start()` 补 `mkdir -p "$(dirname "$APK_CACHE")"`；后台 update 失败时**不再猜原因**，改为逐字记录 apk 原话 |
+| `Scripts/SelfCheck.sh` | C8 增加第 ④ 项：必须为软链的父目录建目录（锚在 `dirname … APK_CACHE` 上，不写死 `/var/cache/apk`，免得守卫跟着代码各自漂移） |
+
+★ 顺带修掉一处**无依据归因**：原本失败日志写「多半是此刻还没联网」，
+真机实测真实原因是**数据库锁被占用**（另一支 `apk update` 尚未退出
+→ `ERROR: Unable to lock database: Resource temporarily unavailable`），与网络毫无关系。
+带着一个错误结论去排障，会让人白查一遍 WAN。
+
+### 4. 真机验证（A/B + 重启模拟，非推测）
+
+从**真正的空 tmpfs** 起步（`/var/cache` 不存在，这正是 09-23 漏掉的前置条件）：
+
+| 步骤 | 旧版（09-23 那版） | 修复版 |
+| :-- | :-- | :-- |
+| `start` 返回码 | **rc=1** | **rc=0** |
+| `/var/cache/apk` | 不存在（故障复现） | `-> /usr/share/apk/cache` |
+| 日志 | `软链创建失败` | `索引不完整（0/6 条源）…` |
+
+重启模拟（抹掉 `/var/cache` = 真机重启后的状态）：
+
+| 场景 | `apk list -a` |
+| :-- | :-- |
+| 抹掉后不跑脚本（＝ 09-23 版本的实际效果） | **0** ← 就是「软件页空的、要手动 Update lists」 |
+| 跑修复版 `start` 之后，**不联网**立即查 | **9656 包 / 0.5s**（纯读持久缓存） |
+
+幂等：连跑两次 `start`，rc=0，软链与内容不变。
+
+### 5. 变异验证
+
+C8-④ 配一对对照 + 两个变异：**对照绿 / R1（父目录指错）红 / R2（整块删除）红**，
+逐字节还原一致。
+
+### 遗留（非本次范围）
+
+- 本次真机只补到 **5/6 条源**（9668 包）。差的 1 条是蜂窝链路抖动
+  （`ERROR: wget: exited with error 4` / `unexpected end of file`），**非代码问题**；
+  脚本的**条数比对**会在下次开机自动重试（have<want 不会自锁，这正是当初刻意不用
+  「有无判定」的原因）。
+- `/usr/share/apk/cache` 不在 sysupgrade 保留列表内，刷机后要重新联网补一次 —— 刻意如此
+  （跨版本保留旧索引会让软件页列出一批已不存在的包，比留空更误导）。
+
 ## [2026-09-23] 修 LuCI「系统 → 软件」页每次重启都不可用（apk 索引缓存在 tmpfs）+ 新增 C8/C9 守卫
 
 症状（2026-09-23 真机复现）：重启后打开「系统 → 软件」，可用包列表是空的、
