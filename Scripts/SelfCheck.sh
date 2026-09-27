@@ -16,7 +16,9 @@
 #   C5 Files/ 覆盖层必须是 LF
 #   C6 plugin-deps 标记区存在且条目数达标
 #   C7 MT_MODE 的 default 必须保持空
-#   C8 apk 索引缓存持久化：文件 / START= / enable 三者齐备
+#   C8 apk 索引缓存持久化：文件 / START= / enable / 为软链父目录建目录，四者齐备
+#   C9 README 项目结构树不得漏列 Scripts / Files/etc / workflows
+#   C10 软件页在慢链路上的两条防线：uhttpd CGI 预算 + package-manager-call 的补丁
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -335,6 +337,44 @@ if [ -n "$MISS" ]; then
 else
 	[ "$FAIL" -eq "$N" ] && pass "README 结构树覆盖了全部 Scripts / Files/etc / workflow"
 fi
+
+# ---------- C10：「软件页在慢链路上用得成吗」的两条防线 ----------
+# 出处：2026-09-27 用户报「无法执行 apk update 命令：SyntaxError: Unexpected end of
+#   JSON input」。真机复现并**计时到 60.2 秒**，正好等于 uhttpd 的 `-t 60`：
+#   /usr/libexec/package-manager-call 是「跑完 apk update 才 json_dump」，
+#   中途零输出；uhttpd 到点关掉 CGI 那条连接 → HTTP 200 + **空 body**；
+#   前端 fs.js 的 handleCgiIoReply 对 'json' 走 `res.json()`，空串直接抛那句话。
+#   慢链路上（本机 5G 漫游、6 个源逐个下，实测还常被截断重试）apk update
+#   一两分钟是常态 ⇒ 60 秒预算 ＝「Update lists 永远失败」，跟包管理器好坏无关。
+# ★ 两条防线都属于「删掉之后一切照旧能编译、能刷机，只在真机点按钮时才暴露」，
+#   所以必须静态钉住。
+echo "-- C10 软件页慢链路：CGI 预算 + 并发失败"
+N=$FAIL
+
+# ① uhttpd 的 CGI 超时被抬高过（★ 必须跳过注释行 —— 注释里那段「想回退」的
+#    说明就写着 script_timeout='60'，不排除会把它当成实际配置值读出来）
+UP_T="$(awk '!/^[[:space:]]*#/ && /script_timeout/ {print}' Files/etc/uci-defaults/* 2>/dev/null \
+	| grep -oE "script_timeout='?[0-9]+" | grep -oE '[0-9]+' | head -1)"
+if [ -z "$UP_T" ]; then
+	fail "C10 Files/etc/uci-defaults/ 里没有设置 uhttpd.main.script_timeout：CGI 预算仍是 uhttpd 默认的 60 秒，慢链路上点「Update lists」必得空 body → 前端报 SyntaxError: Unexpected end of JSON input"
+elif [ "$UP_T" -lt 120 ]; then
+	fail "C10 uhttpd.main.script_timeout 设成了 $UP_T（应 >= 120）：慢链路上 apk update 一两分钟是常态，60 秒预算必失败"
+fi
+
+# ② Handles.sh 对 package-manager-call 的两个补丁都必须在
+#   ★ 判据必须锁进 **sed 的替换串**，不能只 grep `flock -n -x 200`：
+#     Handles.sh 里还有一条运行时自检 `if grep -q 'flock -n -x 200' "$PMC_FILE"`，
+#     只按裸字符串匹配的话，**替换串被改坏时这条守卫照样绿**（命中自检那句）——
+#     即「守卫被自己的自检顶住」，和 C9 的 CNT 断言是同一类陷阱。
+#     尾部那个 `|` 是 sed 的分隔符，只在替换串里出现，拿它当锚最稳。
+if ! grep -qF 'if flock -n -x 200; then|' Scripts/Handles.sh; then
+	fail "C10 Scripts/Handles.sh 里 sed 的替换串没有 flock -n：并发点「Update lists」会一直等锁，而脚本跑完才输出 JSON ⇒ CGI 零输出熬到超时 ⇒ 前端又报那条 SyntaxError（实测旧行为：空转 60.2 秒）"
+fi
+if ! grep -qF 'cmd="$cmd --allow-untrusted"' Scripts/Handles.sh; then
+	fail "C10 Scripts/Handles.sh 的 sed 替换串里没有 --allow-untrusted：LuCI 软件页将装不上自编译 apk（既有能力被弄丢了）"
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "慢链路两点都守着：uhttpd CGI 预算 ${UP_T}s、package-manager-call 的两个补丁都在"
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then

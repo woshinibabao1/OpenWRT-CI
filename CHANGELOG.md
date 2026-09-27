@@ -1,5 +1,67 @@
 # 更新日志
 
+## [2026-09-27 · 二] 修「无法执行 apk update 命令：SyntaxError: Unexpected end of JSON input」
+
+用户报错原文即这一句。**真机全程复现并计时，非推测。**
+
+### 1. 根因：uhttpd 的 60 秒 CGI 预算，撞上「跑完才输出」的包管理脚本
+
+| 环节 | 证据（都是打开的代码 / 量出来的数） |
+| :-- | :-- |
+| 前端怎么炸的 | `/www/luci-static/resources/fs.js` 的 `handleCgiIoReply`：`case 'json': return res.json()`。对**空 body**，`res.json()` 抛的正是 `SyntaxError: Unexpected end of JSON input`；而它前面先过 `res.ok && status==200` ⇒ 说明服务端给的是 **HTTP 200 + 空 body** |
+| 后端为什么不输出 | `/usr/libexec/package-manager-call` 的 `install\|update\|upgrade\|remove` 分支：先 `$cmd $action "$@" >/tmp/ipkg.out 2>/tmp/ipkg.err`，**全部跑完之后**才 `json_init … json_dump` —— 中途 stdout 一个字节都没有 |
+| 谁掐的连接 | uhttpd 启动参数 `-t 60`（`/etc/config/uhttpd` 的 `script_timeout='60'`）。受控实验：占住 `/tmp/ipkg.lock` 让 CGI 全程静默，浏览器点击后**恰好 60.2 秒**弹出上面那句报错 |
+| 为什么越点越死 | 被掐掉的只是 `cgi-io`，**孙进程 `apk update` 会继续跑**（真机实测存活 68 分钟），期间一直占着 `/tmp/ipkg.lock` 与 apk 数据库锁 ⇒ 再点一次要么继续等锁、要么直接失败 |
+
+为什么 60 秒必然不够：本机 WAN 是 5G 漫游，6 个源逐个下、还常被截断重试
+（`ERROR: wget: exited with error 4` / `unexpected end of file`），实测一次完整 `apk update`
+耗时分钟级、最坏一次 **68 分钟**。**60 秒预算 ＝「Update lists 永远失败」**，
+这跟包管理器本身好不好完全无关 —— 换个快的网络就一切正常，所以极难归因。
+
+### 2. 三处改动
+
+| 位置 | 改动 | 治的是 |
+| :-- | :-- | :-- |
+| `Files/etc/uci-defaults/99-mt5700-sys` 第 6 节 | `uhttpd.main.script_timeout` 60 → **300** | 「第一次点击就注定失败」 |
+| `Scripts/Handles.sh` | 既有补丁串里 `flock -x 200` → `flock -n -x 200`，并加二次核对 | 「并发点击空转到超时、再报一句 JSON 解析错」 |
+| `Files/etc/init.d/apk-index-cache` | 后台 `apk update` 加 `timeout 300` | 开机那次更新可能占着数据库锁几十分钟 |
+
+★ 用 `-n` 而不是 `-w <秒>`：本机 BusyBox flock（v1.38）**只有 -s/-x/-u/-n**，
+没有 `-w`（真机 `flock --help` 核过）。拿不到锁就立刻失败，走脚本既有的
+`else → code=255 / stderr="Failed to acquire lock"` 分支，正常吐 JSON。
+★ 只抬 `script_timeout`，**不动 `network_timeout(=30)`** —— 后者是读请求头的空闲上限，
+与「CGI 能跑多久」无关，一并放大只会放宽无谓的连接占用。
+
+### 3. 真机验证（A/B，均带计时）
+
+| 场景 | 改前 | 改后 |
+| :-- | :-- | :-- |
+| 占锁时点「Update lists」 | 空转 **60.2 秒** → `SyntaxError: Unexpected end of JSON input` | **0.2 秒** → 弹窗给出可读结果：`错误 / Failed to acquire lock / apk update 命令失败了，代码为 255。` |
+| 让 CGI 静默超过 60 秒 | 60.2 秒被掐、空 body | HTTP 层直接测：客户端 **100.1 秒**自己超时，服务端始终**没**关连接 |
+
+（同一个构造、同一个观测点，只改配置，前后对照。）
+
+### 4. C10 守卫 + 变异验证
+
+新增 C10：uhttpd 预算 ≥120，且 Handles.sh 的 **sed 替换串**里两个补丁都在。
+
+⚠️ 第一版判据写成裸 `grep 'flock -n -x 200'` —— 它会命中 Handles.sh 里那句**运行时自检**
+（`if grep -q 'flock -n -x 200' "$PMC_FILE"`），于是**替换串被改坏时守卫照样绿**。
+「守卫被自己的自检顶住」，与 C9 的 CNT 陷阱同类。已改成锚定 `if flock -n -x 200; then|`
+（尾部 `|` 是 sed 分隔符，只在替换串里出现）。
+
+变异：**对照绿 / R1 预算改回 60 → 红 / R2 替换串丢掉 `flock -n` → 红 /
+R3 替换串丢掉 `--allow-untrusted` → 红 / 在注释里写 `script_timeout='60'` → 仍绿**
+（这一条专门证明守卫排除了注释行），逐字节还原一致。
+
+### 5. 顺带澄清
+
+用户起初怀疑「是不是你改了我的 **apk 源**」—— **没有**：仓内 `repositories.d` / `distfeeds`
+字样全部出现在注释与文档里（唯一功能性代码是一句**只读** `grep` 数源条数），
+真机 `distfeeds.list` 仍是原厂 6 条 immortalwrt snapshot 源，
+编译上游 `immortalwrt/immortalwrt` 是 2026-08-29 由 LianXia233 切换的。
+这条报错与「源」无关，纯粹是超时预算问题。
+
 ## [2026-09-27] 修 apk-index-cache：软链从来就没建成过（脚本进了固件、被 enable，却什么都没做）
 
 起因是用户问「你是不是改了我的 apk 源」。**核查结论：源一行都没动。**

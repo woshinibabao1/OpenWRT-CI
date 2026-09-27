@@ -122,8 +122,29 @@ if [ -f "$PMC_FILE" ]; then
 		#   构建不划算；但必须留下可见的警告。
 		echo "::warning::package-manager: 未找到锚点 'if flock -x 200; then'，--allow-untrusted 未注入；LuCI 软件页将装不上自编译 apk。请检查上游 $PMC_FILE"
 	else
-		sed -i 's|^\t*if flock -x 200; then|\t\t\t# install 默认允许未签名包（自编译 apk 无签名，否则装不上）\n\t\t\tif [ "$action" = "add" ] \&\& [ "$ipkg_bin" = "apk" ]; then\n\t\t\t\tcmd="$cmd --allow-untrusted"\n\t\t\tfi\n\t\t\tif flock -x 200; then|' "$PMC_FILE"
+		# ★★ 顺带把 `flock -x` 改成 `flock -n -x`（2026-09-27 加，起因是用户报
+		#   「无法执行 apk update 命令：SyntaxError: Unexpected end of JSON input」）。
+		#
+		#   上游这个 `flock -x 200` **没有超时**：只要前面有一支 apk 还在跑
+		#   （慢链路上 apk update 能动辄跑几分钟、实测甚至 68 分钟），
+		#   后一次点击就会一直阻塞在这里，而本脚本**只在全部跑完之后才 json_dump**
+		#   —— 于是 CGI 长时间零输出，uhttpd 到 script_timeout 就关掉连接，
+		#   前端 fs.js 的 handleCgiIoReply 拿空 body 走 res.json()，
+		#   抛出的正是那句 SyntaxError（实测：距点击 60.2s 出现）。
+		#   改成 `-n`＝拿不到锁**立刻**返回：走下面的 else 分支，
+		#   正常吐出 {code:255, stderr:"Failed to acquire lock"} 的 JSON，
+		#   前端于是显示一句**能读懂**的错误，而不是转 60 秒再报一句 JSON 解析失败。
+		#   ★ 用 `-n` 而不是 `-w <秒>`：本机 BusyBox 的 flock（v1.38）**只有 -s/-x/-u/-n**，
+		#     没有 -w（真机 `flock --help` 已核）。少等一会总比等出个空 body 强。
+		sed -i 's|^\t*if flock -x 200; then|\t\t\t# install 默认允许未签名包（自编译 apk 无签名，否则装不上）\n\t\t\tif [ "$action" = "add" ] \&\& [ "$ipkg_bin" = "apk" ]; then\n\t\t\t\tcmd="$cmd --allow-untrusted"\n\t\t\tfi\n\t\t\tif flock -n -x 200; then|' "$PMC_FILE"
 		echo "package-manager: install now defaults to --allow-untrusted!"
+		# 二次核对：上面那条 sed 承载了两个补丁（--allow-untrusted 与 flock -n），
+		# 锚点或替换串任一处被上游改版影响都会**静默少写一半**，所以分别复核。
+		if grep -q 'flock -n -x 200' "$PMC_FILE"; then
+			echo "package-manager: flock 已改为 -n（并发调用立即失败，不再空转）"
+		else
+			echo "::warning::package-manager: flock -n 未注入成功（--allow-untrusted 那条可能仍在）；慢链路下并发点「Update lists」仍可能空转后报 JSON 解析错误。请检查 $PMC_FILE"
+		fi
 	fi
 fi
 

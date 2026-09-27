@@ -137,7 +137,13 @@ start() {
 			#   当时真实的失败原因是**数据库锁被占用**（另一支 apk update 尚未退出，
 			#   `ERROR: Unable to lock database: Resource temporarily unavailable`），
 			#   与网络毫无关系。带着一个错误的结论去排障，会让人白查一遍 WAN。
-			if ERR="$(apk update 2>&1)"; then
+			# ★ 必须给它一个上界（2026-09-27 补）：慢链路上 apk update 会连着重试
+			#   几十分钟（真机实测一次卡了 **68 分钟**），而它全程占着
+			#   apk 数据库锁（/lib/apk/db/lock）与 /tmp/ipkg.lock —— 这期间用户在
+			#   LuCI 软件页点任何东西都只会得到「database ... Resource temporarily
+			#   unavailable」。300 秒还没下完就放弃，交给下次开机重试：
+			#   cache_complete 用的是**条数比对**，不全的状态不会自锁。
+			if ERR="$(timeout 300 apk update 2>&1)"; then
 				logger -t apk-index-cache "索引已就绪，软件页可直接安装/卸载"
 			else
 				logger -t apk-index-cache "apk update 未成功，apk 原话：$(printf '%s' "$ERR" | tr '\n' ' ' | cut -c1-200)"

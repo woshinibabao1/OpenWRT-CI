@@ -110,4 +110,39 @@ if [ -x /etc/init.d/apk-index-cache ]; then
 	logger -t mt5700-sys "已启用 apk-index-cache（apk 索引跨重启保留，软件页不再每次都要手动 Update lists）"
 fi
 
+# ---------- 6. uhttpd 的 CGI 超时：60 → 300 秒 ----------
+# 症状：LuCI「系统 → 软件」点「Update lists…」，等一下弹出
+#   「无法执行 apk update 命令：SyntaxError: Unexpected end of JSON input」。
+#
+# 根因（2026-09-27 真机复现，**计时 60.2 秒**，不是推测）：
+#   /usr/libexec/package-manager-call 是「跑完 apk update 之后才 json_dump」，
+#   中间一个字节都不输出；而 uhttpd 默认 `-t 60`（本文件下面的 script_timeout=60）
+#   到点就把 CGI 那条连接关掉 —— HTTP 200 + **空 body**。
+#   前端 fs.js 的 handleCgiIoReply 对 'json' 类型走 `res.json()`，
+#   空字符串直接抛 SyntaxError: Unexpected end of JSON input（就是那句报错）。
+#   ★ 被掐掉的只是 cgi-io，**孙进程 apk update 会继续跑**（实测存活 68 分钟），
+#     期间一直占着 /tmp/ipkg.lock 与 apk 数据库锁 → 再点一次就彻底没反应。
+#     （并发点击那条已由 Handles.sh 把 `flock -x` 改成 `flock -n` 兜住，
+#      这里解决的是「第一次点击就注定失败」。）
+#
+# 为什么必须调：本机 WAN 是 5G 漫游，6 个源逐个下、还常被截断重试
+#   （实测 `wget: exited with error 4` / `unexpected end of file`），
+#   apk update 一两分钟是常态。60 秒的预算 ＝「Update lists 永远失败」，
+#   而这跟包管理器本身好不好完全无关。
+#
+# 取值 300 秒的理由：再长收益很小（超过 5 分钟的下不了本来也难成），
+#   而 CGI 预算是「一个挂死的脚本能占住一条连接多久」的上限，不宜无节制放大。
+#   想回退：uci set uhttpd.main.script_timeout='60'; uci commit uhttpd;
+#           /etc/init.d/uhttpd restart
+# 只动 script_timeout，**不动 network_timeout(=30)** —— 后者是读请求头的空闲上限，
+#   与「CGI 跑多久」无关，一并放大只会放宽无谓的连接占用。
+if [ -f /etc/config/uhttpd ]; then
+	CUR_HTTPD_T="$(uci -q get uhttpd.main.script_timeout)"
+	if [ "$CUR_HTTPD_T" != "300" ]; then
+		uci -q set uhttpd.main.script_timeout='300'
+		uci -q commit uhttpd
+		logger -t mt5700-sys "uhttpd.script_timeout: ${CUR_HTTPD_T:-未设置} → 300（慢链路下软件页 Update lists 不再被 60 秒掐断）"
+	fi
+fi
+
 exit 0
