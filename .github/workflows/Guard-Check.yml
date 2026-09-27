@@ -40,7 +40,14 @@ jobs:
           # SelfCheck 的 C2/C3/C7 要解析 workflow YAML。runner 自带 python3，
           # 但**默认没有 PyYAML** —— 缺了它脚本会把这三条降级成 skip 而不是判红，
           # 于是「YAML 写坏了」照样一路绿灯。所以在这里显式装，并在下一步验证真能 import。
-          sudo apt-get update -qq
+          #
+          # ★ 与 WRT-CORE 的初始化同一处理（那个坑已经写在那边的注释里）：
+          #   托管 runner 预置的 google-chrome 源偶发哈希不一致
+          #   （File has unexpected size / Mirror sync in progress?），
+          #   会让 `apt update` 返回非零。本闸门是 PR 上唯一的自动信号，
+          #   一旦假红就直接挡住合并，所以这里也要先删源、并允许重试一次。
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list
+          sudo apt-get update -qq || sudo apt-get update -qq
           sudo apt-get install -y -qq python3-yaml
 
       - name: Verify PyYAML

@@ -1,5 +1,149 @@
 # 更新日志
 
+## [2026-09-28 · 三] 全仓审计修复批：能力宣称与产物不一致（mwan3 / SQM / EHT160）+ 权限与守卫
+
+起因是「全面分析，看还有没有更完善的地方」。审计覆盖工作流 / 构建脚本 / 设备端注入层 /
+配置与文档一致性五个面，**每条结论都带两侧原文**；凡涉及设备行为的，一律上真机
+（192.168.10.1，`luci-app-mt5700-2.3.60`）核对，不采信推断。
+
+### 1. 能力宣称与产物不一致（3 条，均为真机确证）
+
+| # | 位置 | 问题 | 证据 |
+| :-- | :-- | :-- | :-- |
+| D1 | `README.md`「链路检测」 | 写「搭配 mwan3…毫秒级无缝切换，确保网络永不掉线」 | 全仓 `Config/*.txt` + `Packages.sh` **搜不到 mwan3**（`luci-app-h5000m-netmode` 的 `LUCI_DEPENDS` 只有 `+luci-base`，不会带入）；真机**无** `mwan3` 命令、无 `/etc/init.d/mwan3`。→ **纯宣称、无实现**，已划掉并注明 |
+| D2 | `GENERAL.txt` + `99-mt5700-net` | 两处都让用户「到「网络 → SQM QoS」填写」，但只编了**后端** `sqm-scripts`、没编**前端** `luci-app-sqm` | 真机：`/etc/init.d/sqm` 在、`uci show sqm` 有段、`sqm-scripts` 已装，但 `/www/luci-static/resources/view/network/` 下**无任何 sqm 页面**（对照组 `luci-app-firewall` 页面齐全）。→ 已补 `CONFIG_PACKAGE_luci-app-sqm=y`（上游该包存在，`LUCI_DEPENDS:=+luci-base +sqm-scripts`），并加进 WRT-CORE 的「关键包选择自检」打印列表 |
+| D3 | `README.md` 默认配置表 | 5G 频宽写 `EHT160` | 真机是 **`HE160` + `channel=auto`**（`iwinfo` 报 `HT Mode: HE160`） |
+
+**D3 的完整定位（三条设置路径全部没落地）**：
+
+1. `Scripts/Settings.sh` 的 `$WIFI_SH` 分支（设 `EHT160`，还配了一条守卫告警）——
+   **该分支永不执行**：上游 `target/linux/mediatek/filogic/base-files/etc/uci-defaults/` 下
+   已没有 `*set-wireless.sh`（只剩 `05_fix-compat-version`，2026-09-28 用 GitHub API 核对），
+   `find` 返回空 → 一律走 `elif` 的 `mac80211.uc` 分支；
+2. `Settings.sh` 的 uc 分支 —— 那两条改频宽的 `sed` 是**注释掉的**，注释理由写着
+   「5G 保持 80MHz 上限」，而实测是 160MHz：**该决策的前提本身就不成立**
+   （它并没有限制在 80MHz，只是没动上游默认值）；
+3. `Files/etc/uci-defaults/99-mt5700-net` 第 5b 节（设 `channel=36` + `EHT160`）——
+   真机上判断条件 `wireless.radio1.band` 返回的确实是 `5g`（条件成立），
+   但设置**没有保留**（仍是 `auto`/`HE160`）。推断是 wifi 服务生成配置时按
+   `mac80211.uc` 的默认重写；**未做实机确证**（改 Wi-Fi 配置会当场断开当前连接，
+   不能在这台在用设备上做）。
+
+三处都已按「如实描述 + 标注证据」改写；**没有动任何 Wi-Fi 行为** —— 频宽改动触及 DFS，
+必须在真机上带自动回滚验证后再合（唯一有效的位置是 `Settings.sh` 的 uc 分支）。
+
+### 2. 安全（2 条）
+
+| 位置 | 问题 | 修法 |
+| :-- | :-- | :-- |
+| `Auto-Clean.yml` / `Cache-Clean.yml` | `permissions: write-all` —— 而本仓 `Guard-Check.yml` 用的是 `contents: read`，**同一原则只落实了一半**。`write-all` 额外给出 `packages`/`deployments`/**`id-token`（OIDC）** 等本任务用不到的权限 | 各自收敛为实际所需：Auto-Clean = `contents: write` + `actions: write`；Cache-Clean = `actions: write` |
+| `WRT-CORE.yml` 的 job 级 `env: GITHUB_TOKEN` | 该令牌是 `contents: write`，却挂在 **job 级 env** 上，于是**每一步**都能读到 —— 包括 `Packages.sh` 克隆第三方插件、`make` 执行上游/第三方 Makefile、以及以 root 执行远端下载的初始化脚本。而它**没有任何使用者**：`Scripts/*.sh` 里 grep `TOKEN\|secrets.` 为零 | 删掉 job 级 env，改为只在 `Release Firmware` 步骤注入。该 action 的 `token` 输入默认就是 `${{ github.token }}`（其 action.yml 原文：“Defaults to github.token when omitted”），故不影响发布 |
+
+### 3. 健壮性（4 条）
+
+| 位置 | 问题 | 修法 |
+| :-- | :-- | :-- |
+| `Auto-Clean.yml` | 删除两句都带 `\|\| true`，紧跟着**无条件** `DELETED+1` —— 删除失败也计入成功数，日志撒谎；更要紧的是 job 仍返回 success，而下游 `H5000M-MT-AUTO` 的闸门正是 `conclusion == 'success'`，于是「清理全失败 + 照跑几小时编译」（该文件注释自己点名的场景，实际拦不住） | 改为 `if` 判定；失败计 `FAILED`；**尝试删过但一条都没成功**时 `exit 1`（判据不用 `DELETED==0`：keep-latest 模式下本来就可能一条不删，那是正常的） |
+| `WRT-CORE.yml` | `TEST=true` 声称「仅生成配置文件」，但全仓 `artifact` **零命中** —— 导出的 `.config` 只被 `cp` 进 runner 本地的 `./wrt/upload/`（随 runner 销毁），用户在页面上**拿不到** | 新增 `Upload Config (TEST only)` 步骤（`actions/upload-artifact@v4`，仅 `WRT_TEST == 'true'` 时跑） |
+| `WRT-CORE.yml` | `BRANCH` 是自由文本输入，而它原样进**文件名**与 **Tag**：填 `feature/x` 会让 `cp ...-feature/x-....txt` 的父目录不存在 → `bash -e` 就地失败，打包与 Release 都不执行 | 另存 `WRT_BRANCH_SLUG`（`tr '/' '-'`）供拼名与 Tag 用；`git clone` 仍用原值 |
+| `Guard-Check.yml` | 它的 `apt-get update` 没有 WRT-CORE 早已总结过的规避手段（google-chrome 源哈希竞态）也没有重试，而它是 **PR 上唯一的自动信号** —— 假红直接挡合并 | 补 `rm -f .../google-chrome*.list` + 失败重试一次，与 WRT-CORE 同一处理 |
+| `WRT-CORE.yml` | `feeds update/install` 无重试，而同文件的 `git clone` 明确加了 3 次重试 —— 同一个文件里两条网络路径加固标准不一致（feeds 的 git 拉取次数远多于单次 clone） | 套用同样的 3 次重试 + 失败即终止 |
+
+另：`WRT-CORE.yml` 里 5 处 `$GITHUB_WORKSPACE/Scripts/x.sh` 直接调用统一改为 `bash <file>`
+—— 直接调用能跑全靠 `Check Scripts` 那条 `find -maxdepth 3 ... -exec chmod +x` 的副作用，
+而它限深 3 层：将来加 `Scripts/<子目录>/x.sh` 会「本地能跑（Windows 不看执行位）、CI 报
+Permission denied」。`WRT-BUILD.yml` 的 `type: boolean` 默认值由 `'false'` 改为 `false`
+（与 `Auto-Clean.yml` 的写法统一）。
+
+### 4. 守卫增强：C9 的扫描范围扩到 `Config/`
+
+`Config/PRIVATE.txt` 是 `Settings.sh` **最后写入 `.config` 的一层**（可覆盖 GENERAL 的同名项），
+却从来没进过 README 结构树、也没人告警 —— 因为 C9 只扫 `Scripts/` `Files/etc/` `workflows/`。
+
+现把 `Config/*.txt` 纳入 C9，README 同步补上 `PRIVATE.txt`。
+**变异验证**（本仓红线：「写了守卫 ≠ 有了守卫」）：把 README 里的 `PRIVATE.txt` 临时改成
+`XXXXXX.txt` → C9 判红（`::error::C9 README 项目结构树漏列： PRIVATE.txt`）→ 还原后全绿。
+
+### 5. 文档与注释修正（不改变任何行为）
+
+- `README.md`：工作流表补 `Guard-Check`（原先同页结构树里有它、表里却没有）；
+  「产物区分」删掉已停用且**不可能产生**的 `MT5700M` 示例（`ApplyMTMode.sh` 对它直接 `exit 1`）；
+  结构树补 `Config/PRIVATE.txt` 并写明叠加顺序；「本清单与 Config 严格一致」改为
+  「列出**显式选中**的包，但 `+DEPENDS` 的传递依赖照样进固件」（例：`luci-app-partexp`
+  声明了一串不在任何 Config 里的依赖）；`eip197-mini-firmware` 的溯源改为
+  「由 `kmod-crypto-hw-safexcel` 的 `+DEPENDS` 带入、本仓未显式声明」，并标注
+  **真机 `/lib/firmware/` 下未见该固件、是否启用未经验证**；
+- `Config/GENERAL.txt`：内核版本注释 `6.18.41` → `6.18.x`（同仓他处为 6.18.52，钉小版本必过期）；
+- `Scripts/Packages.sh`：`x86)` 分支标注为**已不可达的历史分支**（WRT_TARGET 只可能是 mediatek）；
+- `Files/etc/uci-defaults/99-mt5700-net`：`flow-offload` 注释说清「设计默认 off、脚本内变量初值 auto
+  只是兜底」这两件事不是一回事。
+
+### 6. 设备端（Files/）补充修复
+
+| 位置 | 问题 | 修法 |
+| :-- | :-- | :-- |
+| `99-mt5700-sys` | **三个 init.d 服务在首次开机都不会运行**：`enable` 只建 `/etc/rc.d/S*` 软链，而 procd 的 rc 队列在开机那一刻就**一次性展开完了**（只 glob 一次）—— 本脚本跑在 S10，此刻新建的软链进不了本次队列。`apk-index-cache` 因此要等**下一次开机**才生效，而它治的正是「每次重启后软件页不可用」，首启等于没治 | 对不依赖时序的 `apk-index-cache` 补一次 `start`（幂等、内部有 timeout 300）。`mt5700-smp`（S10 时无线 IRQ 尚未注册）/ `mt5700-rps`（要停的 `packet_steering` 此刻还没启动）**不补** —— 补了反而引入时序偏差，由 hotplug 与「第二次开机」兜住 |
+| `99-mt5700-wan` | 机型守卫用 `exit 0` 收尾：uci-defaults 被 source 后返回 0 即记为 applied、**随后脚本被删除** ⇒ 一次判据不成立就**永不重试**，而它负责的恰是「刷完没网」的三件事（MT5700M 接口 / 不收对端 DNS + 国内 DNS / 加入防火墙 wan 区） | 区分「读不到机型」（`return 1`，保留脚本待下次开机）与「确认是别的机型」（才 `exit 0`）；匹配改为大小写无关 |
+| `30-mt5700-rps` | 补设 RPS 后不看返回码就记「已补设」—— 而 `mt5700-rps` 在一个队列都没设上时 `return 1`，日志与事实可能相反（本项目反复踩的「假成功」类） | 改为 `if … start; then 已补设; else 补设失败` |
+
+### 7. 构建脚本（Scripts/）补充修复
+
+| 位置 | 问题 | 修法 |
+| :-- | :-- | :-- |
+| `Settings.sh` | `$WRT_IP / $WRT_NAME / $WRT_SSID / $WRT_WORD` **未转义就进 sed 替换串**，而它正是文档推荐的改法（「改默认值就改 `WRT-CORE.yml` 的 `inputs.default`」，那里没有任何字符校验）：`&` 会展开成整个匹配、`/` 让 sed 报错、`\` 吞掉后一字符。**要紧的是改 SSID / 密码那两处零回读断言**（唯一那条 wifi 回读告警在 `$WIFI_SH` 分支里，而该分支永不执行）⇒ 密码含 `/`（WPA 密码里很常见）时会**静默保持上游默认**，极端情形是空密码 AP，而 Release 说明照抄 `WRT_SSID/WRT_WORD` | 加 `esc()` 并转义 4 处替换串；给 uc 分支补 SSID / 密码的回读断言 |
+| `Packages.sh` | `rustup target add … \|\| true` 与 `rustup component add rust-lld \|\| true` —— **注释自己写着**缺 rust-lld 会导致编译失败，代码却把失败吞掉且无重试 ⇒ 故障被推迟几小时到 Compile Firmware，以一条 cargo 报错出现，离根因很远 | 抽 `add_component()`：重试 3 次、最终 `::error::` + `exit 1` |
+| `Packages.sh` | `[ -d "$SRC_DIR" ] \|\| { echo …跳过; return 0; }` —— 同一函数里「单个覆盖层文件缺失」是硬失败，**整个源目录缺失**却静默跳过（后果更大：`Files/` 是 TTL 规则 / sysctl / uci-defaults / init.d 的全部来源）。原先没变成静默洞，只是**靠 `ApplyFlowOffload.sh` 的副作用兜住** | 改为硬失败 |
+
+### 8. 自我纠错：5G 频宽那段的结论**撤回**
+
+第一轮我在 `Scripts/Settings.sh` 与 README 里写了「注释理由与真机不符，**上游默认本来就是 160MHz**」。第二轮（上游源码 + 真机取证）复核后，**那条更正本身是错的**，已撤回改写：
+
+| 事实 | 证据 |
+| :-- | :-- |
+| 上游模板**会把频宽钉在 80** | `mac80211.uc`：`let width = band.max_width; … else if (width > 80) width = 80;` 之后 `htmode += width` ⇒ 只要 5G 的 `max_width > 80`，生成的后缀必然是 80（EHT80/HE80）。所以原注释「保持 80MHz 上限」**与上游行为一致** |
+| 真机的 160MHz **不能作为编译产物的证据** | 那台设备的 Wi-Fi 被手工改过：`default_radio1.ssid` 不是默认的 OWRT（是 `Ajmd007-5G`）、`encryption` 是 `sae-mixed` 而不是脚本会设的 `psk-mixed` —— 读数反映的是**用户的选择** |
+| 5b 节到底有没有生效**无法判定** | 它确已执行（`/etc/uci-defaults/` 已被消费、同批次的 rpcd respawn 改动在真机生效），但用户的手工改动同样会覆盖它 |
+
+**教训**：拿「真机当前值」推断「编译产物状态」之前，必须先排除「用户改过」这个混杂因素。这次恰好有 `ssid` 与 `encryption` 两处独立证据说明该机被改过；没有它们，就会把用户的选择当成脚本失效的证据。
+
+### 9. 验证
+
+| 项 | 结果 |
+| :-- | :-- |
+| `bash Scripts/SelfCheck.sh` | **C1~C10 全部通过**（含扩展后的 C9） |
+| C9 变异验证 | 删 `PRIVATE.txt` → 判红；还原 → 全绿 |
+| 6 个 workflow YAML | 逐个 `yaml.safe_load` 通过 |
+| 真机只读核对 | sysctl 13 项 + 端口段、RPS/XPS 掩码、`packet_steering` 已停用、`apk-index-cache` 软链与索引、
+MT5700M 接口/防火墙 wan 区/DNS/USB autosuspend、`ubus call mt5700 logs`、SQM/mwan3 有无 —— **均与仓库声明一致**（除上面 D1/D2/D3） |
+
+**诚实边界**：
+
+1. **没有实机验证的改动**：`WRT-CORE.yml` 的 Token 改动（需要真跑一次 Release 才能确认
+   `action-gh-release` 的默认 token 生效）、`upload-artifact` 步骤、`BRANCH_SLUG`、
+   Auto-Clean 的 `exit 1` 判据 —— 都需要一次真实 workflow 运行。已尽量选有官方文档/源码
+   兜底的写法（如 action.yml 的 `default: ${{ github.token }}`）。
+2. **没有改的**：Wi-Fi 频宽行为（见 D3，触及 DFS 需真机带回滚验证）；`GENERAL.txt` 里
+   「通用层却含 H5000M 专属项」的结构问题（当前只有单机型，下沉收益小于改动风险，
+   仅把 README 的描述改准）；Release body 硬编码机型文案（同因）；
+   缓存 restore/save 的 key/path 双写（需要一条静态自检才能防漂移，本轮未做）。
+3. **第二轮审计发现、但本轮仍未改的**（都属「潜伏」或需真机验证）：
+   - `Handles.sh` 的 tailscale 补丁 `sed -i '/\/files/d'` 删的是**含 `/files` 的整行**，
+     而上游那两行是必需的安装规则（`$(INSTALL_BIN) ./files//tailscale.init` 等，双斜杠无害）
+     ⇒ 包只装二进制、没有 `init.d` 与配置，脚本却打印假成功。当前 `Config/*.txt` 无该符号
+     （未启用），属潜伏；
+   - `Handles.sh` 的 argon 主题 sed 无左边界：会把 `dark_primary` 一并改成同一颜色，
+     且守卫单靠 `dark_primary` 即可满足（上游改名普通 `primary` 时仍打印 `has been fixed!`）；
+   - `Settings.sh` 的 `EDIT_FILES` 只覆盖「find 一个文件都没找到」，**不覆盖「锚点不存在」**，
+     而 GNU sed 零匹配返回 0 —— 其中 `EDIT_FILES "/attendedsysupgrade/d"` 对上游 master
+     的 6 个 collection **已经永远零匹配**（真正拦住它的是 `Config/GENERAL.txt` 的 `=n`）；
+   - `Packages.sh` 的 `curl … | sh` 装 rustup 无校验和、且脚本无 `pipefail`（curl 失败时
+     `sh` 读空 stdin 仍返回 0）；honk 预编译 apk 从第三方 release 取 `latest` 且
+     `apk add --allow-untrusted`（显式关掉签名校验）—— 两者都属「启用后即为高风险」；
+   - `nftables.d/12-mangle-ttl-128.nft` 依赖 fw4 生成的 `$wan_devices` 宏：**未确证**它在
+     宏不存在时是「fw4 整体拒绝加载」（= 没有 NAT、客户端全断）还是仅该 include 失败。
+     需在真机上清空 wan 区 `network` 后 `fw4 reload` 观察（本轮没做——那是一台在用的设备，
+     不动它的防火墙）；加固方向是本文件自带 `define`，或写成 `oifname { "eth1", "eth2" }`。
+
 ## [2026-09-27 · 二] 修「无法执行 apk update 命令：SyntaxError: Unexpected end of JSON input」
 
 用户报错原文即这一句。**真机全程复现并计时，非推测。**

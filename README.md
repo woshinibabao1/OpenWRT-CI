@@ -19,7 +19,8 @@
 
 | 工作流 | 触发方式 | 作用 |
 | :--- | :--- | :--- |
-| **WRT-BUILD** | 手动 `workflow_dispatch` | 手动编译 / 预览配置。可选机型、源码、MT 模式（`MT5700`，唯一在用的模式），默认完整编译并发布固件（`TEST=false`） |
+| **Guard-Check** | push / PR / 手动 | **编译前的静态自检闸门**（跑 `Scripts/SelfCheck.sh` 的 C1~C10）。秒级反馈，且不占编译的 concurrency 组 |
+| **WRT-BUILD** | 手动 `workflow_dispatch` | 手动编译 / 预览配置。机型与源码已收敛为单一选项，仅 **MT 模式**可选（`MT5700`，唯一在用的模式），默认完整编译并发布固件（`TEST=false`） |
 | **H5000M-MT-AUTO** | 每天随 `Auto-Clean` 完成后自动触发，亦可手动 | 自动并行编译 H5000M 的 **MT5700** 单配置并发布 |
 | **Auto-Clean** | 每天定时 + 手动 | 清理 Release 与 Workflow 运行记录。Release **默认全部清空**；手动触发时勾选 `keep_latest_per_device` 才改为「每个机型保留最新一个」。运行记录保留 30 天 |
 | **Cache-Clean** | 仅手动触发 | 清理 GitHub Actions 编译缓存（已移除每周定时清空：那会让本周第一次构建必然冷启动，配额交由 GitHub 按 LRU 自动回收） |
@@ -28,16 +29,18 @@
 
 **说明：** `TEST=false`（默认）会完整编译并发布固件；`TEST=true` 只生成 `.config` 配置用于校验，不消耗编译资源。
 
-**产物区分：** 同一机型的两种 MT 配置产物在文件名与 Release Tag 中均嵌入模式标签，例如：
+**产物命名：** 文件名与 Release Tag 都嵌入 MT 模式标签，例如：
 
 ```text
 …-MT5700-wifi-yes-26.09.13-….bin
-…-MT5700M-wifi-yes-26.09.13-….bin
 Tag: H5000M-WIFI-YES-MT5700-…
-Tag: H5000M-WIFI-YES-MT5700M-…
 ```
 
-双配置 Job 名为 `机型-MT模式`（如 `H5000M-WIFI-YES-MT5700`），在 Actions 页面可直接分辨。
+Job 名为 `机型-MT模式`（如 `H5000M-WIFI-YES-MT5700`），在 Actions 页面可直接分辨。
+
+> 早先这里还并列过 `…-MT5700M-wifi-yes-…bin` / `Tag: H5000M-WIFI-YES-MT5700M-…` 两个示例。
+> MT5700M 方案已于 2026-09-18 停用，且 `ApplyMTMode.sh` / `VerifyMTMode.sh` 对它**直接报错终止**
+> —— 该产物已不可能产生，示例留着只会让人以为还能选（2026-09-28 修正）。
 
 <br>
 
@@ -52,10 +55,11 @@ OpenWRT-CI/
 │   ├── Auto-Clean.yml        # 清理旧 Release / 运行记录
 │   └── Cache-Clean.yml       # 清理编译缓存
 │   └── Guard-Check.yml       # 静态自检闸门（跑 Scripts/SelfCheck.sh，编译前先自查）
-├── Config/                   # 编译配置
-│   ├── GENERAL.txt           # 全设备通用插件与内核配置（不含 MT 插件）
+├── Config/                   # 编译配置（WRT-CORE 里的叠加顺序：机型 → GENERAL → PRIVATE）
+│   ├── GENERAL.txt           # 通用插件与内核配置（不含 MT 插件；含 H5000M / mediatek 专属项，见文件内标注）
 │   ├── MT5700.txt            # MT5700 独立插件层（方案 B）
-│   └── H5000M-WIFI-YES.txt   # Hiveton H5000M（带 Wi-Fi）
+│   ├── H5000M-WIFI-YES.txt   # Hiveton H5000M（带 Wi-Fi）
+│   └── PRIVATE.txt           # 私有覆盖层：由 Settings.sh 最后写入 .config，可覆盖上面各层的同名项
 ├── Files/                    # 固件 files 覆盖层（随固件打包，首次开机生效）
 │   └── etc/
 │       ├── uci-defaults/99-mt5700-net   # 网络调优（flow offload / TCP / 中断均衡 / 5G 无线）
@@ -110,9 +114,30 @@ OpenWRT-CI/
 | 主机名 | `OWRT` |
 | 国家码 | `CN` |
 | 2.4G 频宽 | 40MHz |
-| 5G 频宽 | 160MHz（EHT160，Wi-Fi 7；仅当雷达检测导致 36-64 起不来时才退回 HE80） |
+| 5G 频宽 | 目标 `EHT160`，但**这条链路不可靠** —— 见下方「5G 频宽现状」 |
 | Flow Offload | `off`（**默认关**；刷机后可在「网络 → 防火墙 → 常规设置」或 uci 改） |
 | 时区 | `CST-8`（`Asia/Shanghai`） |
+
+> **5G 频宽现状（2026-09-28）**
+>
+> 目标是 `EHT160`，但**没有任何一条路径能保证这个结果**；而且本机真机读数**不能作为证据** ——
+> 那台设备的 Wi-Fi 被手工改过（`ssid` 不是默认的 `OWRT`，`encryption` 是 `sae-mixed`
+> 而不是脚本会设的 `psk-mixed`），所以它显示的 `HE160` + `channel=auto`
+> **反映的是用户的选择，不是编译产物的状态**。已定位的三条路径：
+>
+> 1. `Scripts/Settings.sh` 的 `$WIFI_SH` 分支（设 `EHT160`，还配了一条守卫告警）——**该分支永不执行**：
+>    upstream 的 `target/linux/mediatek/filogic/base-files/etc/uci-defaults/` 下已无 `*set-wireless.sh`
+>    （只剩 `05_fix-compat-version`），`find` 返回空 → 走 `elif` 的 `mac80211.uc` 分支；
+> 2. `Settings.sh` 的 uc 分支 —— 那两条改频宽的 `sed` 是**注释掉的**，理由是「5G 保持 80MHz 上限」。
+>    该理由**与上游行为一致**：`mac80211.uc` 里 `if (width > 80) width = 80;` 会把生成的 htmode
+>    后缀钉成 80。也就是说**编译产物的 5G 更可能是 `EHT80`/`HE80`，而不是 `EHT160`**；
+> 3. `Files/etc/uci-defaults/99-mt5700-net` 第 5b 节（设 `channel=36` + `EHT160`）——该脚本确已执行
+>    （`/etc/uci-defaults/` 已被消费、同批次的 rpcd respawn 改动在真机上生效），但**无法从当前真机
+>    状态判断它有没有被后续覆盖**，因为用户的手工改动同样会覆盖它。
+>
+> **结论**：上表写 `EHT160` 是**意图**，不是已验证的事实。要确定实际频宽，需刷一台**未被手工改过**
+> 的固件再看；要真正把 5G 钉在某个频宽上，唯一有效的位置是 `Settings.sh` 的 uc 分支
+> （能影响 `mac80211.uc` 的输出），而频宽改动触及 DFS，必须在真机带自动回滚验证后再合。
 
 > **Flow Offload 说明**（本固件最易被误解的开关，与 SQM/CAKE 互斥）：
 > 1. 四个取值通过 `WRT-BUILD` 手动页的 `FLOW_OFFLOAD` 选择（`auto` / `off` / `on` / `on-hw`），**默认 `off`**；定时自动编译（`H5000M-MT-AUTO`）同样取 `off`。
@@ -216,7 +241,13 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 互斥由 CI 在**配置生成前**（`Scripts/ApplyMTMode.sh`）与**配置生成后、编译前**（`Scripts/VerifyMTMode.sh`）双重校验，冲突时直接失败。
 
 * **🔄 一键切换**：支持在“仅 5G 模式”、“仅有线宽带模式”及“负载均衡/故障转移模式”间快速切换，告别复杂的接口配置。
-* **⚡ 链路检测**：搭配 mwan3，实时监测链路连通状态，主链路故障时实现毫秒级无缝切换，确保网络永不掉线。
+* ~~**⚡ 链路检测**：搭配 mwan3，实时监测链路连通状态，主链路故障时实现毫秒级无缝切换，确保网络永不掉线。~~
+  > ⚠️ **2026-09-28 更正：本固件没有编入 mwan3。** `Config/*.txt` 与 `Scripts/Packages.sh`
+  > 里都搜不到它（`luci-app-h5000m-netmode` 的 `LUCI_DEPENDS` 只有 `+luci-base`，不会把它带进来），
+  > 真机上也既无 `mwan3` 命令、也无 `/etc/init.d/mwan3`。所以「毫秒级无缝切换 / 确保网络永不掉线」
+  > 是**没有实现的宣称**，已划掉。链路优先级切换由 `luci-app-h5000m-netmode` 提供，
+  > 但**不含** mwan3 的链路健康探测与故障转移。确实需要的话得自己加
+  > `CONFIG_PACKAGE_mwan3=y` + `CONFIG_PACKAGE_luci-app-mwan3=y` 重编。
 
 ---
 
@@ -224,12 +255,23 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 
 得益于 ImmortalWrt 优秀的底包基础，Hiveton H5000M 不仅具备卓越的基础路由性能，还将扩展性推向极致：
 
-* **内核级加解密加速**：开启 `kmod-cryptodev` 与 `kmod-tls`，大幅提升加密隧道（WireGuard、HTTPS 等）的吞吐量，降低 CPU 占用；EIP-197 硬件加密引擎（`kmod-crypto-hw-safexcel` + `eip197-mini-firmware`）已就位。
+* **内核级加解密加速**：开启 `kmod-cryptodev` 与 `kmod-tls`，大幅提升加密隧道（WireGuard、HTTPS 等）的吞吐量，降低 CPU 占用。
+  > **EIP-197 的溯源（2026-09-28 更正）**：`kmod-crypto-hw-safexcel` 由 `Config/GENERAL.txt`
+  > 的 `CONFIG_PACKAGE_kmod-crypto-hw-safexcel=y` 选中；其固件 `eip197-mini-firmware`
+  > 是**靠该包的 `+DEPENDS` 自动带入**的，本仓并未显式声明它
+  > （原先这里写成「已就位」，还指向 `H5000M-WIFI-YES.txt` —— 那个文件里其实没有这个符号）。
+  > ⚠️ 真机核对：`/lib/firmware/` 下**未见** eip197 固件，该引擎在本机是否真的启用**未经验证**；
+  > 需要时以真机 `dmesg | grep -i safexcel` 为准。
 * **USB 驱动栈扩展**：包含 `kmod-usb-core`, `kmod-usb3` 及 `kmod-usb-net-qmi-wwan` 等丰富驱动，确保系统准确识别各类移动通信模组。
 * **轻量级 NAS 存储**：支持 NVMe 固态硬盘（`kmod-nvme`）挂载，结合 BTRFS 文件系统，轻松打造家庭数据中心。
 * **安全异地组网**：内置 WireGuard（`kmod-wireguard` + `luci-proto-relay`），轻松实现内网设备的远程安全访问。
 
-> ⚠️ 本清单与 `Config/*.txt` 严格一致：`Scripts/Packages.sh` 里克隆但未写 `CONFIG_PACKAGE_*=y` 的包**不会**进入固件，别把它们算作固件能力。
+> ⚠️ 本清单列出的是**显式选中**（`Config/*.txt` 里写了 `CONFIG_PACKAGE_*=y`）的包：
+> `Scripts/Packages.sh` 里克隆了但没写 `=y` 的包**不会**因为克隆而进固件，别把它们算作固件能力。
+> 但反过来不成立 —— 被这些包 `+DEPENDS` 拉进来的**传递依赖**照样会编进镜像
+> （例：`luci-app-partexp` 声明了 `+parted +btrfs-progs +e2fsprogs +f2fs-tools +kmod-loop` 等，
+> 它们不在任何 Config 里，却会随包一起进来）。要判断「固件里到底有什么」，
+> 以真机 `apk list -I` / `opkg list-installed` 为准（2026-09-28 补注）。
 
 <br>
 

@@ -15,7 +15,16 @@ on:
         type: boolean
         default: false
 
-permissions: write-all
+# 最小权限：本工作流只做两件事 —— 删 Release 与 tag（contents）、删 workflow runs（actions）。
+#
+# ★ 原先写的是 `permissions: write-all`，而本仓 Guard-Check.yml 用的是 `contents: read` ——
+#   同仓两个工作流一个最小、一个全开，属「同一原则只落实了一半」。
+#   write-all 会让 GITHUB_TOKEN 同时具备改 issues / pull-requests / packages /
+#   deployments / discussions 的能力，而这些能力本工作流一条都用不到；
+#   一旦哪一步把 token 泄进日志、或喂给不可信输入，危害面就被无谓地放大。
+permissions:
+  contents: write   # 删 Release（同时删关联 tag）、删 git/refs/tags/*
+  actions: write    # 删 workflow runs
 
 jobs:
   auto_clean:
@@ -41,6 +50,7 @@ jobs:
           fi
           PER_PAGE=100
           DELETED=0
+          FAILED=0
 
           echo ">>> 开始处理 Releases（KEEP_LATEST=${KEEP_LATEST}）"
 
@@ -77,14 +87,35 @@ jobs:
             fi
 
             echo "  [delete] ${RTAG} (id=${RID})"
-            # 删除 Release（同时会删除关联的 tag）
-            gh api "repos/${REPO}/releases/${RID}" -X DELETE --silent || true
-            # 二次确认：手动删除残留 tag（部分情况下 tag 不会随 release 自动删除）
-            gh api "repos/${REPO}/git/refs/tags/${RTAG}" -X DELETE --silent 2>/dev/null || true
-            DELETED=$((DELETED + 1))
+            # ★ 计数必须跟着**实际结果**走。原先两句删除都带 `|| true`，紧跟着
+            #   无条件 `DELETED+1` —— 删除失败也会被计进成功数，末尾那句
+            #   「deleted N old release(s)」于是会撒谎（本仓另一处的同类教训：
+            #   界面显示的值与真实值不一致 = 界面在说谎）。
+            #   改用 if 判定后，`set -e` 下同样不会因单条失败而中断整轮清理。
+            if gh api "repos/${REPO}/releases/${RID}" -X DELETE --silent; then
+              # 二次确认：手动删除残留 tag（部分情况下 tag 不会随 release 自动删除）
+              gh api "repos/${REPO}/git/refs/tags/${RTAG}" -X DELETE --silent 2>/dev/null || true
+              DELETED=$((DELETED + 1))
+            else
+              echo "  [warn] 删除 ${RTAG} (id=${RID}) 失败，未计入统计"
+              FAILED=$((FAILED + 1))
+            fi
           done < "${ALL}"
 
           rm -f "${ALL}"
+
+          # ★ 一次都没删成功时必须以失败收场：H5000M-MT-AUTO 的闸门是
+          #   `workflow_run.conclusion == 'success'`，而那个文件 43-48 行的注释
+          #   自己点名的场景正是「清理失败（如 GitHub API 限流）」——
+          #   若这里静默返回 0，几小时的编译照常启动，Release 页上残留的旧固件
+          #   很快又会被下一次清理删掉，等于白烧机时。
+          #   判据用「尝试删过、但一条都没成功」，而不是「DELETED == 0」：
+          #   keep-latest 模式下本来就可能一条都不删（全部保留），那是正常结果。
+          if [ "${FAILED}" -gt 0 ] && [ "${DELETED}" -eq 0 ]; then
+            echo "::error::尝试删除 release 但一条都没成功（失败 ${FAILED} 条），按失败收场以拦住下游几小时的编译"
+            exit 1
+          fi
+          [ "${FAILED}" -eq 0 ] || echo "::warning::有 ${FAILED} 条 release 删除失败（其余已处理）"
 
           if [ "${KEEP_LATEST}" = "true" ]; then
             echo "=== Done: deleted ${DELETED} old release(s), kept $(echo "${KEEP_IDS}" | wc -w | tr -d ' ') latest ==="

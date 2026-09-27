@@ -311,17 +311,22 @@ fi
 #   没有记忆 —— 同一轮里新增的 SelfCheck.sh 与 Guard-Check.yml 就都没进结构树，
 #   本轮的 apk-index-cache 要不是先写这条守卫也会漏。同一个坑踩到第三次，交给机器。
 #
-# 判据：Scripts/*.sh、Files/etc/**、.github/workflows/*.yml 里真实存在的每个文件，
-#   其文件名都必须出现在 README.md 的结构树中。
+# 判据：Scripts/*.sh、Files/etc/**、.github/workflows/*.yml、Config/*.txt 里真实存在的
+#   每个文件，其文件名都必须出现在 README.md 的结构树中。
 #   ★ 按 **basename** 而不是相对路径比对：README 的树里写作 `init.d/mt5700-rps`
 #     这种带父目录的短名，按完整路径比对会全量误报。
+#   ★ 2026-09-28 扩到 Config/：原先不扫它，于是 Config/PRIVATE.txt 从来没进过
+#     结构树也没人告警 —— 而它是 Settings.sh 里**最后写入 .config 的一层**
+#     （可以覆盖 GENERAL 的同名项），正好属于「不看 README 就不知道它存在」的那类。
+#     加进来之后 README 必须同步补上该文件，否则本条会红（这正是要的）。
 echo "-- C9 README 结构树完整性"
 N=$FAIL
 MISS=""
 CNT=0
 for F in $(find Scripts -maxdepth 1 -type f -name '*.sh' | sort) \
 	$(find Files/etc -type f | sort) \
-	$(find .github/workflows -type f -name '*.yml' | sort); do
+	$(find .github/workflows -type f -name '*.yml' | sort) \
+	$(find Config -maxdepth 1 -type f -name '*.txt' | sort); do
 	B="${F##*/}"
 	CNT=$(( CNT + 1 ))
 	grep -qF "$B" README.md || MISS="$MISS $B"
@@ -335,7 +340,7 @@ fi
 if [ -n "$MISS" ]; then
 	fail "C9 README 项目结构树漏列：$MISS —— 「新增了文件却忘了同步文档」正是文档与代码矛盾的复发入口"
 else
-	[ "$FAIL" -eq "$N" ] && pass "README 结构树覆盖了全部 Scripts / Files/etc / workflow"
+	[ "$FAIL" -eq "$N" ] && pass "README 结构树覆盖了全部 Scripts / Files/etc / workflow / Config"
 fi
 
 # ---------- C10：「软件页在慢链路上用得成吗」的两条防线 ----------

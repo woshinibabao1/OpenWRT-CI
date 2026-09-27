@@ -4,10 +4,16 @@
 #
 # 只做「低风险且可回滚」的项。SQM/CAKE 的限速速率需要真实上下行带宽，
 # 固件里不预设，刷机后请到「网络 → SQM QoS」按实测值填写（建议填带宽的 90%）。
+# ★ 2026-09-28：该菜单原先并不存在（只编了后端 sqm-scripts，没编前端 luci-app-sqm，
+#   真机核对无任何 sqm 页面）—— 已在 Config/GENERAL.txt 里补上 luci-app-sqm=y。
+#   若你手上的固件早于该版本，请用命令行配置：uci set sqm.<if>.enabled=1 && uci commit sqm
 
 # ---------- 1. flow offload：编译期选型（/etc/mt5700/flow-offload）+ 运行期与 SQM 互斥 ----------
 # 选型来源：构建期由 Scripts/ApplyFlowOffload.sh 写入固件 files 覆盖层
-#   /etc/mt5700/flow-offload（一行 MODE=<auto|off|on|on-hw>，默认 auto）。
+#   /etc/mt5700/flow-offload（一行 MODE=<auto|off|on|on-hw>。
+#   ★ 设计默认是 **off**，不是 auto（见本节末的解释与 WRT-CORE 的 `default: 'off'`）；
+#     下面第 40 行把 MODE 的**变量初值**设成 auto，只是「文件缺失时的兜底」，
+#     两者不是一回事 —— 原注释写成「默认 auto」会让人以为默认值变了。）
 #   也可刷机后在「网络 → 防火墙 → 常规设置」或 uci 改 firewall.@defaults[0].flow_offloading。
 # 实测依据（2026-09-18 真机只读体检，固件 r0-3e24625 / kernel 6.18.44）：
 #   · /sys/kernel/debug/ppe0 与 ppe1 存在 → MediaTek PPE 硬件转发表在；
@@ -208,6 +214,18 @@ for dev in $(uci -q show wireless | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/
 done
 
 # 5b. 5GHz：36 信道 + EHT160。
+#
+# ⚠️ 2026-09-28 说明：**本节的最终效果无法从真机读数判断**。
+#   判断条件 `uci -q get wireless.radio1.band` 确实返回 `5g`（条件成立），
+#   但真机上看到的却是 `channel='auto'` / `htmode='HE160'` —— 与本节所设不符。
+#   两种解释都成立、且无法区分：
+#     a) 写进去之后被 wifi 服务的配置生成覆盖（按 mac80211.uc 的默认重写）；
+#     b) 用户后来自己在 LuCI 里改过（**有独立证据**：该机 `default_radio1.ssid`
+#        不是默认的 OWRT、`encryption` 是 `sae-mixed` 而非脚本设的 `psk-mixed`）。
+#   注意上游 `mac80211.uc` 里 `if (width > 80) width = 80;` 会把生成的 htmode 后缀
+#   钉成 80 —— 若为真，连"编译产物是 160MHz"这个前提都不成立。详见 README 的
+#   「5G 频宽现状」与 Scripts/Settings.sh 的对应注释。
+#   本节保留（在旧结构固件上仍有效），但**不要拿真机的 160MHz 当它的功劳**。
 # ★ 2026-09-21 由 HE160/HE80 改为 **EHT160**，依据：
 #   ① 硬件与驱动都支持：`iw phy phy0 info` 明确列出 "EHT Iftypes: AP" 与
 #      "EHT-MCS Map (BW = 160)"（网卡 iwinfo 报 MediaTek MT7992E，HW Mode 802.11be）；

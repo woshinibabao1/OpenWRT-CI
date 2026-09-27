@@ -107,7 +107,19 @@ fi
 if [ -x /etc/init.d/apk-index-cache ]; then
 	chmod 0755 /etc/init.d/apk-index-cache 2>/dev/null
 	/etc/init.d/apk-index-cache enable 2>/dev/null || true
-	logger -t mt5700-sys "已启用 apk-index-cache（apk 索引跨重启保留，软件页不再每次都要手动 Update lists）"
+	# ★ `enable` 只建 /etc/rc.d/S96 软链，而 procd 的 rc 队列在开机那一刻就**一次性
+	#   展开完了**（procd 的 rcS 只 glob 一次 /etc/rc.d/S*，之后新建的软链进不了本次队列）。
+	#   本脚本跑在 S10，也就是说光 enable 的话，apk-index-cache 要等到**下一次开机**
+	#   才真正运行 —— 而它治的正是「每次重启后软件页都用不了」，首启等于没治。
+	#   这里补一次 start（该脚本幂等，且内部对后台 apk update 有 timeout 300 保护），
+	#   让首次开机就生效；之后各次开机由 S96 正常拉起。
+	#   ⚠️ mt5700-smp / mt5700-rps **不在这里补 start**：前者在 S10 时无线 IRQ 尚未注册、
+	#      后者要 stop 的 packet_steering（S25）此刻还没启动 —— 补了反而引入时序偏差；
+	#      它们由 hotplug.d/net/30-mt5700-rps 与「第二次开机」兜住。
+	#      这条时序结论与 99-mt5700-net 第 4 节那句「S* glob 开机那一刻就展开完了」
+	#      是同一条机制，只是当时没意识到它也适用于我们自己 enable 的服务。
+	/etc/init.d/apk-index-cache start 2>/dev/null || true
+	logger -t mt5700-sys "已启用并启动 apk-index-cache（首启即生效，不必等下次重启；apk 索引跨重启保留）"
 fi
 
 # ---------- 6. uhttpd 的 CGI 超时：60 → 300 秒 ----------

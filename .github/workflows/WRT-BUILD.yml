@@ -52,7 +52,7 @@ on:
         # 2026-09-19 改为默认 false：手动触发本工作流的意图通常就是要出固件，
         # 默认的 true 只会生成 .config，容易让人以为「跑完了但没产物」。
         # 只想校验配置时手动勾选 true 即可。
-        default: 'false'
+        default: false
         required: true
         type: boolean
 

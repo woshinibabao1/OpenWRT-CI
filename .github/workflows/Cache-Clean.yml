@@ -10,7 +10,11 @@ on:
   #   GitHub 会按 LRU 自动回收超配额缓存，需要彻底清理时手动触发本工作流即可。
   workflow_dispatch:
 
-permissions: write-all
+# 最小权限：本工作流只调 `gh cache delete --all`（Actions 缓存 API），
+# 因此只需要 actions: write。原先的 `write-all` 与 Guard-Check.yml 的
+# `contents: read` 形成同仓两种口径 —— 同一原则只落实了一半。
+permissions:
+  actions: write
 
 env:
   GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}

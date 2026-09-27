@@ -17,10 +17,22 @@
 #
 # 这里只做幂等的补齐：已存在就不动，用户改过的值不覆盖。
 
-# 只在本机型上生效，避免同一份 Files/ 被别的机型复用时凭空建接口
+# 只在本机型上生效，避免同一份 Files/ 被别的机型复用时凭空建接口。
+#
+# ★ 2026-09-28 改：区分「读不到机型」与「确认是别的机型」。原先两种情况一律
+#   `echo + exit 0`，而 uci-defaults 的每个脚本是被 source 在子 shell 里跑的，
+#   返回 0 就会被记为 applied、随后**脚本被删除** ⇒ 一次判据不成立就**永不重试**，
+#   而下面这三件事正是「刷完没网」的全部内容（MT5700M 接口 / 不收对端 DNS + 国内 DNS /
+#   加入防火墙 wan 区）。board_name 正常情况下由 preinit 的 02_sysinfo 写好，
+#   但"拿不到"时应当保留脚本、下次开机再来，而不是永久放弃。
+#   匹配同时改为大小写无关：上游可能给出 `HIVETON,H5000M` 这类形态。
 BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
-case "$BOARD" in
+case "$(printf '%s' "$BOARD" | tr '[:upper:]' '[:lower:]')" in
 	*h5000m*) ;;
+	'')
+		echo "99-mt5700-wan: 读不到 /tmp/sysinfo/board_name，保留本脚本待下次开机重试"
+		return 1 2>/dev/null || exit 1
+		;;
 	*)
 		echo "99-mt5700-wan: board='$BOARD' 非 H5000M，跳过"
 		exit 0

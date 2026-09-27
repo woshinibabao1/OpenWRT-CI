@@ -19,12 +19,24 @@ EDIT_FILES() {
 	done
 }
 
+# sed **替换串**里的特殊字符转义。
+# ★ 为什么必须做：$WRT_IP / $WRT_NAME / $WRT_SSID / $WRT_WORD 都来自 WRT-CORE.yml 的
+#   inputs.default —— 而仓库文档明确告诉用户「想改 SSID / 密码 / 管理地址就改那一处」，
+#   那里没有任何字符校验。未转义时的三种后果：
+#     &  → 展开成「整个匹配到的内容」，静默写错值；
+#     /  → sed 报 unknown option、命令失败 —— 而改 SSID / 密码那两处（下面 uc 分支）
+#          **没有回读断言**，于是 SSID / 密码静默保持上游默认（极端情形是空密码 AP），
+#          而 Release 说明照抄 $WRT_SSID / $WRT_WORD；
+#     \  → 吞掉后一个字符。
+#   WPA 密码里带 / 是很常见的，这条不是理论风险。
+esc() { printf '%s' "$1" | sed 's/[&/\\]/\\&/g'; }
+
 #移除luci-app-attendedsysupgrade
 EDIT_FILES "/attendedsysupgrade/d" ./feeds/luci/collections/ -name "Makefile"
 #修改默认主题
 EDIT_FILES "s/luci-theme-bootstrap/luci-theme-$WRT_THEME/g" ./feeds/luci/collections/ -name "Makefile"
 #修改immortalwrt.lan关联IP
-EDIT_FILES "s/192\.168\.[0-9]*\.[0-9]*/$WRT_IP/g" ./feeds/luci/modules/luci-mod-system/ -name "flash.js"
+EDIT_FILES "s/192\.168\.[0-9]*\.[0-9]*/$(esc "$WRT_IP")/g" ./feeds/luci/modules/luci-mod-system/ -name "flash.js"
 #添加编译日期标识
 EDIT_FILES "s/(\(luciversion || ''\))/(\1) + (' \/ $WRT_MARK-$WRT_DATE')/g" ./feeds/luci/modules/luci-mod-status/ -name "10_system.js"
 
@@ -34,6 +46,13 @@ WIFI_UC="./package/network/config/wifi-scripts/files/lib/wifi/mac80211.uc"
 #    zz-set-wireless.sh 与 set-wireless.sh 之类），而 [ -f "a\nb" ] 恒为假 ——
 #    于是会静默掉到 elif（甚至两个分支都不进），整个 wifi 配置无声不生效。
 #    下面的 sed 本来就支持多文件（`sed -i ... $WIFI_SH` 会把路径按空白拆开）。
+# ⚠️ 2026-09-28：本分支**当前永不执行**。上游 immortalwrt master 的
+#   target/linux/mediatek/filogic/base-files/etc/uci-defaults/ 下已没有
+#   *set-wireless.sh（只剩 05_fix-compat-version），上面的 find 必然返回空 →
+#   一律落到下面的 elif（mac80211.uc）。保留本分支（含 EHT160 逻辑与那条守卫告警）
+#   是为了将来上游若改回旧结构能自动接上，但**不要以为它在生效**：
+#   真机实测 5G 仍是 HE160 + channel=auto，而这条 warn 从未打印过。
+#   判据：2026-09-28 用 GitHub API 核对上游该目录 + 真机 `uci show wireless.radio1`。
 if [ -n "$WIFI_SH" ]; then
 	#修改WIFI名称
 	sed -i "s/BASE_SSID='.*'/BASE_SSID='$WRT_SSID'/g" $WIFI_SH
@@ -62,9 +81,9 @@ if [ -n "$WIFI_SH" ]; then
 	grep -q "htmode='EHT160'" $WIFI_SH || echo "::warning::Settings: $WIFI_SH 中未匹配到 htmode='VHT80' 锚点，5G 频宽未被改写（上游可能改了默认值）"
 elif [ -f "$WIFI_UC" ]; then
 	#修改WIFI名称
-	sed -i "s/ssid='.*'/ssid='$WRT_SSID'/g" $WIFI_UC
+	sed -i "s/ssid='.*'/ssid='$(esc "$WRT_SSID")'/g" $WIFI_UC
 	#修改WIFI密码
-	sed -i "s/key='.*'/key='$WRT_WORD'/g" $WIFI_UC
+	sed -i "s/key='.*'/key='$(esc "$WRT_WORD")'/g" $WIFI_UC
 	#修改加密方式为 WPA-PSK/WPA2-PSK Mixed Mode
 	sed -i "s/encryption = 'none'/encryption = 'psk-mixed'/g" $WIFI_UC
 	#设置国家码为 CN（6G 分支）
@@ -73,9 +92,41 @@ elif [ -f "$WIFI_UC" ]; then
 	sed -i "s/} else {/} else {\\n\\t\\tcountry = 'CN';/" $WIFI_UC
 	#修改2.4G默认频宽为 40MHz
 	sed -i 's/width = 20;/width = 40;/g' $WIFI_UC
-	#5G 保持 80MHz 上限（原因同上：CN 5.8G 限 80MHz；5.2G 的 160MHz 必然跨 DFS）
+	# 5G 频宽：下面两条 sed 是**故意注释掉**的，给出的理由是「5G 保持 80MHz 上限」。
+	#
+	# ★★ 2026-09-28 复核 —— 本段一度被我改成「注释理由与真机不符，上游默认本来就是
+	#    160MHz」，**那个更正本身是错的**，已撤回。如实记下事实与不确定处：
+	#    ① 上游 `mac80211.uc` 的写法是
+	#         let width = band.max_width; if (band_name == "2G") width = 20;
+	#         else if (width > 80) width = 80;   … 然后 htmode += width
+	#       也就是说只要 5G 的 max_width > 80，**编译期生成的 htmode 后缀必然是 80**
+	#       （EHT80 / HE80）。所以「保持 80MHz 上限」这个描述**与上游行为是一致的**；
+	#    ② 本机真机实测确实是 `HE160` + `channel=auto`，**但这台设备的 Wi-Fi 被手工改过**：
+	#       `wireless.default_radio1.ssid` 不是默认的 OWRT（是 Ajmd007-5G）、
+	#       `encryption` 是 `sae-mixed` 而不是脚本会设的 `psk-mixed`。
+	#       所以真机值**不能代表编译产物的状态**，拿它当证据会得出相反结论；
+	#    ③ `99-mt5700-net` 第 5b 节会设 `channel=36` + `htmode=EHT160`，而它确已执行
+	#       （`/etc/uci-defaults/` 已消费、同批次的 rpcd respawn 改动在真机上生效），
+	#       但**无法从当前真机状态判断它有没有被后续覆盖**——用户的手工改动同样会覆盖它。
+	#    结论：不要拿真机的 160MHz 当「上游默认」或「脚本已生效」的证据。要确定编译产物
+	#    的频宽，得刷一台**未被手工改过**的固件再看，或直接查本仓改过的 mac80211.uc。
+	#    ⚠️ 另注意上面 if 分支（$WIFI_SH）里那段改 EHT160 的逻辑**当前永不执行** ——
+	#      上游 .../filogic/base-files/etc/uci-defaults/ 下已无 *set-wireless.sh
+	#      （只剩 05_fix-compat-version），find 返回空 → 一贯走本 elif 分支。
+	#    要真正把 5G 定成某个频宽，唯一有效的位置就是这里（能影响 mac80211.uc 的输出）；
+	#    而频宽改动会触及 DFS，必须在真机上带自动回滚验证后再合。
 	#sed -i 's/width > 80)/width > 160)/g' $WIFI_UC
 	#sed -i 's/width = 80;/width = 160;/g' $WIFI_UC
+
+	# ★ 回读断言：uc 分支原先**一条都没有**（唯一那条 wifi 回读告警在 if 分支里，
+	#   而那个分支当前永不执行、见上方注释）。sed 零匹配、或值里含未转义字符时，
+	#   SSID / 密码会**静默保持上游默认** —— 用户拿到的是「刷完还是 ImmortalWrt、
+	#   或者干脆是空密码」的固件，而 CI 一路全绿。这里按下面 $CFG_FILE 那三处的
+	#   既有做法补上告警（判据是"内容真的变了"，不是"sed 没报错"）。
+	grep -qF "ssid='$WRT_SSID'" $WIFI_UC \
+		|| echo "::warning::Settings: $WIFI_UC 中 SSID 未写成 '$WRT_SSID'（上游模板改了锚点，或值含特殊字符）"
+	grep -qF "key='$WRT_WORD'" $WIFI_UC \
+		|| echo "::warning::Settings: $WIFI_UC 中 WIFI 密码未写成本次给定的值（上游模板改了锚点）"
 else
 	# ★ 两个候选都不存在 = 本次固件的 SSID / 密码 / 加密方式 / 国家码 / 频宽
 	#   **全部沿用上游默认**，而且不会有任何报错 —— 这正是本文件开头 EDIT_FILES
@@ -100,9 +151,9 @@ CFG_FILE="./package/base-files/files/bin/config_generate"
 #修改默认IP地址
 # （$WIFI_SH 那边是**故意**不引：find 可能返回多个路径，要靠空白分词传给 sed；
 #   这里的 $CFG_FILE 是单个确定路径，必须引 —— 路径一旦含空格就会静默 sed 到错误文件。）
-sed -i "s/192\.168\.[0-9]*\.[0-9]*/$WRT_IP/g" "$CFG_FILE"
+sed -i "s/192\.168\.[0-9]*\.[0-9]*/$(esc "$WRT_IP")/g" "$CFG_FILE"
 #修改默认主机名
-sed -i "s/hostname='.*'/hostname='$WRT_NAME'/g" "$CFG_FILE"
+sed -i "s/hostname='.*'/hostname='$(esc "$WRT_NAME")'/g" "$CFG_FILE"
 #修改默认时区
 sed -i "s/timezone='.*'/timezone='CST-8'/g" "$CFG_FILE"
 sed -i "s/zonename='.*'/zonename='Asia\/Shanghai'/g" "$CFG_FILE"

@@ -183,6 +183,10 @@ UPDATE_PACKAGE "luci-app-h5000m-fancontrol" "woshinibabao1/luci-app-h5000m-fanco
 # 链接器必须用 rust-lld（自包含 musl），否则 rustc 会驱动宿主 cc，交叉编译失败。
 SETUP_RUST_FOR_MT5700() {
 	local RUST_TARGET="aarch64-unknown-linux-musl"
+	# ★ 历史分支：x86 机型已于 2026-09-18 随 AP3000M / X86 的工作流与配置一起删除，
+	#   而 WRT-CORE 现在只会从 Config/*.txt 解析出 `mediatek`（WRT_TARGET），
+	#   所以下面这支**永远不可达**。留着是记录当年的取值，不代表还支持 x86；
+	#   真要用 x86，得先恢复对应的工作流与配置层。
 	case "${WRT_TARGET:-${WRT_CONFIG:-}}" in
 		x86) RUST_TARGET="x86_64-unknown-linux-musl" ;;
 	esac
@@ -197,10 +201,27 @@ SETUP_RUST_FOR_MT5700() {
 			| sh -s -- -y --profile minimal --default-toolchain stable
 	fi
 	export PATH="$HOME/.cargo/bin:$PATH"
-	rustup target add "$RUST_TARGET" || true
+	# ★ 两者都不能 `|| true` 吞掉（原实现是 `rustup target add … || true`）。
+	#   下面那行注释自己就写明了：rust-lld 缺失会让 `-C linker=rust-lld` 找不到链接器
+	#   而编译失败。吞掉它的后果是**故障被推迟几个小时**到 Compile Firmware，
+	#   届时以一条 cargo 报错的形式出现，离根因（安装阶段失败）很远。
+	#   这里按 UPDATE_PACKAGE 的克隆重试同款处理：重试 3 次、最终明确报错终止。
+	add_component() {
+		local what="$1"; shift
+		local try=1
+		while [ "$try" -le 3 ]; do
+			if rustup "$what" "$@" >/dev/null 2>&1; then return 0; fi
+			echo "::warning::rustup $what $* 第 $try 次失败，10 秒后重试"
+			try=$((try + 1))
+			sleep 10
+		done
+		echo "::error::rustup $what $* 连续 3 次失败 —— rust 工具链不完整，后续 cargo 交叉编译必然失败（rust-lld 缺失时现象是 'linker rust-lld not found'）"
+		exit 1
+	}
 	# rust-lld 是自包含 musl 静态链接的必需组件，minimal profile 不自带，
 	# 缺失会导致 "-C linker=rust-lld" 找不到链接器而编译失败。
-	rustup component add rust-lld || true
+	add_component target add "$RUST_TARGET"
+	add_component component add rust-lld
 	echo "luci-app-mt5700: rustup ready, target=$RUST_TARGET"
 
 	# 让后续 GitHub Actions 步骤（尤其 Compile Firmware）能找到 cargo。
@@ -233,7 +254,16 @@ INSTALL_NET_TUNING() {
 	local SRC_DIR="${GITHUB_WORKSPACE:-$(pwd)/../..}/Files"
 	local DST_DIR="${GITHUB_WORKSPACE:-$(pwd)/../..}/wrt/files"
 
-	[ -d "$SRC_DIR" ] || { echo "net-tuning: $SRC_DIR 不存在，跳过"; return 0; }
+	# ★ 这里必须**硬失败**，不能 return 0。
+	#   同一个函数里，「单个覆盖层文件缺失」是 ::error:: + exit 1（见下方逐文件断言），
+	#   而「整个源目录缺失」原来却是静默跳过 —— 政策自相矛盾，且后者的后果更大：
+	#   Files/ 是 TTL 规则 / sysctl / uci-defaults / init.d 的全部来源，
+	#   缺了它固件照样能编能刷，只是「刷完没网、没有 RTT 统一、没有网络调优」，
+	#   而下面 272-277 行的注释自己就写着这种情况的后果。
+	#   （原先它没变成静默洞，只是**靠另一个脚本的副作用兜住**：ApplyFlowOffload.sh
+	#     检查 wrt/files 是否存在、不存在即 exit 2，而这里提前返回时该目录从未被创建。
+	#     那种"靠别处报错来兜底"的耦合不该继续。）
+	[ -d "$SRC_DIR" ] || { echo "::error::net-tuning: 源目录 $SRC_DIR 不存在 —— Files/ 覆盖层全部内容（TTL 规则 / sysctl / uci-defaults / init.d / hotplug）都不会进固件"; exit 1; }
 
 	mkdir -p "$DST_DIR/etc/uci-defaults" "$DST_DIR/etc/sysctl.d" "$DST_DIR/etc/nftables.d" "$DST_DIR/etc/hotplug.d/net"
 	cp -rf "$SRC_DIR/etc/." "$DST_DIR/etc/"
