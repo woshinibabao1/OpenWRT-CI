@@ -381,6 +381,55 @@ fi
 
 [ "$FAIL" -eq "$N" ] && pass "慢链路两点都守着：uhttpd CGI 预算 ${UP_T}s、package-manager-call 的两个补丁都在"
 
+# ---------- C11：Rust 交叉编译前提 —— 不许赌「组件名」 ----------
+# 事故（GHA run 36408269360，10:20:18 在 Custom Packages 中断）：Packages.sh 写的是
+# `rustup component add rust-lld`，而**Rust 官方发行清单里没有名为 rust-lld 的组件**
+# （channel-rust-stable.toml 里携带 LLD 的只有 llvm-tools-preview 与
+# llvm-bitcode-linker-preview）。于是那行**每次必失败**：重试 3 次白烧 30 秒，
+# 最后以「rust 工具链不完整」终止整条流水线 —— 真实原因只是一个不存在的组件名。
+# 判定证据：同一 job 内 `rustup target add aarch64-unknown-linux-musl` 是成功的
+# （工具链可写、可用、默认 toolchain 正常），只有 component add 那条瞬时失败，
+# 且失败间隔恰好等于重试的 sleep 10s —— 确定性参数错误，不是网络抖动。
+# 钉两件事：① 只用清单里真实存在的组件名；② 判据是**产物存在**（rust-lld 可执行
+# 文件），不是某条命令的返回码 —— 前者换 toolchain 也不会误判，后者会随版本漂移。
+echo "-- C11 Rust 交叉编译前提（组件名 + 产物验收）"
+N=$FAIL
+
+PKG_SH="Scripts/Packages.sh"
+
+# ① 可执行的 `component add <名>` 必须在白名单内。
+#    ★ 必须排除注释行 —— 上面的修复说明里正引用了那个错误写法，
+#      不排除的话这条守卫会把自己判红（和 C1 拆 SLASH/STAR 是同一个动机）。
+#    ★ 匹配 `component add` 而不是 `rustup component add`：本仓是通过
+#      add_component() 包装调用的，只认前者会**漏掉真正的调用点**。
+COMP_NAMES="$(awk '!/^[[:space:]]*#/' "$PKG_SH" \
+	| grep -oE 'component add [a-z0-9-]+' | awk '{print $3}' | sort -u || true)"
+while IFS= read -r COMP; do
+	[ -n "$COMP" ] || continue
+	case "$COMP" in
+		llvm-tools|llvm-tools-preview) ;;
+		*) fail "C11 $PKG_SH 执行了 'component add $COMP'，但它不是 Rust 发行清单里的组件（携带 LLD 的只有 llvm-tools / llvm-tools-preview）—— 这行会每次必失败，报错还会把根因引向「工具链不完整」" ;;
+	esac
+done <<EOF
+$COMP_NAMES
+EOF
+
+# ② 必须按**产物**验收 rust-lld，而不是按命令返回码。
+if ! grep -qF 'find_rust_lld()' "$PKG_SH"; then
+	fail "C11 $PKG_SH 缺少 find_rust_lld()：rust-lld 必须按「可执行文件找得到」判定"
+fi
+if ! awk '!/^[[:space:]]*#/' "$PKG_SH" | grep -qF '[ -z "$RUST_LLD" ]'; then
+	fail "C11 $PKG_SH 没有对 RUST_LLD 的空值判定 —— 找不到 rust-lld 时必须就地判红，否则故障推迟到 Compile Firmware 才以 'linker rust-lld not found' 暴露，离根因几小时"
+fi
+
+# ③ 报错必须看得见：add_component 不许再丢弃 rustup 输出。
+#    原实现 `rustup ... >/dev/null 2>&1` 导致连续 3 次失败零证据，只能靠猜。
+if ! awk '!/^[[:space:]]*#/' "$PKG_SH" | grep -qF 'out="$(rustup'; then
+	fail "C11 $PKG_SH 的 add_component 没有捕获 rustup 输出：失败时会打印「第 N 次失败」却没有任何真实报错，无法定位（run 36408269360 就是无证据排查）"
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "组件名合法（只用 $(printf '%s' "${COMP_NAMES:-无}" | tr '\n' '/')）、rust-lld 按产物验收、失败时带 rustup 原始报错"
+
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then
 	echo "::error::静态自检未通过，请修正后再编译"

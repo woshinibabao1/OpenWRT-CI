@@ -1,5 +1,99 @@
 # 更新日志
 
+## [2026-09-28 · 一] 修 `rustup component add rust-lld` —— 那个组件根本不存在（Custom Packages 必中断）
+
+真机 run：[`36408269360`](https://github.com/woshinibabao1/OpenWRT-CI/actions/runs/36408269360)
+（WRT-BUILD，`main@f68511f`）。8 分 9 秒后停在 **第 11 步 Custom Packages**：
+
+```
+10:19:48  ##[warning]rustup component add rust-lld 第 1 次失败，10 秒后重试
+10:19:58  ##[warning]rustup component add rust-lld 第 2 次失败，10 秒后重试
+10:20:08  ##[warning]rustup component add rust-lld 第 3 次失败，10 秒后重试
+10:20:18  ##[error]…连续 3 次失败 —— rust 工具链不完整…
+```
+
+### 根因：组件名不存在
+
+Rust 官方发行清单（`channel-rust-stable.toml`）里**没有名为 `rust-lld` 的组件** ——
+携带 LLD 的只有 **`llvm-tools-preview`**（rustup 记作 `llvm-tools`）与
+`llvm-bitcode-linker-preview`。所以那行**每次必失败**，重试 3 次纯属空转 30 秒，
+最后以一句「工具链不完整」把整条流水线终止 —— 报错信息还把人往错误方向带。
+
+**判定证据（同一 job 内自证，不需要额外实验）**：
+
+| 事实 | 说明 |
+| :-- | :-- |
+| `rustup target add aarch64-unknown-linux-musl` **成功** | 工具链可写、可用、默认 toolchain 正常 → 排除「环境坏了」「权限不足」「没设默认工具链」 |
+| `component add` 每次**瞬时**失败 | 不是下载超时；失败间隔恰好 = 重试的 `sleep 10` → 确定性参数错误，不是网络抖动 |
+| 清单里查无此组件 | `pkg.rust-lld` 不存在 |
+
+另外注意这是**一次回归**：本地旧版写的是 `rustup component add rust-lld || true`
+（吞掉失败，无害空转），改成「硬失败 + 重试 3 次」后，把一次静默空转升级成了构建终止。
+
+### 修复（`Scripts/Packages.sh`）
+
+不再赌组件名，改成**验收产物**+**兜底**+**可见报错**三件事：
+
+1. **按产物验收**：`find_rust_lld()` 在 `$SYSROOT` 下找 `rust-lld*` 可执行文件 ——
+   真正的前提是「链接器找得到」，不是「某条 rustup 命令返回 0」。rustc 自带时无需任何操作。
+2. **兜底**：找不到才 `llvm-tools` → `llvm-tools-preview` 依次尝试（两个名字都试，不再赌）。
+3. **报错可见**：`add_component` 原实现是 `>/dev/null 2>&1`，于是 3 次失败**零证据**，
+   只能靠猜。改为捕获输出、失败时打印前 300 字符；并且它只负责**报告**，
+   是否致命交给调用方 —— 否则兜底成功时页面上仍会挂一个红色 error 注解。
+4. 最终仍找不到 → 打印 `rustc -vV` / `rustup show` / 已装组件清单后 exit 1。
+
+顺带省掉那 **30 秒**空转重试（`sleep 10 × 3`）。
+
+### 新增静态闸门 C11（`Scripts/SelfCheck.sh`）
+
+这类错误「编译前必炸、且报错指错方向」，所以静态钉住三条：
+
+- **①** 可执行的 `component add <名>` 必须在白名单（`llvm-tools` / `llvm-tools-preview`）内；
+  ★ 匹配的是 `component add` 而非 `rustup component add` —— 本仓走 `add_component()` 包装
+  调用，只认前者会漏掉真正的调用点；★ 必须排除注释行，否则修复说明里引用的错误写法会自判红。
+- **②** 必须存在 `find_rust_lld()`，且必须有 `[ -z "$RUST_LLD" ]` 空值闸门 ——
+  否则故障会推迟到 Compile Firmware 才以 `linker rust-lld not found` 暴露，离根因几小时。
+- **③** `add_component` 必须捕获 rustup 输出 —— 防止「失败无证据」再次回来。
+
+**变异验证**（4/4 判红，还原后全绿）：
+
+| 变异 | 结果 |
+| :-- | :-- |
+| 组件名换回 `rust-lld` | ✗ 判红（并连带发现 `rust-lld-preview` 也会被判） |
+| `find_rust_lld()` 改名 | ✗ 判红 |
+| 删掉 `RUST_LLD` 空值闸门 | ✗ 判红 |
+| `add_component` 改回丢弃输出 | ✗ 判红 |
+
+### 顺带量到的耗时（本次未改，作为下次的候选）
+
+按日志时间空档统计（≥3 秒的空档合计 **204 秒**，其中最大的 20 个已列）：
+
+| 耗时 | 位置 | 说明 |
+| --: | :-- | :-- |
+| **81.8 s** | `Building format(s) --all.` | **TeX Live 的 postinst**（`fmtutil-sys --all`） |
+| **30.2 s** | rust-lld 重试 | 本次已消除 |
+| 22.3 s | `[INFO] Checking network...` → `apt update` | 上游脚本行为 |
+| 19.2 s | cache restore 解包 | 工具链 + 下载缓存两份 |
+| 8.7 + 6.7 s | 若干 apt 下载 | — |
+
+TeX Live 的来源已定位：上游 `init_build_environment.sh` 的安装清单里并没有 `texlive`，
+它是 **`asciidoc` → `asciidoc-dblatex` → `dblatex` → `default-jre` + 一整套 texlive**
+（推荐依赖）带进来的（run 日志 878–942 行的 NEW packages 列表可见）。
+
+候选改法（**本次故意没做**，理由见下）：在跑上游脚本前放一个定向 pin，
+只挡 TeX 相关包、其余推荐依赖不动：
+
+```
+# /etc/apt/preferences.d/99-no-texlive
+Package: texlive* dblatex tex-gyre tipa
+Pin: release *
+Pin-Priority: -1
+```
+
+★ **为什么这次没顺手改**：它属于「删掉之后照样能编译、只在真机某个包上才炸」的类型，
+而唯一的验证方式是一次**完整编译**。稳定性优先于速度，所以先只把结论和补丁留在案，
+要做得先备好一次全量跑。
+
 ## [2026-09-28 · 五] 修复 `FLOW_OFFLOAD` 选项被 YAML 吃成布尔（会导致编译中断）
 
 在验证「MT5700-Console 转私有后本仓库还能不能拉到源码」时，`workflow_dispatch` 派发被

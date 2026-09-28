@@ -271,28 +271,61 @@ SETUP_RUST_FOR_MT5700() {
 			| sh -s -- -y --profile minimal --default-toolchain stable
 	fi
 	export PATH="$HOME/.cargo/bin:$PATH"
-	# ★ 两者都不能 `|| true` 吞掉（原实现是 `rustup target add … || true`）。
-	#   下面那行注释自己就写明了：rust-lld 缺失会让 `-C linker=rust-lld` 找不到链接器
-	#   而编译失败。吞掉它的后果是**故障被推迟几个小时**到 Compile Firmware，
-	#   届时以一条 cargo 报错的形式出现，离根因（安装阶段失败）很远。
-	#   这里按 UPDATE_PACKAGE 的克隆重试同款处理：重试 3 次、最终明确报错终止。
+	# ★ 重试必须**看得见原因**：原实现是 `rustup "$what" "$@" >/dev/null 2>&1`，
+	#   于是一次真机上连续 3 次失败却一条证据都没留下（GHA run 36408269360 就是如此：
+	#   日志里只有三行「第 N 次失败」，拿不到 rustup 的报错，只能靠猜）。
+	#   改成捕获输出、失败时打印（截断 300 字符，避免刷屏）。
+	# 注意：这里只负责**报告**，是否致命由调用方决定 —— 若在这里直接 echo ::error::，
+	#   下面的 llvm-tools 兜底即使成功了，run 页面上也会挂一个红色的 error 注解。
 	add_component() {
 		local what="$1"; shift
-		local try=1
+		local try=1 out
 		while [ "$try" -le 3 ]; do
-			if rustup "$what" "$@" >/dev/null 2>&1; then return 0; fi
-			echo "::warning::rustup $what $* 第 $try 次失败，10 秒后重试"
+			if out="$(rustup "$what" "$@" 2>&1)"; then return 0; fi
+			echo "::warning::rustup $what $* 第 $try 次失败：$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-300)"
 			try=$((try + 1))
 			sleep 10
 		done
-		echo "::error::rustup $what $* 连续 3 次失败 —— rust 工具链不完整，后续 cargo 交叉编译必然失败（rust-lld 缺失时现象是 'linker rust-lld not found'）"
+		return 1
+	}
+
+	# ── rust-lld 的正确拿法（2026-09-28 修；起因：run 36408269360 在 Custom Packages 中断）──
+	# ★ 事故根因：这里原本写的是 `rustup component add rust-lld`，而**官方发行清单里
+	#   根本没有名为 `rust-lld` 的组件** —— channel-rust-*.toml 里携带 LLD 的只有
+	#   `llvm-tools-preview`（rustup 把它记作 llvm-tools）与 `llvm-bitcode-linker-preview`。
+	#   所以那行**每次必失败**：3 次重试纯属空转 30 秒，最后以「rust 工具链不完整」
+	#   终止整条流水线 —— 而真实原因只是一个**不存在组件名**。
+	#   判定证据（同一 job 内）：`rustup target add aarch64-unknown-linux-musl` 成功
+	#   （说明工具链可写、可用、默认 toolchain 正常），只有 component add 那条每次瞬时
+	#   失败，且失败间隔恰好等于重试的 sleep 10s —— 典型的确定性参数错误，不是网络抖动。
+	# ★ 因此不再赌组件名，改为**验收产物**：真正的前提是「rust-lld 这个可执行文件存在
+	#   且能被 rustc 找到」，而不是「某条 rustup 命令返回 0」。rustc 自带时无需额外操作。
+	find_rust_lld() {
+		find "$(rustc --print sysroot)" -name 'rust-lld*' -type f 2>/dev/null | head -n 1 || true
+	}
+
+	add_component target add "$RUST_TARGET" || {
+		echo "::error::目标 std 装不上：$RUST_TARGET —— 缺了它连编译都开始不了"
 		exit 1
 	}
-	# rust-lld 是自包含 musl 静态链接的必需组件，minimal profile 不自带，
-	# 缺失会导致 "-C linker=rust-lld" 找不到链接器而编译失败。
-	add_component target add "$RUST_TARGET"
-	add_component component add rust-lld
-	echo "luci-app-mt5700: rustup ready, target=$RUST_TARGET"
+
+	RUST_LLD="$(find_rust_lld)"
+	if [ -z "$RUST_LLD" ]; then
+		# 两个名字都试一次，别再把「名字赌错」变成构建失败的根因。
+		add_component component add llvm-tools \
+			|| add_component component add llvm-tools-preview \
+			|| true
+		RUST_LLD="$(find_rust_lld)"
+	fi
+
+	if [ -z "$RUST_LLD" ]; then
+		echo "::error::找不到 rust-lld（应为 \$SYSROOT/lib/rustlib/*/bin/rust-lld）—— 后续 cargo 交叉编译会以 'linker rust-lld not found' 失败。诊断信息："
+		rustc -vV || true
+		rustup show || true
+		rustup component list --installed || true
+		exit 1
+	fi
+	echo "luci-app-mt5700: rustup ready, target=$RUST_TARGET, rust-lld=$RUST_LLD"
 
 	# 让后续 GitHub Actions 步骤（尤其 Compile Firmware）能找到 cargo。
 	# PATH 只能通过 GITHUB_PATH 追加；不要写入 GITHUB_ENV 的 PATH（会整段覆盖）。
