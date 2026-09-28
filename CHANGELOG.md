@@ -1,5 +1,58 @@
 # 更新日志
 
+## [2026-09-28 · 四] 构建对仓库可见性免疫：MT5700 Console 转私有后又转回公开
+
+`luci-app-mt5700` 的唯一源码源 `woshinibabao1/MT5700-Console` 今天在 public / private
+之间来回切了一次（转私有 → 恢复开源 → 又转私有 → 最终**恢复开源**）。
+而 `Scripts/Packages.sh` 是用**匿名 HTTPS** 克隆它的（硬编码
+`https://github.com/$PKG_REPO.git`，`UPDATE_PACKAGE ... MT5700-Console`）：
+
+仓库私有时会要求认证 → CI 里必然失败（`could not read Username`）→ 连续 3 次后
+命中 `P07` 的 `exit 1` → **整条编译中断**。好的一面是 P07 是硬失败而非静默缺包，
+不会编出一个没有控制台的固件。
+
+最终结论：**仓库继续开源**（贡献记录要能被别人看到），但**构建不该再被可见性牵着走** ——
+否则每次切换都要改这个仓库并重跑一轮。
+
+### 做法：有密钥走 SSH，没密钥回退匿名 HTTPS
+
+| 项 | 做法 |
+| :-- | :-- |
+| 凭据 | `MT5700-Console` 上一把 **read-only Deploy Key**（ed25519）。实测 push 被拒：`The key you are authenticating with has been marked as read only.` |
+| 传递 | 私钥存为 secret `MT5700_DEPLOY_KEY`，**只注入 `Custom Packages` 这一步** |
+| 生命周期 | 写到 `0600` 临时文件 → 设 `GIT_SSH_COMMAND` → 克隆完或失败**立即删除**，另挂 `trap ... EXIT` 兜底 |
+| **回退** | `PKG_AUTH=ssh` 时若 `MT5700_DEPLOY_KEY` 为空（他人 fork）或密钥准备失败，**回退匿名 HTTPS** 并记一条 notice/warning —— 不致中断构建 |
+| 影响面 | 只有 `PKG_AUTH=ssh` 的调用走这条分支；其余（argon 等）**始终**匿名 HTTPS |
+| 为什么不用 PAT | Deploy Key 权限更小（只读 + 只对这一个仓库生效）、无过期轮换问题、也不会以 URL 形态出现在进程列表或日志里 |
+
+`GIT_SSH_COMMAND` 用 `IdentitiesOnly=yes`（只用这把钥匙，不把 runner 上其它密钥送出去）
+与 `StrictHostKeyChecking=accept-new`（首次 TOFU 记住 GitHub 主机公钥，之后若变化会被检出）。
+
+**为什么不做成「只支持私有」**：本仓库是个 fork，别人可能拿它编自己的固件而拿不到这个
+secret。做成「缺凭据即回退公开通道」后，四种组合都能跑：公开+有密钥、公开+无密钥、
+私有+有密钥 ✓；私有+无密钥则明确失败（符合预期）。
+
+### 改动清单
+
+| 文件 | 改动 |
+| :-- | :-- |
+| `Scripts/Packages.sh` | 新增 `setup_private_repo_key` / `cleanup_private_repo_key`；`UPDATE_PACKAGE` 新增第 6 参数 `PKG_AUTH`（`ssh` ⇒ 可能私有）；`luci-app-mt5700` 那一行传 `"ssh"`；克隆目标由硬编码 URL 改为 `$CLONE_URL`；失败文案补「凭据失效」 |
+| `.github/workflows/WRT-CORE.yml` | `Custom Packages` 步骤新增 `env: MT5700_DEPLOY_KEY`（**只在这一步** —— 这一步克隆的第三方 Makefile 会被后面的编译执行，不该让它们看到令牌） |
+
+### 验证
+
+- 本地用该私钥 `git clone git@github.com:woshinibabao1/MT5700-Console.git` → **成功**
+  （167 个文件，`PKG_VERSION:=2.4.6`）；同一把钥匙 `git push` → **被拒**（read only），确认最小权限；
+- `Packages.sh` 与其余 7 个脚本 `bash -n` 全通过；`WRT-CORE.yml` YAML 解析通过、
+  `Custom Packages` 的 env 值正确；
+- 端到端：手动触发 `WRT-BUILD`，观察 `Custom Packages` 步骤。
+
+### 回退
+
+把 `luci-app-mt5700` 那一行的第 6 参数 `"ssh"` 去掉即可完全回到改动前（匿名 HTTPS）；
+若仓库长期公开且不想留这把钥匙，删掉仓库的 Deploy Key 与 `MT5700_DEPLOY_KEY` secret 即可 ——
+**代码无需再动**（缺密钥会自动走匿名 HTTPS）。
+
 ## [2026-09-28 · 三] 全仓审计修复批：能力宣称与产物不一致（mwan3 / SQM / EHT160）+ 权限与守卫
 
 起因是「全面分析，看还有没有更完善的地方」。审计覆盖工作流 / 构建脚本 / 设备端注入层 /

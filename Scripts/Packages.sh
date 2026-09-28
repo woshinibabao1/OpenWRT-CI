@@ -2,6 +2,53 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 VIKINGYFY
 
+# ============================================================================
+# 私有仓库的只读部署密钥（2026-09-28）
+#
+# 背景：luci-app-mt5700 的唯一源码源 woshinibabao1/MT5700-Console 曾被转为 private
+# （2026-09-28，随后又转回 public）。而本脚本用**匿名 HTTPS** 克隆第三方插件 ——
+# 仓库私有时会要求认证，在 CI 里必然失败（could not read Username），
+# 连续 3 次后命中下面的 P07 exit 1，整条编译中断。
+#
+# 因此这里的目标不是「支持私有」，而是**让构建对仓库可见性免疫**：
+# 公开时走匿名 HTTPS（零凭据依赖），私有时走只读部署密钥，切换可见性**不必改代码**。
+#
+# 做法：给该仓库配一把 **read-only** Deploy Key，私钥经 workflow 的 env 传进来
+# （secret MT5700_DEPLOY_KEY），且只在需要它的那一次克隆期间存在：
+#   · 私钥落到 0600 的临时文件（umask 077），克隆完成或失败都立即删除，
+#     另挂 trap 兜底 —— 不留到下一步骤；
+#   · 只在克隆期间设置 GIT_SSH_COMMAND，不动全局 ~/.ssh/config，
+#     也不影响其它（公开）仓库继续走匿名 HTTPS；
+#   · IdentitiesOnly=yes —— 只用这一把钥匙，不会把 runner 上的其它密钥送出去；
+#   · StrictHostKeyChecking=accept-new —— 首次接受 GitHub 主机公钥并记住（TOFU），
+#     比 no 安全：之后主机公钥若变化会被检出。
+# 这把钥匙在 GitHub 侧标记为 read-only，实测 push 会被拒：
+#   ERROR: The key you are authenticating with has been marked as read only.
+# ============================================================================
+DEPLOY_KEY_FILE='/tmp/.mt5700_deploy_key'
+DEPLOY_KNOWN_HOSTS='/tmp/.mt5700_known_hosts'
+
+setup_private_repo_key() {
+	if [ -z "$MT5700_DEPLOY_KEY" ]; then
+		echo "::error::需要私有仓库凭据，但 MT5700_DEPLOY_KEY 为空 —— 请在 workflow 的这一步注入 secrets.MT5700_DEPLOY_KEY"
+		return 1
+	fi
+	# umask 077：私钥必须是 0600，否则 ssh 直接拒绝使用
+	if ! ( umask 077; printf '%s\n' "$MT5700_DEPLOY_KEY" > "$DEPLOY_KEY_FILE" ); then
+		echo "::error::写入部署密钥失败：$DEPLOY_KEY_FILE"
+		return 1
+	fi
+	export GIT_SSH_COMMAND="ssh -i $DEPLOY_KEY_FILE -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$DEPLOY_KNOWN_HOSTS"
+	# 兜底：脚本无论怎么退出，私钥都不该留在 runner 磁盘上
+	trap cleanup_private_repo_key EXIT
+	return 0
+}
+
+cleanup_private_repo_key() {
+	rm -f "$DEPLOY_KEY_FILE"
+	unset GIT_SSH_COMMAND
+}
+
 #安装和更新软件包
 UPDATE_PACKAGE() {
 	local PKG_NAME=$1
@@ -9,7 +56,10 @@ UPDATE_PACKAGE() {
 	local PKG_BRANCH=$3
 	local PKG_SPECIAL=$4
 	local PKG_LIST=("$PKG_NAME" $5)  # 第5个参数为自定义名称列表
+	local PKG_AUTH=$6                # 第6个参数（可选）：'ssh' ⇒ 私有仓库，用部署密钥
 	local REPO_NAME=${PKG_REPO#*/}
+	# 默认匿名 HTTPS（绝大多数第三方仓库都是公开的）
+	local CLONE_URL="https://github.com/$PKG_REPO.git"
 
 	echo " "
 
@@ -30,15 +80,32 @@ UPDATE_PACKAGE() {
 		fi
 	done
 
+	# PKG_AUTH=ssh ⇒ 该仓库**可能**私有：有部署密钥就走 SSH。
+	# 没有密钥时回退匿名 HTTPS 而不是报错，这覆盖两种真实场景：
+	#   · 仓库已转回公开（2026-09-28 确实来回切过一次）；
+	#   · 他人 fork 了本仓库去编自己的固件，但拿不到这个 secret。
+	# 一个缺失的凭据不该把别人的构建直接打断。
+	if [ "$PKG_AUTH" = "ssh" ]; then
+		if [ -n "$MT5700_DEPLOY_KEY" ]; then
+			if setup_private_repo_key; then
+				CLONE_URL="git@github.com:$PKG_REPO.git"
+			else
+				echo "::warning::部署密钥准备失败，回退匿名 HTTPS 克隆 $PKG_REPO"
+			fi
+		else
+			echo "::notice::$PKG_REPO 标了 ssh 但未提供 MT5700_DEPLOY_KEY —— 按公开仓库走匿名 HTTPS"
+		fi
+	fi
+
 	# 克隆 GitHub 仓库
-	# P07：克隆失败（分支改名 / 仓库私有 / 限流）必须立即终止，
+	# P07：克隆失败（分支改名 / 仓库私有 / 凭据失效 / 限流）必须立即终止，
 	# 否则会静默缺包，最终表现为「插件莫名没了」而不是构建失败。
 	# 但「失败」要区分偶发与必然：GitHub 对 CI 出口 IP 的限流（403 / early EOF）
 	# 是偶发的，一次失败就 exit 1 会让几小时的构建白跑，故先重试 3 次。
 	# 重试前必须删掉残留目录，否则 git 会以 "destination path already exists" 直接失败。
 	local TRY=1
 	while [ "$TRY" -le 3 ]; do
-		if git clone --depth=1 --single-branch --branch $PKG_BRANCH "https://github.com/$PKG_REPO.git"; then
+		if git clone --depth=1 --single-branch --branch $PKG_BRANCH "$CLONE_URL"; then
 			break
 		fi
 		echo "::warning::克隆 $PKG_REPO@$PKG_BRANCH 第 $TRY 次失败，5 秒后重试"
@@ -47,9 +114,12 @@ UPDATE_PACKAGE() {
 		sleep 5
 	done
 	if [ ! -d "./$REPO_NAME" ]; then
-		echo "::error::克隆 $PKG_REPO@$PKG_BRANCH 连续 3 次失败（分支改名/仓库私有/限流）"
+		echo "::error::克隆 $PKG_REPO@$PKG_BRANCH 连续 3 次失败（分支改名/仓库私有/凭据失效/限流）"
+		if [ "$PKG_AUTH" = "ssh" ]; then cleanup_private_repo_key; fi
 		exit 1
 	fi
+	# 克隆成功即收回私钥：后面不再需要，别留在 runner 上
+	if [ "$PKG_AUTH" = "ssh" ]; then cleanup_private_repo_key; fi
 
 	# 处理克隆的仓库
 	if [[ "$PKG_SPECIAL" == "pkg" ]]; then
@@ -321,7 +391,8 @@ case "$MT_MODE" in
 		# LuCI 前端 + Rust 后端 at-webserver-rust，PKG_NAME=luci-app-mt5700）。
 		# 注意：仓库名与包名不同，故用第 4 参数 "name" 把克隆目录重命名为包名，
 		# 保证 OpenWrt 扫描 package/ 时目录与 PKG_NAME 一致。
-		UPDATE_PACKAGE "luci-app-mt5700" "woshinibabao1/MT5700-Console" "main" "name"
+		# ★ 该仓库是 private，第 6 参数 "ssh" ⇒ 用只读 Deploy Key（见文件顶部说明）
+		UPDATE_PACKAGE "luci-app-mt5700" "woshinibabao1/MT5700-Console" "main" "name" "" "ssh"
 		SETUP_RUST_FOR_MT5700
 		# 防污染：若工作区意外出现 mt5700m 相关目录，主动移除
 		rm -rf ./luci-app-mt5700m ./luci-app-mt5700m_shell

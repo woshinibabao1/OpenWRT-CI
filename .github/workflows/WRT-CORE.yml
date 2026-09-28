@@ -322,6 +322,15 @@ jobs:
           [ "$OK" = "1" ] || { echo "::error::feeds update/install 连续 3 次失败"; exit 1; }
 
       - name: Custom Packages
+        # ★ 2026-09-28：luci-app-mt5700 的源码在**私有**仓库里
+        #   （woshinibabao1/MT5700-Console），匿名 HTTPS 克隆必然失败。
+        #   Packages.sh 对需要它的那一次克隆改用只读 Deploy Key（见该文件顶部说明）。
+        #   密钥**只注入这一步** —— 这一步会克隆一批第三方插件，而它们的 Makefile
+        #   会进构建树、由后面的 Compile Firmware 执行；编译期跑的第三方代码
+        #   不该看得到任何令牌（与本文件 2026-09-28 移除 job 级 GITHUB_TOKEN 同一理由）。
+        #   Packages.sh 克隆完成即删除私钥文件（另有 trap 兜底），不留到下一步。
+        env:
+          MT5700_DEPLOY_KEY: ${{ secrets.MT5700_DEPLOY_KEY }}
         run: |
           cd ./wrt/package/
 
