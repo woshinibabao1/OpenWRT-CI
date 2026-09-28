@@ -1,5 +1,58 @@
 # 更新日志
 
+## [2026-09-28 · 五] 修复 `FLOW_OFFLOAD` 选项被 YAML 吃成布尔（会导致编译中断）
+
+在验证「MT5700-Console 转私有后本仓库还能不能拉到源码」时，`workflow_dispatch` 派发被
+GitHub 以 422 拒绝：
+
+```
+Provided value 'off' for input 'FLOW_OFFLOAD' not in the list of allowed values
+```
+
+查下去发现是 **YAML 的坑**：`WRT-BUILD.yml` / `H5000M-MT-AUTO.yml` 的 options 写的是裸值
+
+```yaml
+        options:
+          - auto
+          - off        # ← YAML 1.1 把裸写的 off 当布尔 false
+          - on         # ← 同理，当 true
+          - on-hw
+```
+
+解析结果实测是 `['auto', False, True, 'on-hw']`。两个后果：
+
+1. `default: 'off'`（带引号，是字符串）**不在选项列表里** → 用默认值派发必被 422 拒；
+2. 网页下拉框显示成 `auto / false / true / on-hw`，用户选「off」实际传下去的是字符串
+   `"false"` —— 而 `Scripts/ApplyFlowOffload.sh` 的 case 只认 `auto|off|on|on-hw`：
+
+   ```bash
+   case "$MODE" in
+   auto|off|on|on-hw) ;;
+   *) echo "::error::非法 WRT_FLOW_OFFLOAD='$MODE'（仅允许 auto/off/on/on-hw），终止 CI"; exit 1 ;;
+   ```
+
+   → **报「非法」并 exit 1，整个编译中断**。
+
+### 修复
+
+给 options 的 `off` / `on` 加引号，使选项名、默认值、脚本接受值三者一致：
+
+```yaml
+        options:
+          - 'auto'
+          - 'off'
+          - 'on'
+          - 'on-hw'
+```
+
+两处同源问题一并修：`WRT-BUILD.yml`、`H5000M-MT-AUTO.yml`（后者是 `workflow_run`
+自动触发，传空值走 `WRT-CORE` 的 default，所以一直没暴露；但网页手动触发同样会踩）。
+
+### 验证
+
+`yaml.safe_load` 复核 options 已全为字符串；随后用 REST API 派发 `WRT-BUILD`
+（显式传 `FLOW_OFFLOAD=off`）不再被 422 拒绝 —— 这条路径此前 100% 失败。
+
 ## [2026-09-28 · 四] 构建对仓库可见性免疫：MT5700 Console 转私有后又转回公开
 
 `luci-app-mt5700` 的唯一源码源 `woshinibabao1/MT5700-Console` 今天在 public / private

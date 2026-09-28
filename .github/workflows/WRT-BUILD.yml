@@ -42,11 +42,21 @@ on:
         default: 'off'
         required: false
         type: choice
+        # ★ 2026-09-28 修复：options 里的 off / on 必须**加引号**。
+        #   YAML 1.1 把裸写的 off / on / yes / no 当**布尔**解析，于是 GitHub 收到的是
+        #   ['auto', False, True, 'on-hw']，而不是 ['auto','off','on','on-hw']。后果：
+        #     ① default 'off'（字符串）不在选项列表里 → workflow_dispatch 用默认值时
+        #        被 422 拒绝（Provided value 'off' ... not in the list of allowed values）；
+        #     ② 网页下拉框显示成 auto / false / true / on-hw，用户选「off」实际传的是
+        #        字符串 "false"，而 Scripts/ApplyFlowOffload.sh 的 case 只认
+        #        auto|off|on|on-hw → 报「非法 WRT_FLOW_OFFLOAD='false'」并 exit 1，
+        #        **整个编译中断**。
+        #   加引号后三者一致（选项名、默认值、脚本接受值）。
         options:
-          - auto
-          - off
-          - on
-          - on-hw
+          - 'auto'
+          - 'off'
+          - 'on'
+          - 'on-hw'
       TEST:
         description: '仅生成配置文件，不编译固件。'
         # 2026-09-19 改为默认 false：手动触发本工作流的意图通常就是要出固件，
