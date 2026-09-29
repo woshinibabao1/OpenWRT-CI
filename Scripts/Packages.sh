@@ -369,10 +369,10 @@ INSTALL_NET_TUNING() {
 	[ -d "$SRC_DIR" ] || { echo "::error::net-tuning: 源目录 $SRC_DIR 不存在 —— Files/ 覆盖层全部内容（TTL 规则 / sysctl / uci-defaults / init.d / hotplug）都不会进固件"; exit 1; }
 
 	# ★ 2026-09-30：改为**整棵 Files/ 树**复制，不再只复制 etc/。
-	#   起因：往固件里固化 H5000M 的无线校准（Files/lib/firmware/mediatek/mt7996/*.bin），
-	#   它不在 etc/ 下。只复制 etc/ 的话，Files/lib/... 会被静默丢掉 —— 而下面的
-	#   完整性断言是「源里有什么、目标就必须有什么」，届时会直接判红而不是静默放过
-	#   （这正是要的：漏了会报错，不会悄悄少一份校准）。
+	#   原实现自相矛盾：复制只做 `Files/etc/`，而下面的完整性断言遍历整个 `Files/`
+	#   —— 只要有人往 Files/ 下放一个非 etc 路径（任何新覆盖层目录），断言就会判红，
+	#   而正确做法本该是「复制覆盖全部来源」。两者对齐后，新增任意 Files/ 子树都会
+	#   被带进固件，并且**漏了会报错**，不会出现"文件在仓库里、却悄悄没进固件"。
 	mkdir -p "$DST_DIR"
 	cp -rf "$SRC_DIR/." "$DST_DIR/"
 

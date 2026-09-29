@@ -66,18 +66,18 @@ OpenWRT-CI/
 │   │   ├── uci-defaults/99-mt5700-wan   # 补齐 MT5700M 接口、防火墙 wan 区、关 USB autosuspend
 │   │   ├── uci-defaults/99-mt5700-sys   # zram 512M / 无线 isolate=0 / 国内 NTP
 │   │   ├── uci-defaults/99-mt5700-stability  # 可用性兜底（rpcd 自愈等，不动网络策略）
+│   │   ├── uci-defaults/99-h5000m-wifi-mac   # ★ Wi-Fi MAC 唯一化（全机型 BSSID 相同的修复，见第三节）
+│   │   ├── uci-defaults/99-h5000m-wifi-scrub # ★ 清理厂家固件残留的无线私有键（assocresp_elements 等）
 │   │   ├── sysctl.d/99-mt5700-tcp.conf  # BBR / fq / TFO / rp_filter=0
 │   │   ├── sysctl.d/99-mt5700-conntrack.conf  # 连接跟踪容量（max 10 万）
 │   │   ├── sysctl.d/99-mt5700-lan.conf  # proxy_arp_pvlan（MLO 跨射频互通）
 │   │   ├── init.d/mt5700-rps            # 收包软中断多核分摊（RPS/XPS）
 │   │   ├── init.d/mt5700-smp            # 硬中断亲和（能搬的按负载分到四核）
 │   │   ├── init.d/apk-index-cache       # apk 索引缓存持久化（软件页重启后不必手动 Update lists）
-│   │   ├── hotplug.d/net/30-mt5700-rps  # 接口 up 时补设 RPS（无线比 S95 晚 25 秒）
+│   │   ├── hotplug.d/net/30-mt5700-rps  # 后出现的接口补设 RPS/中断亲和（无线 + USB 网卡重枚举）
 │   │   ├── nftables.d/12-mangle-ttl-128.nft  # WAN 出包 TTL/hoplimit 统一为 128
-│   │   └── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw，默认 off）
-│   └── lib/firmware/mediatek/mt7996/    # ★ 无线校准（顶掉 mt76 的同名默认 eeprom，见第三节）
-│       ├── mt7992_eeprom_23_2i5i.bin     # 内部 FEM（iPAiLNA）BE5040 校准，7680 字节
-│       └── mt7992_eeprom_23.bin          # 外部 FEM（ePAeLNA）BE5040 校准，7680 字节
+│   │   ├── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw，默认 off）
+│   │   └── rc.local                     # ★ 停用内核温控，让 h5000m-fancontrol 独占风扇 pwm1（见第三节）
 ├── Scripts/                  # 编译前自定义脚本
 │   ├── Packages.sh           # 拉取第三方插件与主题（含 MT 模式条件克隆/折叠）
 │   ├── ApplyMTMode.sh        # 按 MT_MODE 叠加配置层并写入互斥保护
@@ -86,7 +86,7 @@ OpenWRT-CI/
 │   ├── VerifyNoSingBox.sh    # 编译前后双断言 sing-box / homeproxy 未编入
 │   ├── Handles.sh            # feeds 源码修补（主题配色 / 组件冲突 / 软件页安装行为）
 │   └── Settings.sh           # 默认 IP / 主机名 / Wi-Fi / 主题
-│   └── SelfCheck.sh          # 编译前静态自检（C1~C12，见 CHANGELOG 顶部清单）
+│   └── SelfCheck.sh          # 编译前静态自检（C1~C13，见 CHANGELOG 顶部清单）
 ├── LICENSE
 └── README.md
 ```
@@ -278,30 +278,47 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 * **USB 驱动栈扩展**：包含 `kmod-usb-core`, `kmod-usb3` 及 `kmod-usb-net-qmi-wwan` 等丰富驱动，确保系统准确识别各类移动通信模组。
 * **轻量级 NAS 存储**：支持 NVMe 固态硬盘（`kmod-nvme`）挂载，结合 BTRFS 文件系统，轻松打造家庭数据中心。
 * **安全异地组网**：内置 WireGuard（`kmod-wireguard` + `luci-proto-relay`），轻松实现内网设备的远程安全访问。
-* **Wi-Fi 射频校准（已固化，不再依赖上游默认值）**：把 Hiveton 官方固件（higowrt）所用的
-  BE5040 校准固化进 `Files/lib/firmware/mediatek/mt7996/`，由 `Packages.sh` 铺进固件、顶掉
-  mt76 的同名默认文件。
-  > **为什么需要（2026-09-30 真机取证）**：H5000M 的 `factory` 分区（`/dev/mmcblk0p2`）
-  > **整块全零**（`dd … | tr -d '\000' | wc -c` 得 0），所以 mt76 每次开机都走默认校准：
-  > `eeprom tx_power zeros detected, using defaults` / `eeprom load fail, use default bin`。
-  > 也就是说整机射频校准**只挂在上游 mt76 的默认文件名上**，而这个名字历史上改过
-  > （`mt7992_eeprom.bin` → `_23` → `_24`）—— 上游一改，本固件就**静默**换成别的板子的
-  > 默认值（WiFi 照常起来，只是功率/频段按错板子走，没有任何报错）。
+* **Wi-Fi MAC 唯一化（2026-09-30 修复；这是"全机型 BSSID 相同"的真缺陷）**：
+  `Files/etc/uci-defaults/99-h5000m-wifi-mac` 按 eMMC CID 派生本机唯一 MAC，写进
+  `wireless.<iface>.macaddr`。
+  > **缺陷与取证（真机 192.168.10.1）**：`factory` 分区（`/dev/mmcblk0p2`）**整块全零** →
+  > mt76 每次开机走内置默认 eeprom（`eeprom tx_power zeros detected, using defaults` /
+  > `eeprom load fail, use default bin`），而那份文件里写死了 MediaTek 的**样例 MAC**
+  > （`MT_EE_MAC_ADDR=00:0c:43:26:60:10` / `MAC_ADDR2=…:11`），mt76 按频段从 eeprom 取
+  > **接口** MAC：
+  > - 上游 `11_fix_wifi_mac` 的 `hiveton,h5000m` 分支**确实生效**了，但它只改 **phy 级**地址
+  >   （实测 `/sys/class/ieee80211/phy0/macaddress` = CID 派生的 `56:9d:93:7b:f5:a5`）；
+  > - AP 接口仍是 eeprom 里那对固定值（实测 `iw dev`：`phy0.1-ap0` = `00:0c:43:26:60:11`）。
   >
-  > 这份校准取自 Hiveton 官方固件 [higowrt](https://github.com/Hiveton/higowrt) 的
-  > `mt_wifi7` 包所选的 SDK BE5040 校准（`MT7991_MT7976_EEPROM_BE5040_iPAiLNA.bin` /
-  > `..._ePAeLNA.bin`，公开镜像见 `benboguan/mt799x`）。与 mt76 自带值逐字节比对后的结论：
-  > - 本机 `dev->var.fem = INT`，驱动加载的是 `mt7992_eeprom_23_2i5i.bin`；从
-  >   `/sys/kernel/debug/ieee80211/phy0/mt76/eeprom` 把驱动真正生效的 7680 字节 dump 出来
-  >   对比，它与厂家 iPAiLNA 文件只差 **1 个字节**（偏移 `0x1af`，落在 mt76 不解析的区域），
-  >   另外 11 处差异是驱动按芯片 efuse 运行时打的补丁；
-  > - 换句话说：**这次改动的价值不是"修功率表"，而是把校准从「上游 mt76 文件名漂移」的
-  >   风险里解耦**，并让两个 FEM 槽位都拿到 BE5040 的值 —— 外部 FEM 那一槽，mt76 自带的是
-  >   另一块板的表（差 254 字节），而该文件同样有概率被别的机型请求。
-  >
-  > SHA256：`4f5a6345…f85563`（iPAiLNA）/ `64584a83…6ab137`（ePAeLNA）。`SelfCheck.sh`
-  > 的 C12 按**大小 7680 / CHIP_ID 0x7992 / FEM 槽位对应 / `.gitattributes` 的 `*.bin binary`**
-  > 四项钉住：装反槽位、文件被当文本转换（CRLF）都会被判红。
+  > ⇒ **所有刷本固件的 H5000M，2.4G/5G 的 BSSID 都是同一对地址**，同网段两台机器直接冲突。
+  > 修法走 OpenWrt 官方路径（`/usr/share/ucode/wifi/ap.uc` 会把 `macaddr` 作为 hostapd 的
+  > `bssid=`）；取值沿用 immortalwrt 既有约定（同一颗 phy：radio0 = CID+2、radio1 = CID+3，
+  > 地址占用表写在脚本注释里）。刷机后验证：`ubus call network.wireless status | grep bssid`
+  > 应显示 `56:9d:…` 段，而不再是 `00:0c:43:…`。
+  > `SelfCheck.sh` 的 **C13** 钉三条红线：必须 CID 派生、已有值不覆盖、取不到 CID 必须 `exit 1`。
+* **厂家固件残留清理**：`Files/etc/uci-defaults/99-h5000m-wifi-scrub`。
+  > sysupgrade 会保留 `/etc/config/wireless`，从厂家固件（mt_wifi7 / qmodem 那套）刷过来时
+  > 会带一批 mt76/mac80211 **不认识**的私有键：`assocresp_elements`（残留会导致客户端
+  > "关联成功但 BA 协商全超时"）、`tx_burst` / `pp_mode` / `pp_bitmap`，以及非 `mac80211`
+  > 的 `type`。依据是 v024 固件自己的升级清理脚本（`99-h5000m-clean-defaults` 里逐个 delete
+  > 的就是这些键）。本仓只**删私有键 + 修正 type**，绝不重建 wireless、不动 SSID/密码/信道
+  > （C13 把这条写成红线）。幂等：没东西可改就不 commit。
+* **Wi-Fi 射频校准：审计结论是「不固化」**（2026-09-30）
+  > 上面那个"factory 全零"的根因一度让人想把厂家固件的 eeprom 固化进本仓，**逐字节复核后放弃**：
+  > ① 本机实际加载的那一槽（`mt7992_eeprom_23_2i5i.bin`）与 mt76 自带默认文件**只差 3 个字节**
+  > （2 个是 MAC 字段、1 个落在 mt76 不解析的区域）→ **收益为 0**；② 固化会连带把 Wi-Fi MAC
+  > 钉成文件里的值（厂家固件里那份真品带的是 `00:0c:8c` 段）→ 与上面的 MAC 修复相互冲突；
+  > ③ "上游改名丢校准"的动机也不成立：mt76 的默认 eeprom 与其驱动**同仓库同版本发布**
+  > （`package/kernel/mt76` 从 `$(PKG_BUILD_DIR)/firmware/` 安装）。
+  > 详细取证与逐字节对照见 `CHANGELOG.md` 的 2026-09-30 条目。`SelfCheck.sh` 的 **C12** 因此
+  > 改为**条件式**：目录在就校验格式（大小 7680 / CHIP_ID 0x7992 / FEM 槽位 / `*.bin binary`），
+  > 不在就明确 skip 并打印这条结论 —— 而不是静默通过。
+* **USB 网卡重枚举后补设 RPS 与中断亲和**：`Files/etc/hotplug.d/net/30-mt5700-rps`（2026-09-30 扩）
+  > 原先只对无线接口名触发。5G 模组重插/复位后 netdev 是**销毁重建**的：新接收队列的
+  > `rps_cpus` 回到内核默认 0（net-sysfs 里 rps_map 初始为空），而 `init.d/mt5700-rps` 只在
+  > S95 跑一次 → 之后一路没有 RPS，直到重启；USB 侧中断号也会重新分配，`mt5700-smp` 在 S99
+  > 的成果同样失效。现按「设备挂在 USB 总线上」判定（不写死 eth2），补跑 `mt5700-rps start`
+  > 与 `mt5700-smp restart`（均幂等）。
 
 > ⚠️ 本清单列出的是**显式选中**（`Config/*.txt` 里写了 `CONFIG_PACKAGE_*=y`）的包：
 > `Scripts/Packages.sh` 里克隆了但没写 `=y` 的包**不会**因为克隆而进固件，别把它们算作固件能力。

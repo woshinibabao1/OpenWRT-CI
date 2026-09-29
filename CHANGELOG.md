@@ -1,5 +1,123 @@
 # 更新日志
 
+## [2026-09-30 · 三] Wi-Fi MAC 唯一化（全机型 BSSID 相同）+ 三处运行时加固；并**回退**当天的无线校准固化
+
+本轮起因是"从厂家固件里找无线校准"。结论是：**校准不用搬（也搬错了对象），但顺着这条线挖出了一个真缺陷** ——
+factory 分区全零导致**所有 H5000M 的 Wi-Fi BSSID 都是同一对地址**。
+
+### 一、真缺陷：全机型 Wi-Fi BSSID 相同（已修）
+
+**症状**（无人会怀疑到配置上）：两台 H5000M 放同一网段，客户端在两者之间反复漫游/握手失败。
+
+**取证链**（真机 192.168.10.1，逐条可复现）：
+
+| 步骤 | 命令 | 结果 |
+| :-- | :-- | :-- |
+| 出厂校准是否存在 | `dd if=/dev/mmcblk0p2 bs=64k \| tr -d '\000' \| wc -c`（并按 64KB 分块逐块统计） | **0**（4MB 全零） |
+| 驱动怎么办的 | `dmesg` | `eeprom tx_power zeros detected, using defaults`、`eeprom load fail, use default bin` |
+| 驱动实际加载了什么 | `cat /sys/kernel/debug/ieee80211/phy0/mt76/eeprom` | 7680 B，`MT_EE_MAC_ADDR=00:0c:43:26:60:10`、`MAC_ADDR2=…:11`（MediaTek **样例**地址，写死在 `/lib/firmware/mediatek/mt7996/mt7992_eeprom_23_2i5i.bin` 里） |
+| 上游的 MAC 修复有没有生效 | `cat /sys/class/ieee80211/phy0/macaddress` | `56:9d:93:7b:f5:a5` —— 生效了，但它改的是 **phy 级**地址 |
+| 接口用的是哪个 | `iw dev` | `phy0.1-ap0 = 00:0c:43:26:60:11` —— 仍是 eeprom 里那对固定值 |
+
+即：`11_fix_wifi_mac` 的 `hiveton,h5000m` 分支（用 eMMC CID 派生）只管 phy，**mt76 是按频段从 eeprom 取接口 MAC 的**，
+于是 2.4G/5G 的 BSSID 在所有机器上完全一致。
+
+**修法**：`Files/etc/uci-defaults/99-h5000m-wifi-mac` —— 用 eMMC CID 派生（`macaddr_generate_from_mmc_cid`），
+写进 `wireless.<iface>.macaddr`（OpenWrt 官方路径：`/usr/share/ucode/wifi/ap.uc` 会把它作为 hostapd 的
+`bssid=`）。取值沿用 immortalwrt 既有约定（同一颗 phy：radio0 = CID+2、radio1 = CID+3），
+脚本注释里附**地址占用表**（eth0=C+0 / eth1=C+1 / phy0=C+2 / 上游留给第二 phy 的 C+3）。
+不碰任何二进制与分区，纯 uci，升级安全；已有 `macaddr` 一律不覆盖；拿不到 CID 时 `exit 1` 保留待重试。
+
+刷机后验证：`ubus call network.wireless status | grep bssid` 应显示 `56:9d:…` 段。
+
+**新增静态闸门 C13**（钉三条"改坏也照样能编译、能刷机"的红线）：必须 CID 派生、已有值不覆盖、
+拿不到 CID 必须 `exit 1`；另外禁止清理脚本出现 `rm /etc/config/wireless` / `wifi config` 之类的重建动作。
+
+### 二、厂家固件残留清理（新增）
+
+`Files/etc/uci-defaults/99-h5000m-wifi-scrub`：sysupgrade 会保留 `/etc/config/wireless`，从厂家固件
+（`mt_wifi7` + qmodem 那一套）刷过来时会带 mt76/mac80211 **不认识**的私有键 ——
+`assocresp_elements`（厂家塞进关联响应的私有 IE，残留后客户端"关联成功但 BA 协商全超时"）、
+`tx_burst` / `pp_mode` / `pp_bitmap`、以及非 `mac80211` 的 `type`。
+
+依据不是猜的：v024 固件**自己**的升级清理脚本 `99-h5000m-clean-defaults` 里逐个 delete 的就是这些键。
+本仓只删私有键 + 修正 `type`，**绝不重建 wireless、不动 SSID/密码/信道**（C13 把这条写成红线）；
+`sae_pwe` 属标准选项，只在取值非法时才删。
+
+### 三、USB 网卡重枚举后补设 RPS 与中断亲和（扩既有 hotplug）
+
+`Files/etc/hotplug.d/net/30-mt5700-rps` 原先只对无线接口名触发（注释理由是"避免 USB 模组反复重连时
+做无谓调用"）。但 5G 模组重插/复位时 netdev 是**销毁重建**的：新接收队列的 `rps_cpus` 回到内核默认 0
+（net-sysfs 里 rps_map 初始为空），而 `init.d/mt5700-rps` 只在 S95 跑一次
+→ 之后一路没有 RPS，直到重启。USB 侧中断号也会重新分配，`mt5700-smp` 在 S99 的成果同样失效。
+现按「设备挂在 USB 总线上」（`readlink -f /sys/class/net/$INTERFACE/device`）判定，不写死 eth2；
+补跑 `mt5700-rps start` 与 `mt5700-smp restart`（都幂等）。代价是模组每次重插多几毫秒。
+
+### 四、风扇 pwm1 的两个写者（新增 rc.local）
+
+真机实测**内核 step_wise 温控与用户态守护进程同时在位**：
+
+```
+thermal_zone0: type=cpu-thermal  mode=enabled
+cooling_device0: type=pwm-fan  cur=1 max=3        ← 4 档，即 dts 默认 <0 128 192 255>
+hwmon2(pwmfan) pwm1=147                           ← 用户态曲线写的值（4 档里没有 147）
+ps: /usr/sbin/h5000m-fancontrol daemon 在跑（S98），uci: enabled=1 mode=auto curve=balanced
+```
+
+当前 50℃ 未触发 trip 所以还没打架；越过降温点后内核会按 4 档写 128/192/255，守护进程 5 秒后又写回曲线值
+—— 两个写者互相覆盖。厂家固件用的正是同一招（风扇守护脚本**先** `echo disabled > thermal_zone0/mode`）。
+
+新增 `Files/etc/rc.local`（每次开机执行，早于 S98 风扇服务）：**仅当确实装了并启用了 h5000m-fancontrol**
+才停内核温控，并回读校验 + 记日志；没装就一行不碰（保留内核兜底）。
+取舍写明：停内核温控同时也停掉了内核侧对 WiFi（`mt7996_phy0.0/0.1`）的降功率降温动作 —— 与厂家一致
+（本机有主动风扇）。回退：删本文件或 `echo enabled > /sys/class/thermal/thermal_zone0/mode`。
+
+### 五、回退：当天的无线校准固化（`Files/lib/firmware/mediatek/mt7996/*.bin`）
+
+同一天早些时候按"factory 全零 → 只依赖上游默认文件"的推理，把厂家 BE5040 校准固化进了固件。
+随后**用用户手上的厂家固件镜像（`mwrt-hiveton-h5000m-1139-24-20260925中秋.bin`）里的真品**做逐字节复核，
+结论是应当回退：
+
+| 判据 | 结果 |
+| :-- | :-- |
+| 本机实际使用的那一槽（`_23_2i5i`，内部 FEM）vs mt76 自带默认文件 | **只差 3 个字节**：2 个是 MAC 字段、1 个在 mt76 不解析的区域（`0x1af`）→ **收益为 0** |
+| 厂家真品 vs 之前从第三方仓库取的副本 | 只差 2 个字节，且**都在 MAC 字段**（厂家真品是 `00:0c:8c` 段、mt76 默认是 `00:0c:43` 段） |
+| 固化会不会有副作用 | 会：eeprom 里的 MAC 就是 mt76 取接口 MAC 的来源，换文件等于把 BSSID 钉成另一段固定值 → 与第一节的修复直接冲突 |
+| "上游改名丢校准"这个动机 | 不成立：mt76 的默认 eeprom 与其驱动**同仓库同版本发布**（`package/kernel/mt76` 从 `$(PKG_BUILD_DIR)/firmware/` 安装） |
+| 外部 FEM 那一槽（`_23`） | 与本机无关（`dev->var.fem=INT`），且厂家真品比 mt76 默认低 3~4 档（功率表 41 vs 45）→ 改了是降功率，收益不明 |
+
+处理：删掉那两个 `.bin`（`Files/lib/` 整目录）并改写 C12 为**条件式**（目录在就按大小/CHIP_ID/FEM 槽位/
+`*.bin binary` 四项校验；不在就明确 skip 并打印本节结论，而不是静默通过）。
+
+### 六、配套改动
+
+| 文件 | 改动 |
+| :-- | :-- |
+| `Scripts/Packages.sh` | `INSTALL_NET_TUNING` 由"只复制 `Files/etc/`"改为**整棵 `Files/` 树**。原实现自相矛盾：复制只做 etc/，而完整性断言遍历整个 Files/ —— 新增任意 Files/ 子树都会让断言误红 |
+| `.gitattributes` | 新增 `*.bin binary`（★ 必须排在 `Files/** text eol=lf` 之后，后写者胜）：否则二进制覆盖层会被当文本翻成 CRLF |
+| `Scripts/SelfCheck.sh` | C9 由 `Files/etc` 扩到整个 `Files/`；C12 改条件式；新增 C13；**修 C5 假阳性**（二进制里出现 0x0d 是数据不是行尾 → 显式跳过 `*.bin`） |
+| `README.md` | 结构树补三个新文件；第三节改写为"Wi-Fi MAC 唯一化 / 厂家残留清理 / 校准审计结论 / USB 重枚举补设"四条 |
+
+### 七、复核后**不采纳**的项（连同理由，避免以后重复调研）
+
+| 候选（来源） | 不采纳的理由 |
+| :-- | :-- |
+| conntrack buckets 改走 `modprobe.d`（据称内核把它注册为只读） | **结论被真机推翻**：本机 6.18 上 `/sys/module/nf_conntrack/parameters/hashsize` 是 `-rw-------`，`sysctl -w` 返回 0 并回读生效；而且**用户自己的 `99-mt5700-conntrack.conf` 早把这条写清楚了**（可写，但写它会重建哈希表，63488 vs 65536 只差 3%，不值得）。保持现状 |
+| 接口级 sysctl 的 netdev 热插拔重放 | **真机实测无增益**：`proxy_arp_pvlan` / `rp_filter` / `arp_ignore` 的 `br-lan`、`eth2`、`phy0.1-ap0` 上已经是期望值（`default` 模板确实被后创建的接口继承了）。`S11sysctl` 早于 `S20network` 这个事实成立，但 `all`+`default` 已经覆盖 |
+| 关掉 `ubihealthd` | eMMC 机型无 MTD/UBI（`/proc/mtd` 为空、`lsmod` 无 ubi）→ 该服务本来就什么都不做，收益≈0 |
+| USB 事件驱动"模组就绪"取代固定 `sleep 5` | 属**新功能**而非缺陷修复（现有 `99-mt5700-wan` 已能工作）；增加一条 USB hotplug 触发链需要真机反复插拔验证，本轮不做 |
+| 5G 出口健康探测 + 主备切换（mwrt 的 assurance 组件） | 风险中（误判会来回切路由），且本仓文档已就该方向做过取舍；要做得自己写轻量探活 + 滞回 + 冷却，留作独立任务 |
+| `&fan` 的 `cooling-levels` 由 4 档改厂家 24 档 | 一旦按第四节的 `rc.local` 停用内核温控，这些档位就不再参与控制 → 无意义；先解决"谁写 pwm1"更根本 |
+| `CONFIG_SQUASHFS_DECOMP_MULTI_PERCPU=y`（厂家 config-6.12 有） | 有理论收益（多核解压），但属内核 kconfig，需一次全量编译验证符号可用；留作候选，不塞进本轮 |
+| zram / swap / fstab / 日志级别 / dnsmasq 缓存 TTL 等 | 与厂家固件两边等价，或属有意选择的策略（如把 dnsmasq 日志丢 `/dev/null` 会牺牲排障能力，正是本机 TTL 校验与 5G 排障依赖的东西） |
+
+### 验证
+
+- `bash Scripts/SelfCheck.sh`：本地全绿（C1~C13；C12 打印 skip 说明、C13 覆盖两个新脚本的红线）。
+- C13 的红线判据已用"删掉守卫 / 改成常量 / 加 rm"三种变异确认会判红（详见提交说明）。
+- 真机取证全部在 192.168.10.1 现场完成（dmesg / debugfs eeprom dump / iw / thermal / hwmon / usb 标识）。
+- **未做**：刷机验证。新固件刷入后按第一节与第四节的命令各验一次即可。
+
 ## [2026-09-30 · 三] H5000M 无线校准（e2p）固化进固件 —— factory 分区全零，此前完全依赖上游 mt76 的默认文件名
 
 把 Hiveton 官方固件（[higowrt](https://github.com/Hiveton/higowrt)）所用的 **BE5040 无线校准**

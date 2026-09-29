@@ -20,7 +20,8 @@
 #   C9 README 项目结构树不得漏列 Scripts / Files / workflows / Config
 #   C10 软件页在慢链路上的两条防线：uhttpd CGI 预算 + package-manager-call 的补丁
 #   C11 Rust 交叉编译前提：不赌组件名 + 按产物验收 rust-lld
-#   C12 固化进固件的无线校准（厂家 e2p）：大小 / CHIP_ID / FEM 槽位 / gitattributes binary
+#   C12 二进制覆盖层行尾保护（*.bin binary）+ 若固化无线校准则校验其格式
+#   C13 Wi-Fi MAC 唯一化守卫（CID 派生 / 不覆盖用户值 / 不重建无线配置）
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -444,7 +445,20 @@ fi
 
 [ "$FAIL" -eq "$N" ] && pass "组件名合法（只用 $(printf '%s' "${COMP_NAMES:-无}" | tr '\n' '/')）、rust-lld 按产物验收、失败时带 rustup 原始报错"
 
-# ---------- C12：固化进固件的无线校准（厂家 e2p）----------
+# ---------- C12：二进制覆盖层（行尾保护）+ 若固化无线校准则校验其格式 ----------
+# ★ 2026-09-30 回退说明（下面的历史结论仍然成立，但**结论变了**）：
+#   本仓当天先按下面的推理把厂家 BE5040 校准固化进了 Files/lib/firmware/mediatek/mt7996/，
+#   随后用厂家固件镜像（mwrt-hiveton-h5000m-1139-24）里的**真品**做了逐字节复核，发现：
+#     · 本机实际使用的那个槽位（_23_2i5i，内部 FEM）与 mt76 自带默认文件**只差 3 个字节**，
+#       其中 2 个是 MAC 字段（MTK 样例地址）、1 个落在 mt76 不解析的区域 → **收益为 0**；
+#     · 且 eeprom 里的 MAC 字段就是 mt76 取接口 MAC 的来源，固化一份带**另一段 OUI**
+#       （厂家真品是 00:0c:8c）的文件会改掉设备 Wi-Fi MAC → 有多机同 MAC 的风险；
+#     · 「上游改名导致校准丢失」这个动机也不成立：mt76 的默认 eeprom 文件与其驱动
+#       **同仓库同版本发布**（package/kernel/mt76 从 $(PKG_BUILD_DIR)/firmware/ 安装），
+#       不存在"驱动改文件名、文件却没跟上来"的漂移。
+#   故**回退该固化**，真正的问题改用 `Files/etc/uci-defaults/99-h5000m-wifi-mac` 解决
+#   （见 C13：全机型 BSSID 相同才是那个真缺陷）。下面保留条件式校验：将来若有人再放
+#   校准文件进来，四项检查立刻生效。
 # 出处（2026-09-30 真机取证，192.168.10.1）：
 #   · H5000M 的 factory 分区 /dev/mmcblk0p2 **整块全零**（`dd | tr -d '\000' | wc -c` = 0），
 #     所以 mt76 每次开机都打印
@@ -475,6 +489,9 @@ EE_EXT="$EE_DIR/mt7992_eeprom_23.bin"        # 外部 FEM（ePAeLNA）
 EE_WANT_SIZE=7680
 EE_WANT_ID=31122   # 0x7992
 
+# 条件式：目录在就按四项校验；不在就明确 skip（打印理由，而不是静默通过）
+if [ -d "$EE_DIR" ]; then
+
 for pair in "$EE_INT:0" "$EE_EXT:3"; do
 	EE_F="${pair%:*}"
 	EE_FEM="${pair##*:}"
@@ -496,6 +513,11 @@ for pair in "$EE_INT:0" "$EE_EXT:3"; do
 		|| fail "C12 $EE_F 的 FEM 位是 ($EE_ACT0,$EE_ACT1)，按文件名应为 ($EE_FEM,$EE_FEM)：两个文件装反等于没装，且不会报错"
 done
 
+else
+	echo "  skip  $EE_DIR 不存在 —— 本仓当前**不固化**无线校准（2026-09-30 审计结论，"
+	echo "        见本节顶部的 ★ 回退说明：与 mt76 自带默认文件实质等价、且会连带钉住 Wi-Fi MAC）"
+fi
+
 # .gitattributes：*.bin 必须是 binary，且必须排在 Files/** 那条之后
 EE_ATTR="$(awk '
 	/^\*\.bin/ && (/binary/ || /-text/) { bin = NR }
@@ -504,7 +526,59 @@ EE_ATTR="$(awk '
 ' .gitattributes 2>/dev/null)"
 [ "$EE_ATTR" = "ok" ] || fail "C12 .gitattributes 里 *.bin 必须是 binary 且排在 Files/** text eol=lf 之后（后写者胜）：当前 $EE_ATTR —— 否则校准二进制会在 Windows 检出时被翻成 CRLF，驱动按固定偏移读到错位的表"
 
-[ "$FAIL" -eq "$N" ] && pass "无线校准已固化：两个 FEM 槽位各 7680 字节、CHIP_ID=0x7992、*.bin 已声明为 binary"
+[ "$FAIL" -eq "$N" ] && pass "二进制覆盖层行尾保护就位（*.bin binary 且排在 Files/** 之后）；无线校准按审计结论未固化"
+
+# ---------- C13：Wi-Fi MAC 唯一化守卫 ----------
+# 出处（2026-09-30 真机取证，192.168.10.1）：
+#   H5000M 的 factory 分区整块全零 → mt76 走内置默认 eeprom，而那份 eeprom 里写死了
+#   MediaTek 的**样例 MAC**（MT_EE_MAC_ADDR=00:0c:43:26:60:10 / MAC_ADDR2=...:11），
+#   mt76 按频段从 eeprom 取接口 MAC —— 实测：
+#     · /sys/class/ieee80211/phy0/macaddress 已被上游 11_fix_wifi_mac 改成 eMMC CID
+#       派生值（56:9d:93:7b:f5:a5），但那是 **phy 级**地址；
+#     · AP 接口 `phy0.1-ap0` 仍是 00:0c:43:26:60:11（来自 eeprom）。
+#   ⇒ **所有刷本固件的 H5000M，2.4G/5G 的 BSSID 都是同一对地址**，同网段必冲突。
+#   修法：在 uci 里显式给 wifi-iface 写本机唯一 MAC（OpenWrt 官方路径，
+#   /usr/share/ucode/wifi/ap.uc 会把它作为 hostapd 的 bssid=），取值沿用 immortalwrt
+#   既有约定（同一颗 phy：radio0 = CID+2、radio1 = CID+3）。
+# 下面钉三条「改坏也照样能编译、能刷机」的红线：
+#   ① 唯一来源必须是 eMMC CID（不得改成常量/写死某段地址 —— 那就等于换了个固定 MAC）；
+#   ② 必须"已有 macaddr 就跳过"，**不得覆盖**用户/上游设过的值；
+#   ③ 取不到 base MAC 时必须 `exit 1` 保留待下次开机，不得 `exit 0`（那台机器就永久
+#      拿不到唯一 MAC 了；这也是本仓 uci-defaults 的统一语义）。
+#   ★ 本门是**结构性钉死**：若将来有意重构这两个脚本，守卫要同步改（与 C8 同性质）。
+echo "-- C13 Wi-Fi MAC 唯一化"
+N=$FAIL
+MAC_UCI="Files/etc/uci-defaults/99-h5000m-wifi-mac"
+SCRUB_UCI="Files/etc/uci-defaults/99-h5000m-wifi-scrub"
+
+if [ ! -f "$MAC_UCI" ]; then
+	fail "C13 缺少 $MAC_UCI —— 没有它，全机型的 Wi-Fi BSSID 都会是 eeprom 里那对固定样例地址（同网段冲突）"
+else
+	grep -qF 'macaddr_generate_from_mmc_cid' "$MAC_UCI" \
+		|| fail "C13 $MAC_UCI 没有用 macaddr_generate_from_mmc_cid 派生（改成常量就等于把固定 MAC 从 eeprom 搬到脚本里）"
+	# ② 必须存在"读到已有值就跳过"的守卫：读 .macaddr 的那一行之后 6 行内要有 continue。
+	#    ★ 首版判据写成"文件里出现过 continue"，结果**变异验证时漏判**：脚本里
+	#    `[ -n "$dev" ] || continue` 这类无关 continue 也算了命中。改成行窗口后，
+	#    删掉守卫会判红（三处变异已复验）。
+	awk '/uci -q get/ && /\.macaddr/ { start = NR }
+	     start && NR > start && NR <= start + 6 && /continue/ { ok = 1 }
+	     END { exit ok ? 0 : 1 }' "$MAC_UCI" \
+		|| fail "C13 $MAC_UCI 缺少「已有 macaddr 则跳过」的守卫（读 .macaddr 之后 6 行内没有 continue —— 会覆盖用户设置过的 MAC）"
+	# ③ 必须有非 0 退出分支（拿不到 CID 时保留待重试）
+	awk '/^[[:space:]]*exit[[:space:]]+1/ { n++ } END { exit (n >= 1) ? 0 : 1 }' "$MAC_UCI" \
+		|| fail "C13 $MAC_UCI 没有 exit 1 分支：拿不到 eMMC CID 时会静默成功，那台机器永久拿不到唯一 MAC"
+fi
+
+if [ ! -f "$SCRUB_UCI" ]; then
+	fail "C13 缺少 $SCRUB_UCI —— 从厂家固件升级过来的机器会带着 assocresp_elements 等私有键（关联成功但 BA 协商超时）"
+else
+	# 红线：清理脚本只许删私有键，绝不许重建/删除用户的无线配置
+	for bad in 'rm -f /etc/config/wireless' 'rm /etc/config/wireless' 'uci delete wireless.radio' 'wifi config'; do
+		grep -qF "$bad" "$SCRUB_UCI" && fail "C13 $SCRUB_UCI 出现 '$bad'：清理脚本不得重建/删除用户无线配置（只允许删私有键）"
+	done
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "Wi-Fi MAC 唯一化与厂家残留清理脚本就位，且红线（CID 派生 / 不覆盖 / 不重建配置）都在"
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then

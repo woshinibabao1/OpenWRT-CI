@@ -1,5 +1,5 @@
 #!/bin/sh
-# 无线接口出现时补设 RPS（2026-09-21 新增）
+# 接口出现时补设 RPS / 中断亲和（2026-09-21 新增；2026-09-30 扩到 USB 网卡）
 #
 # ── 为什么需要它 ──────────────────────────────────────────────────────
 # init.d/mt5700-rps 在 S95 只执行一次，而无线接口由 wpad **更晚**才建立：
@@ -8,21 +8,42 @@
 # 而原先的告警只在「一个队列都没设上」时才触发，有线队列已经设上，
 # 于是连日志都没有，属**静默失效**（无线收包软中断全部压回硬中断所在核 CPU0）。
 #
+# ★ 2026-09-30 追加第二类：**USB 网卡**（5G 模组的 CDC-NCM 数据口 eth2）。
+#   原先只认无线名，注释理由是「避免 USB 模组反复重连时做无谓调用」。但模组
+#   一旦重插/复位，netdev 是**销毁重建**的：新接收队列的 `rps_cpus` 回到内核
+#   默认值 0（net-sysfs 里 rps_map 初始为空），而 init.d/mt5700-rps 只在 S95
+#   跑过一次 → 之后 eth2 的 RPS 一直是 0，直到重启才恢复。同一类静默失效。
+#   判据取「设备挂在 USB 总线上」（`readlink -f /sys/class/net/$INTERFACE/device`
+#   落在 usb 下），不写死 eth2 —— 端口名随枚举顺序变化。
+#   代价：模组每次重插多跑一次 `mt5700-rps start`（幂等、毫秒级，且它本身遍历
+#   所有队列，一次调用把所有接口都补齐）。
+#
 # ── 做法 ──────────────────────────────────────────────────────────────
 # 挂在 hotplug.d/net 的 add 事件上：接口一旦带接收队列出现，就重跑一次
 # `mt5700-rps start`。该命令是幂等的、毫秒级，重复执行无副作用。
-# 只对无线接口名触发，避免 USB 5G 模组反复重连时做无谓调用。
+#
+# USB 网卡出现还意味着**中断号可能变了**（重枚举后 IRQ 重新分配），而
+# mt5700-smp 只在 S99 跑一次、成果会随 IRQ 重建失效 → 一并 `restart`。
+# 它是幂等的（只写 smp_affinity；自 2026-09 起明确不再碰 rps_cpus，见其 stop()）。
 #
 # 与 init.d 的分工：init.d 负责开机时已存在的接口（有线/网桥）；
-# 本脚本负责**晚出现**的接口（无线）。两者写的位置相同（RPS/XPS 掩码），
-# 都不碰 smp_affinity，故与 mt5700-smp 不冲突。
+# 本脚本负责**后出现**的接口（无线 / USB 网卡）。
 
 [ "$ACTION" = "add" ] || exit 0
 
+is_wireless=0
+need=0
 case "$INTERFACE" in
-	phy*|*-ap*|ra0*|rai0*|wlan*) ;;
-	*) exit 0 ;;
+	phy*|*-ap*|ra0*|rai0*|wlan*)
+		is_wireless=1; need=1
+		;;
+	*)
+		case "$(readlink -f "/sys/class/net/$INTERFACE/device" 2>/dev/null)" in
+			*usb*) need=1 ;;
+		esac
+		;;
 esac
+[ "$need" = "1" ] || exit 0
 
 [ -e "/sys/class/net/$INTERFACE/queues/rx-0/rps_cpus" ] || exit 0
 [ -x /etc/init.d/mt5700-rps ] || exit 0
@@ -35,4 +56,10 @@ if /etc/init.d/mt5700-rps start 2>/dev/null >/dev/null; then
 else
 	logger -t mt5700-rps "接口 $INTERFACE 出现，但补设 RPS 失败（队列可能尚未就绪）"
 fi
+
+if [ "$is_wireless" = "0" ] && [ -x /etc/init.d/mt5700-smp ]; then
+	/etc/init.d/mt5700-smp restart >/dev/null 2>&1 \
+		&& logger -t mt5700-smp "USB 网卡 $INTERFACE 出现，已重跑中断亲和（IRQ 号可能已变）"
+fi
+
 exit 0

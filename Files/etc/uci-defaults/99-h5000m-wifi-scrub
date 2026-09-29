@@ -1,0 +1,81 @@
+#!/bin/sh
+#
+# 清理厂家固件（mt_wifi7 / qmodem 那一套）遗留在 /etc/config/wireless 里的**私有键**（2026-09-30）
+#
+# 为什么需要：
+#   OpenWrt 的 sysupgrade 默认保留 /etc/config/wireless。从厂家固件（Mwrt / HiGoROS 等，
+#   用 MTK 的 mt_wifi7 驱动 + LuCI 厂家页面）刷到本固件之后，这份配置会带着一批
+#   **mt76/mac80211 不认识**的私有键一起进来。它们的后果不是报错，而是静默异常：
+#     · `assocresp_elements`：厂家往关联响应里塞的私有 IE。残留后客户端能关联成功，
+#       但 BA（Block Ack）协商全超时 —— 现象是"连得上、网速极差"，没人会怀疑配置里的一个旧键；
+#     · `tx_burst` / `pp_mode` / `pp_bitmap`：MTK 私有扩展，上游 mac80211/hostapd 不认；
+#     · `type` 不是 mac80211（厂家驱动叫 mtwifi 之类）：mt76 下这个 radio 直接起不来。
+#
+# 依据（不是猜的）：v024 固件自己从厂家固件升级时用的清理脚本
+#   `Files/etc/uci-defaults/99-h5000m-clean-defaults` 里明确 delete 了上面这些键：
+#     uci -q delete wireless.default_radio0.assocresp_elements
+#     uci -q delete wireless.default_radio1.assocresp_elements
+#     uci -q delete wireless.radio1.pp_bitmap
+#     uci -q set    wireless.radio1.tx_burst='0' / pp_mode='0'
+#     uci -q delete wireless.default_radio0.sae_pwe / default_radio1.sae_pwe
+#   并带一条 `[ "$(uci -q get wireless.radio0.type)" != "mac80211" ]` 的判断。
+#
+# 本脚本的边界（刻意保守）：
+#   · **只删私有键 / 修正 type**，不重建 wireless、不动 SSID / 密码 / 信道 / 频宽；
+#   · `sae_pwe` 是标准选项，只在取值非法（非 0/1/2）时才删 —— 不做无条件删除；
+#   · 没有可改的东西时不 commit（幂等，避免每次开机写 flash）；
+#   · 拿不到 uci 时以非 0 退出，保留待下次开机（与本仓其它 uci-defaults 同一语义）。
+
+command -v uci >/dev/null 2>&1 || exit 1
+uci -q show wireless >/dev/null 2>&1 || exit 0
+
+changed=0
+
+# ---- 1. wifi-device：型别与 MTK 私有扩展 ----
+for dev in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-device$/\1/p'); do
+	case "$(uci -q get "wireless.${dev}.type")" in
+		mac80211) ;;
+		*)
+			uci -q set "wireless.${dev}.type='mac80211'" && {
+				logger -t h5000m-wifi-scrub "radio ${dev}: type 由厂家值改为 mac80211"
+				changed=1
+			}
+			;;
+	esac
+	for key in tx_burst pp_mode pp_bitmap; do
+		if uci -q get "wireless.${dev}.${key}" >/dev/null 2>&1; then
+			uci -q delete "wireless.${dev}.${key}" && {
+				logger -t h5000m-wifi-scrub "radio ${dev}: 删除厂家私有键 ${key}"
+				changed=1
+			}
+		fi
+	done
+done
+
+# ---- 2. wifi-iface：厂家私有 IE 与非法 sae_pwe ----
+for iface in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+	if uci -q get "wireless.${iface}.assocresp_elements" >/dev/null 2>&1; then
+		uci -q delete "wireless.${iface}.assocresp_elements" && {
+			logger -t h5000m-wifi-scrub "iface ${iface}: 删除厂家私有键 assocresp_elements（残留会导致关联成功但 BA 协商超时）"
+			changed=1
+		}
+	fi
+	sae="$(uci -q get "wireless.${iface}.sae_pwe")"
+	case "$sae" in
+		''|0|1|2) ;;
+		*)
+			uci -q delete "wireless.${iface}.sae_pwe" && {
+				logger -t h5000m-wifi-scrub "iface ${iface}: sae_pwe 取值非法（${sae}），删除以回落默认"
+				changed=1
+			}
+			;;
+	esac
+done
+
+[ "$changed" = "1" ] || exit 0
+uci commit wireless || exit 1
+
+# 改完配置要重载一次无线才生效。首启/升级后的场景，后台跑，不阻塞 rcS。
+( sleep 8; wifi reload >/dev/null 2>&1 ) &
+
+exit 0

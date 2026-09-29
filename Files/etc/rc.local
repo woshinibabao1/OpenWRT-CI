@@ -1,0 +1,40 @@
+#!/bin/sh
+# Put your custom commands here that should be executed once
+# after the init script sequence ends before the shell is available
+# This will not be executed if the system was booted in failsafe mode
+
+# ── H5000M：让用户态风扇曲线独占 pwm1（2026-09-30）────────────────────────────
+# 为什么：
+#   mt7987.dtsi 的 cooling-map 把 &fan（pwm-fan）当成内核 step_wise 温控的 cooling
+#   device，immortalwrt 的 H5000M dts 里 &fan 是 status="okay"，于是**内核温控**与
+#   **h5000m-fancontrol 守护进程**会同时写同一个 `/sys/class/hwmon/*/pwm1`。
+#   真机实测（192.168.10.1）两者都在位：
+#     thermal_zone0: type=cpu-thermal **mode=enabled**
+#     cooling_device0: type=pwm-fan cur=1 max=3   ← 4 档，即 dts 默认 <0 128 192 255>
+#     hwmon2(pwmfan) pwm1=147                     ← 用户态曲线写的值（4 档里没有 147）
+#   当前温度（50℃）未触发 trip，所以还没打架；一旦越过降温点，内核会按 4 档写
+#   128/192/255，守护进程 5 秒后又写回曲线值 —— 两个写者互相覆盖，实际转速来回跳，
+#   而用户精心调的曲线（85℃→90%）会被内核对更低档位盖掉。
+#   厂家固件（higowrt/mwrt）用的就是同一招：风扇守护脚本**先**
+#   `echo disabled > /sys/class/thermal/thermal_zone0/mode`，再自己写 pwm1。
+#
+# 边界与取舍（都写在这里，避免以后有人"顺手"改掉）：
+#   · 只在**确实装了并启用了** h5000m-fancontrol 时才停内核温控；没装就一行不碰，
+#     内核温控照旧兜底（否则风扇会失去任何自动控制，那是更糟的状态）。
+#   · 停内核温控同时也停掉了内核侧对 **WiFi（mt7996_phy0.0/0.1）降功率**的降温动作，
+#     这是与厂家一致的取舍：本机有主动风扇，风扇曲线负责散热。
+#   · 回退：删掉本文件（或把下面那段注释掉）后重启，内核温控立刻恢复 enabled。
+#     临时回退：`echo enabled > /sys/class/thermal/thermal_zone0/mode`。
+FAN_CTRL_INIT=/etc/init.d/h5000m-fancontrol
+TZ_MODE=/sys/class/thermal/thermal_zone0/mode
+if [ -x "$FAN_CTRL_INIT" ] && [ "$(uci -q get h5000m_fancontrol.settings.enabled 2>/dev/null)" = "1" ] \
+   && [ -w "$TZ_MODE" ]; then
+	echo disabled > "$TZ_MODE" 2>/dev/null
+	if [ "$(cat "$TZ_MODE" 2>/dev/null)" = "disabled" ]; then
+		logger -t h5000m-fan "已停用内核温控（$TZ_MODE），pwm1 由 h5000m-fancontrol 独占"
+	else
+		logger -t h5000m-fan "停用内核温控失败（$TZ_MODE 未变为 disabled）—— 内核温控仍会与风扇曲线争抢 pwm1"
+	fi
+fi
+
+exit 0

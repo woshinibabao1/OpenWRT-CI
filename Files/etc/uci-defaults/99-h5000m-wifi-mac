@@ -1,0 +1,80 @@
+#!/bin/sh
+#
+# H5000M：给 Wi-Fi 接口钉一个**本机唯一**的 MAC（2026-09-30）
+#
+# 为什么需要（真机取证，192.168.10.1）：
+#   本机 `/dev/mmcblk0p2`（PARTLABEL=factory）**整块 4MB 全零**，所以 mt76 每次
+#   开机都走内置默认校准：dmesg 里
+#     "mt7996e: eeprom tx_power zeros detected, using defaults"
+#     "mt7996e: eeprom load fail, use default bin"
+#   而这份默认 eeprom（/lib/firmware/mediatek/mt7996/mt7992_eeprom_23_2i5i.bin）
+#   里写死了一对**MediaTek 样例 MAC**：
+#     MT_EE_MAC_ADDR  = 00:0c:43:26:60:10   （2.4G）
+#     MT_EE_MAC_ADDR2 = 00:0c:43:26:60:11   （5G）
+#   mt76 是按频段从 eeprom 里取接口 MAC 的，所以：
+#     · 上游 immortalwrt 的 /etc/hotplug.d/ieee80211/11_fix_wifi_mac 里的
+#       `hiveton,h5000m)` 分支改的是 **phy 级**地址（实测 /sys/class/ieee80211/phy0/
+#       macaddress 已变成 eMMC CID 派生值 56:9d:93:7b:f5:a5），**对接口 MAC 无效**；
+#     · 于是 `iw dev` 里的 AP 接口仍是 00:0c:43:26:60:11。
+#   后果：**所有刷本固件的 H5000M，2.4G/5G 的 BSSID 都是同一对地址** —— 同网段
+#   两台机器会直接冲突（客户端在两者之间反复漫游/握手失败）。
+#   ⚠️ 注意根因不是"校准文件不对"：厂家固件（mwrt）里那份 e2p 带的同样是**固定样例**
+#      （00:0c:8c:26:60:10/11），只是它的厂商驱动另有 MAC 来源。真正唯一、稳定的
+#      本机标识是 **eMMC CID**（immortalwrt 的 hiveton,h5000m 分支已经在用它）。
+#
+# 做法：把接口 MAC 显式写进 uci（`wireless.<iface>.macaddr`，OpenWrt 官方支持，
+#   /usr/share/ucode/wifi/ap.uc 会把它作为 hostapd 的 `bssid=`），取值沿用
+#   immortalwrt 既有约定（同一颗 phy 上 radio0 = base+2、radio1 = base+3）。
+#   不碰任何二进制/分区，纯 uci，升级安全。
+#
+# 地址占用表（base = macaddr_generate_from_mmc_cid mmcblk0 = 56:9d:93:7b:f5:a3）：
+#   base+0 → eth0 / br-lan（由内核从 CID 派生）
+#   base+1 → eth1（WAN 口）
+#   base+2 → phy0（11_fix_wifi_mac 写入）→ 本脚本给 radio0 用同一个值（即钉住接口地址）
+#   base+3 → 上游留给第二个 phy（本机不存在）→ 本脚本给 radio1 用
+#   base+4 起空闲，保留不占用
+#
+# 退出码语义（与本仓其余 uci-defaults 一致）：拿不到 base MAC（eMMC 未就绪等）时
+#   以 **非 0** 退出，保留脚本待下次开机重试；不要 `exit 0`，否则这台机器就永久
+#   拿不到唯一 MAC 了。
+
+[ -n "${H5000M_WIFI_MAC_SKIP:-}" ] && exit 0
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+base="$(macaddr_generate_from_mmc_cid mmcblk0 2>/dev/null)"
+if [ -z "$base" ]; then
+	echo "h5000m-wifi-mac: 拿不到 eMMC CID 派生的 base MAC，保留脚本待下次开机重试" >&2
+	exit 1
+fi
+
+changed=0
+for iface in $(uci show wireless 2>/dev/null | sed -n 's/^wireless\.\([^.]*\)=wifi-iface$/\1/p'); do
+	dev="$(uci -q get "wireless.${iface}.device")"
+	[ -n "$dev" ] || continue
+	band="$(uci -q get "wireless.${dev}.band")"
+	case "$band" in
+		2g) want="$(macaddr_add "$base" 2)" ;;
+		5g) want="$(macaddr_add "$base" 3)" ;;
+		*) continue ;;
+	esac
+	# 尊重用户/上游已经设过的值：只在为空时写，绝不覆盖
+	cur="$(uci -q get "wireless.${iface}.macaddr")"
+	if [ -n "$cur" ]; then
+		[ "$cur" = "$want" ] || logger -t h5000m-wifi-mac "保留既有 macaddr=$cur（band=$band）"
+		continue
+	fi
+	uci set "wireless.${iface}.macaddr=${want}" || continue
+	logger -t h5000m-wifi-mac "iface ${iface}（${band}）macaddr=${want}（base=${base}）"
+	changed=1
+done
+
+if [ "$changed" = "1" ]; then
+	uci commit wireless || exit 1
+	# 首次开机时无线可能已经起来了：后台重载一次让它生效（首启场景，不打扰任何人）。
+	# 用 nohup 语义的 & 让 rcS 不必等它。
+	( sleep 8; wifi reload >/dev/null 2>&1 ) &
+fi
+
+exit 0
