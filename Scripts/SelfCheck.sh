@@ -17,8 +17,10 @@
 #   C6 plugin-deps 标记区存在且条目数达标
 #   C7 MT_MODE 的 default 必须保持空
 #   C8 apk 索引缓存持久化：文件 / START= / enable / 为软链父目录建目录，四者齐备
-#   C9 README 项目结构树不得漏列 Scripts / Files/etc / workflows
+#   C9 README 项目结构树不得漏列 Scripts / Files / workflows / Config
 #   C10 软件页在慢链路上的两条防线：uhttpd CGI 预算 + package-manager-call 的补丁
+#   C11 Rust 交叉编译前提：不赌组件名 + 按产物验收 rust-lld
+#   C12 固化进固件的无线校准（厂家 e2p）：大小 / CHIP_ID / FEM 槽位 / gitattributes binary
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -216,6 +218,15 @@ echo "-- C5 覆盖层行尾"
 N=$FAIL
 CRLF=""
 while IFS= read -r F; do
+	# ★ 2026-09-30：二进制覆盖层豁免。本条查的是「shell/conf 覆盖层必须是 LF」，
+	#   而校准 e2p 这类二进制里出现 0x0d 是**数据**，不是行尾 —— 7690 字节的表里
+	#   出现几个 0x0d 完全正常，按本条判就是恒假红（本文件的 C5 首次纳入无线校准
+	#   时就命中了这一条）。它们的完整性由 C12 按大小 / CHIP_ID / FEM 位校验，
+	#   .gitattributes 也有 *.bin binary 兜住行尾转换。
+	#   ⚠️ 将来新增别的二进制覆盖层时，这里与 .gitattributes 要一起加。
+	case "$F" in
+		*.bin) continue ;;
+	esac
 	CR_CNT="$(tr -dc '\r' < "$F" 2>/dev/null | wc -c | tr -d '[:space:]')"
 	if [ "${CR_CNT:-0}" -gt 0 ]; then
 		CRLF="$CRLF $F"
@@ -311,7 +322,7 @@ fi
 #   没有记忆 —— 同一轮里新增的 SelfCheck.sh 与 Guard-Check.yml 就都没进结构树，
 #   本轮的 apk-index-cache 要不是先写这条守卫也会漏。同一个坑踩到第三次，交给机器。
 #
-# 判据：Scripts/*.sh、Files/etc/**、.github/workflows/*.yml、Config/*.txt 里真实存在的
+# 判据：Scripts/*.sh、Files/**、.github/workflows/*.yml、Config/*.txt 里真实存在的
 #   每个文件，其文件名都必须出现在 README.md 的结构树中。
 #   ★ 按 **basename** 而不是相对路径比对：README 的树里写作 `init.d/mt5700-rps`
 #     这种带父目录的短名，按完整路径比对会全量误报。
@@ -319,12 +330,15 @@ fi
 #     结构树也没人告警 —— 而它是 Settings.sh 里**最后写入 .config 的一层**
 #     （可以覆盖 GENERAL 的同名项），正好属于「不看 README 就不知道它存在」的那类。
 #     加进来之后 README 必须同步补上该文件，否则本条会红（这正是要的）。
+#   ★ 2026-09-30 由 Files/etc 扩到整个 Files/：无线校准二进制落在
+#     Files/lib/firmware/mediatek/mt7996/ 下，只扫 etc/ 会让它成为「文档里不存在的
+#     覆盖层文件」—— 而它的作用（顶掉 mt76 的默认校准）恰恰是看不见就想不到的那类。
 echo "-- C9 README 结构树完整性"
 N=$FAIL
 MISS=""
 CNT=0
 for F in $(find Scripts -maxdepth 1 -type f -name '*.sh' | sort) \
-	$(find Files/etc -type f | sort) \
+	$(find Files -type f | sort) \
 	$(find .github/workflows -type f -name '*.yml' | sort) \
 	$(find Config -maxdepth 1 -type f -name '*.txt' | sort); do
 	B="${F##*/}"
@@ -340,7 +354,7 @@ fi
 if [ -n "$MISS" ]; then
 	fail "C9 README 项目结构树漏列：$MISS —— 「新增了文件却忘了同步文档」正是文档与代码矛盾的复发入口"
 else
-	[ "$FAIL" -eq "$N" ] && pass "README 结构树覆盖了全部 Scripts / Files/etc / workflow / Config"
+	[ "$FAIL" -eq "$N" ] && pass "README 结构树覆盖了全部 Scripts / Files / workflow / Config"
 fi
 
 # ---------- C10：「软件页在慢链路上用得成吗」的两条防线 ----------
@@ -429,6 +443,68 @@ if ! awk '!/^[[:space:]]*#/' "$PKG_SH" | grep -qF 'out="$(rustup'; then
 fi
 
 [ "$FAIL" -eq "$N" ] && pass "组件名合法（只用 $(printf '%s' "${COMP_NAMES:-无}" | tr '\n' '/')）、rust-lld 按产物验收、失败时带 rustup 原始报错"
+
+# ---------- C12：固化进固件的无线校准（厂家 e2p）----------
+# 出处（2026-09-30 真机取证，192.168.10.1）：
+#   · H5000M 的 factory 分区 /dev/mmcblk0p2 **整块全零**（`dd | tr -d '\000' | wc -c` = 0），
+#     所以 mt76 每次开机都打印
+#       "eeprom tx_power zeros detected, using defaults" + "eeprom load fail, use default bin"；
+#   · 读 /sys/kernel/debug/ieee80211/phy0/mt76/eeprom 拿到驱动真正加载的 7680 字节校准，
+#     与 mt76 自带的 mediatek/mt7996/mt7992_eeprom_23_2i5i.bin 逐字节相比只差 11 字节
+#     （都是驱动运行时按芯片 efuse 打的补丁）→ 本机确实走的是这个默认文件。
+# 结论：整机射频校准**只依赖上游 mt76 的默认文件名**，而这个名字历史上改过
+#   （mt7992_eeprom.bin → _23 → _24）。上游一改，本固件的校准就静默消失：WiFi 照常起来，
+#   只是功率/频段按**别的板子**的默认值走，没有任何报错。所以把厂家（higowrt）用的
+#   BE5040 校准固化进 Files/，由 Packages.sh 铺进固件顶掉同名文件。
+# 下面钉住四件事（都是「装错也照样能编译、能刷机、WiFi 也能起」的那种静默失效）：
+#   ① 两个文件都在，且大小恰好 7680（mt76 的 MT7996_EEPROM_SIZE；小于它驱动会判
+#      "Invalid default bin size" 并放弃 eeprom 初始化）；
+#   ② CHIP_ID == 0x7992（MT7992，小端 16 位）—— 拿错芯片的 bin 时驱动虽然会接受，
+#      但功率表按别的芯片解析；
+#   ③ FEM 类型与文件名对应：`_2i5i`（内部 PA/LNA）文件里的 MT_EE_WIFI_PA_LNA_CONFIG
+#      必须是 0，另一个（外部 FEM）必须是 3。驱动按芯片 efuse 判定 FEM 后挑文件，
+#      两个文件装反 = 等于没装（而且不会报错）；
+#   ④ .gitattributes 必须把 *.bin 声明为 binary，且**排在 `Files/** text eol=lf` 之后**
+#      （后写者胜）—— 否则 7680 字节的校准会被当文本翻成 CRLF，驱动按固定偏移读到的
+#      是整体错位的表。
+echo "-- C12 H5000M 无线校准（厂家 e2p）固化"
+N=$FAIL
+EE_DIR="Files/lib/firmware/mediatek/mt7996"
+EE_INT="$EE_DIR/mt7992_eeprom_23_2i5i.bin"   # 内部 FEM（iPAiLNA，本机实际使用）
+EE_EXT="$EE_DIR/mt7992_eeprom_23.bin"        # 外部 FEM（ePAeLNA）
+EE_WANT_SIZE=7680
+EE_WANT_ID=31122   # 0x7992
+
+for pair in "$EE_INT:0" "$EE_EXT:3"; do
+	EE_F="${pair%:*}"
+	EE_FEM="${pair##*:}"
+	if [ ! -f "$EE_F" ]; then
+		fail "C12 缺少 $EE_F —— 没有它，固件的无线校准只剩上游 mt76 的默认文件名这一条路（上游改名即静默丢失）"
+		continue
+	fi
+	EE_SZ="$(wc -c < "$EE_F" | tr -d '[:space:]')"
+	[ "$EE_SZ" = "$EE_WANT_SIZE" ] || fail "C12 $EE_F 大小是 $EE_SZ，应为 $EE_WANT_SIZE（mt76 的 MT7996_EEPROM_SIZE，小于它会被判 Invalid default bin size）"
+	# od 是字节级读取，不受核心/行尾设置影响；-tu2 输出本机序（x86/arm 均为小端）
+	EE_ID="$(od -An -tu2 -N2 -j0 "$EE_F" 2>/dev/null | tr -d '[:space:]')"
+	[ "$EE_ID" = "$EE_WANT_ID" ] || fail "C12 $EE_F 的 CHIP_ID 是 $EE_ID，应为 $EE_WANT_ID（0x7992，MT7992）"
+	# MT_EE_WIFI_CONF = 0x190，+6 / +7 各取低 2 位（MT_EE_WIFI_PA_LNA_CONFIG）
+	EE_F0="$(od -An -tu1 -N1 -j406 "$EE_F" 2>/dev/null | tr -d '[:space:]')"
+	EE_F1="$(od -An -tu1 -N1 -j407 "$EE_F" 2>/dev/null | tr -d '[:space:]')"
+	EE_ACT0=$(( ${EE_F0:-99} & 3 ))
+	EE_ACT1=$(( ${EE_F1:-99} & 3 ))
+	[ "$EE_ACT0" = "$EE_FEM" ] && [ "$EE_ACT1" = "$EE_FEM" ] \
+		|| fail "C12 $EE_F 的 FEM 位是 ($EE_ACT0,$EE_ACT1)，按文件名应为 ($EE_FEM,$EE_FEM)：两个文件装反等于没装，且不会报错"
+done
+
+# .gitattributes：*.bin 必须是 binary，且必须排在 Files/** 那条之后
+EE_ATTR="$(awk '
+	/^\*\.bin/ && (/binary/ || /-text/) { bin = NR }
+	/^Files\/\*\*[[:space:]]+text/ { files = NR }
+	END { if (bin && files && bin > files) print "ok"; else print "bad:" bin "/" files }
+' .gitattributes 2>/dev/null)"
+[ "$EE_ATTR" = "ok" ] || fail "C12 .gitattributes 里 *.bin 必须是 binary 且排在 Files/** text eol=lf 之后（后写者胜）：当前 $EE_ATTR —— 否则校准二进制会在 Windows 检出时被翻成 CRLF，驱动按固定偏移读到错位的表"
+
+[ "$FAIL" -eq "$N" ] && pass "无线校准已固化：两个 FEM 槽位各 7680 字节、CHIP_ID=0x7992、*.bin 已声明为 binary"
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then

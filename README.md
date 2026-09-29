@@ -61,20 +61,23 @@ OpenWRT-CI/
 │   ├── H5000M-WIFI-YES.txt   # Hiveton H5000M（带 Wi-Fi）
 │   └── PRIVATE.txt           # 私有覆盖层：由 Settings.sh 最后写入 .config，可覆盖上面各层的同名项
 ├── Files/                    # 固件 files 覆盖层（随固件打包，首次开机生效）
-│   └── etc/
-│       ├── uci-defaults/99-mt5700-net   # 网络调优（flow offload / TCP / 中断均衡 / 5G 无线）
-│       ├── uci-defaults/99-mt5700-wan   # 补齐 MT5700M 接口、防火墙 wan 区、关 USB autosuspend
-│       ├── uci-defaults/99-mt5700-sys   # zram 512M / 无线 isolate=0 / 国内 NTP
-│       ├── uci-defaults/99-mt5700-stability  # 可用性兜底（rpcd 自愈等，不动网络策略）
-│       ├── sysctl.d/99-mt5700-tcp.conf  # BBR / fq / TFO / rp_filter=0
-│       ├── sysctl.d/99-mt5700-conntrack.conf  # 连接跟踪容量（max 10 万）
-│       ├── sysctl.d/99-mt5700-lan.conf  # proxy_arp_pvlan（MLO 跨射频互通）
-│       ├── init.d/mt5700-rps            # 收包软中断多核分摊（RPS/XPS）
-│       ├── init.d/mt5700-smp            # 硬中断亲和（能搬的按负载分到四核）
-│       ├── init.d/apk-index-cache       # apk 索引缓存持久化（软件页重启后不必手动 Update lists）
-│       ├── hotplug.d/net/30-mt5700-rps  # 接口 up 时补设 RPS（无线比 S95 晚 25 秒）
-│       ├── nftables.d/12-mangle-ttl-128.nft  # WAN 出包 TTL/hoplimit 统一为 128
-│       └── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw，默认 off）
+│   ├── etc/
+│   │   ├── uci-defaults/99-mt5700-net   # 网络调优（flow offload / TCP / 中断均衡 / 5G 无线）
+│   │   ├── uci-defaults/99-mt5700-wan   # 补齐 MT5700M 接口、防火墙 wan 区、关 USB autosuspend
+│   │   ├── uci-defaults/99-mt5700-sys   # zram 512M / 无线 isolate=0 / 国内 NTP
+│   │   ├── uci-defaults/99-mt5700-stability  # 可用性兜底（rpcd 自愈等，不动网络策略）
+│   │   ├── sysctl.d/99-mt5700-tcp.conf  # BBR / fq / TFO / rp_filter=0
+│   │   ├── sysctl.d/99-mt5700-conntrack.conf  # 连接跟踪容量（max 10 万）
+│   │   ├── sysctl.d/99-mt5700-lan.conf  # proxy_arp_pvlan（MLO 跨射频互通）
+│   │   ├── init.d/mt5700-rps            # 收包软中断多核分摊（RPS/XPS）
+│   │   ├── init.d/mt5700-smp            # 硬中断亲和（能搬的按负载分到四核）
+│   │   ├── init.d/apk-index-cache       # apk 索引缓存持久化（软件页重启后不必手动 Update lists）
+│   │   ├── hotplug.d/net/30-mt5700-rps  # 接口 up 时补设 RPS（无线比 S95 晚 25 秒）
+│   │   ├── nftables.d/12-mangle-ttl-128.nft  # WAN 出包 TTL/hoplimit 统一为 128
+│   │   └── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw，默认 off）
+│   └── lib/firmware/mediatek/mt7996/    # ★ 无线校准（顶掉 mt76 的同名默认 eeprom，见第三节）
+│       ├── mt7992_eeprom_23_2i5i.bin     # 内部 FEM（iPAiLNA）BE5040 校准，7680 字节
+│       └── mt7992_eeprom_23.bin          # 外部 FEM（ePAeLNA）BE5040 校准，7680 字节
 ├── Scripts/                  # 编译前自定义脚本
 │   ├── Packages.sh           # 拉取第三方插件与主题（含 MT 模式条件克隆/折叠）
 │   ├── ApplyMTMode.sh        # 按 MT_MODE 叠加配置层并写入互斥保护
@@ -83,7 +86,7 @@ OpenWRT-CI/
 │   ├── VerifyNoSingBox.sh    # 编译前后双断言 sing-box / homeproxy 未编入
 │   ├── Handles.sh            # feeds 源码修补（主题配色 / 组件冲突 / 软件页安装行为）
 │   └── Settings.sh           # 默认 IP / 主机名 / Wi-Fi / 主题
-│   └── SelfCheck.sh          # 编译前静态自检（C1~C9，见 CHANGELOG 顶部清单）
+│   └── SelfCheck.sh          # 编译前静态自检（C1~C12，见 CHANGELOG 顶部清单）
 ├── LICENSE
 └── README.md
 ```
@@ -275,6 +278,30 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 * **USB 驱动栈扩展**：包含 `kmod-usb-core`, `kmod-usb3` 及 `kmod-usb-net-qmi-wwan` 等丰富驱动，确保系统准确识别各类移动通信模组。
 * **轻量级 NAS 存储**：支持 NVMe 固态硬盘（`kmod-nvme`）挂载，结合 BTRFS 文件系统，轻松打造家庭数据中心。
 * **安全异地组网**：内置 WireGuard（`kmod-wireguard` + `luci-proto-relay`），轻松实现内网设备的远程安全访问。
+* **Wi-Fi 射频校准（已固化，不再依赖上游默认值）**：把 Hiveton 官方固件（higowrt）所用的
+  BE5040 校准固化进 `Files/lib/firmware/mediatek/mt7996/`，由 `Packages.sh` 铺进固件、顶掉
+  mt76 的同名默认文件。
+  > **为什么需要（2026-09-30 真机取证）**：H5000M 的 `factory` 分区（`/dev/mmcblk0p2`）
+  > **整块全零**（`dd … | tr -d '\000' | wc -c` 得 0），所以 mt76 每次开机都走默认校准：
+  > `eeprom tx_power zeros detected, using defaults` / `eeprom load fail, use default bin`。
+  > 也就是说整机射频校准**只挂在上游 mt76 的默认文件名上**，而这个名字历史上改过
+  > （`mt7992_eeprom.bin` → `_23` → `_24`）—— 上游一改，本固件就**静默**换成别的板子的
+  > 默认值（WiFi 照常起来，只是功率/频段按错板子走，没有任何报错）。
+  >
+  > 这份校准取自 Hiveton 官方固件 [higowrt](https://github.com/Hiveton/higowrt) 的
+  > `mt_wifi7` 包所选的 SDK BE5040 校准（`MT7991_MT7976_EEPROM_BE5040_iPAiLNA.bin` /
+  > `..._ePAeLNA.bin`，公开镜像见 `benboguan/mt799x`）。与 mt76 自带值逐字节比对后的结论：
+  > - 本机 `dev->var.fem = INT`，驱动加载的是 `mt7992_eeprom_23_2i5i.bin`；从
+  >   `/sys/kernel/debug/ieee80211/phy0/mt76/eeprom` 把驱动真正生效的 7680 字节 dump 出来
+  >   对比，它与厂家 iPAiLNA 文件只差 **1 个字节**（偏移 `0x1af`，落在 mt76 不解析的区域），
+  >   另外 11 处差异是驱动按芯片 efuse 运行时打的补丁；
+  > - 换句话说：**这次改动的价值不是"修功率表"，而是把校准从「上游 mt76 文件名漂移」的
+  >   风险里解耦**，并让两个 FEM 槽位都拿到 BE5040 的值 —— 外部 FEM 那一槽，mt76 自带的是
+  >   另一块板的表（差 254 字节），而该文件同样有概率被别的机型请求。
+  >
+  > SHA256：`4f5a6345…f85563`（iPAiLNA）/ `64584a83…6ab137`（ePAeLNA）。`SelfCheck.sh`
+  > 的 C12 按**大小 7680 / CHIP_ID 0x7992 / FEM 槽位对应 / `.gitattributes` 的 `*.bin binary`**
+  > 四项钉住：装反槽位、文件被当文本转换（CRLF）都会被判红。
 
 > ⚠️ 本清单列出的是**显式选中**（`Config/*.txt` 里写了 `CONFIG_PACKAGE_*=y`）的包：
 > `Scripts/Packages.sh` 里克隆了但没写 `=y` 的包**不会**因为克隆而进固件，别把它们算作固件能力。

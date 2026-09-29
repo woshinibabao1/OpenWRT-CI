@@ -1,5 +1,95 @@
 # 更新日志
 
+## [2026-09-30 · 三] H5000M 无线校准（e2p）固化进固件 —— factory 分区全零，此前完全依赖上游 mt76 的默认文件名
+
+把 Hiveton 官方固件（[higowrt](https://github.com/Hiveton/higowrt)）所用的 **BE5040 无线校准**
+固化进固件 `Files/lib/firmware/mediatek/mt7996/`，由 `Packages.sh` 铺进 `wrt/files/` 顶掉 mt76
+自带的同名默认 eeprom。
+
+### 真机取证：这块板的出厂校准**不存在**
+
+| 事实 | 命令 / 来源 | 结果 |
+| :-- | :-- | :-- |
+| factory 分区是否为空 | `dd if=/dev/mmcblk0p2 bs=64k \| tr -d '\000' \| wc -c` | **0**（4MB 全零；按 64KB 分块逐块统计也全为 0） |
+| 驱动怎么处理的 | `dmesg` | `eeprom tx_power zeros detected, using defaults`、`eeprom load fail, use default bin`（每次开机都一样） |
+| 驱动实际加载了什么 | `cat /sys/kernel/debug/ieee80211/phy0/mt76/eeprom` | 7680 字节，CHIP_ID=0x7992，FEM=(0,0) 内部 |
+| 与 mt76 默认文件的关系 | 逐字节比对 `mediatek/mt7996/mt7992_eeprom_23_2i5i.bin` | **只差 11 字节，且全部是驱动按芯片 efuse 运行时打的补丁** → 本机走的就是 mt76 的默认文件 |
+
+结论：整机射频校准**只挂在上游 mt76 的默认文件名上**。而这个名字历史上改过
+（`mt7992_eeprom.bin` → `_23` → `_24`，见 mt76 `mt7996/mt7996.h` 的
+`MT7992_EEPROM_DEFAULT*` 定义）：上游一改，本固件就会**静默**改用别的板子的默认值 ——
+WiFi 照常起来，只是功率/频段按错板子走，没有任何报错。
+
+### 厂家侧证据（为什么用这一份）
+
+higowrt 的 `package/mtk/drivers/mt_wifi7/Makefile` 里有一条自带注释：
+
+```
+# HiGoWRT: 用 SDK 自带 5040 iPA 校准作 driver e2p (无 per-device 校准,
+# 避免 'EEPROM in Flash is wrong' 降级导致 physical_dev not ready)
+$(INSTALL_BIN) $(PKG_BUILD_DIR)/bin/mt7992/rebb/MT7991_MT7976_EEPROM_BE5040_iPAiLNA.bin $(1)/lib/firmware/e2p
+```
+
+即：**厂家自己也承认没有 per-device 校准**，用的是 SDK 的 BE5040 iPA 校准作 e2p。
+该二进制不在 higowrt 的公开仓库里（驱动源码 `mt7993_20250919-39602c.tar.xz` 是
+`PKG_SOURCE_URL` 为空的闭源包），但同一份文件在公开镜像 `benboguan/mt799x`
+（MTK wifi 驱动 + `bin/` 目录）里可取得。
+
+### 本次改动
+
+| 文件 | 改动 |
+| :-- | :-- |
+| `Files/lib/firmware/mediatek/mt7996/mt7992_eeprom_23_2i5i.bin` | 新增。厂家 `MT7991_MT7976_EEPROM_BE5040_iPAiLNA.bin`（内部 FEM，本机实际使用），7680 字节，SHA256 `4f5a6345…f85563` |
+| `Files/lib/firmware/mediatek/mt7996/mt7992_eeprom_23.bin` | 新增。厂家 `MT7991_MT7976_EEPROM_BE5040_ePAeLNA.bin`（外部 FEM 槽位），7680 字节，SHA256 `64584a83…6ab137` |
+| `Scripts/Packages.sh` | `INSTALL_NET_TUNING` 由「只复制 `Files/etc/`」改为**整棵 `Files/` 树**（`cp -rf "$SRC_DIR/." "$DST_DIR/"`）。否则 `Files/lib/...` 会被静默丢掉；而下面的完整性断言是「源里有什么、目标就必须有什么」，届时会判红而不是放过 |
+| `.gitattributes` | 新增 `*.bin binary`（★ 必须排在 `Files/** text eol=lf` 之后，后写者胜）。没有这条，7680 字节的校准会在 Windows 检出时被当文本翻成 CRLF → 驱动按固定偏移读到**整体错位**的表，而 WiFi 照样能起来 |
+| `Scripts/SelfCheck.sh` | C9 由 `Files/etc` 扩到整个 `Files/`；**新增 C12**（见下）；**修 C5 假阳性**（见下） |
+| `README.md` | 结构树补上这两个文件；第三节新增「Wi-Fi 射频校准」条目，写明取证过程与 SHA256 |
+
+### 这次改动的价值要说清楚（不是"修功率表"）
+
+本机 dump 出来的实际校准与厂家 iPAiLNA 文件**只差 1 个字节**（偏移 `0x1af`，落在
+mt76 不解析的区域），所以它**不会**带来功率变化。真正的收益有两条：
+
+1. **解耦上游文件名漂移**：校准从"上游 mt76 恰好有这个名字的默认文件"变成"我们固件自己带"；
+2. **补齐外部 FEM 槽位**：`mt7992_eeprom_23.bin` 那一槽，mt76 自带的是另一块板的表
+   （与厂家 ePAeLNA 差 **254 字节**），现在换成本系列的正确值。
+
+### 新增静态闸门 C12
+
+钉四件事（都属于「装错也照样能编译、能刷机、WiFi 也能起」的静默失效）：
+文件存在、大小恰好 7680（小于它 mt76 判 `Invalid default bin size` 并放弃 eeprom 初始化）、
+CHIP_ID=0x7992、**FEM 位与文件名对应**（`_2i5i` 必须 (0,0)、另一个必须 (3,3)，
+驱动按 efuse 选文件，装反等于没装），外加 `.gitattributes` 的 `*.bin binary` 且顺序正确。
+
+**变异验证（4/4 判红，还原后全绿）**：
+
+| 变异 | 结果 |
+| :-- | :-- |
+| 文件截断成 7000 字节（下载不全 / 被文本转换） | ✗ 判红（大小） |
+| 两个 FEM 槽位互换 | ✗ 判红（两个文件各报一次） |
+| 用 mt76 的 MT7996 通用 eeprom 顶替 | ✗ 判红（CHIP_ID 31120 ≠ 31122，且 FEM 不符） |
+| 删掉 `.gitattributes` 的 `*.bin binary` | ✗ 判红（顺序/缺失） |
+
+### 顺带修掉的同类问题：C5 的假阳性
+
+C5（「Files/ 覆盖层必须是 LF」）用 `tr -dc '\r'` 数 CR —— 但**二进制校准里出现 0x0d 是数据，
+不是行尾**，于是本条对新增的 .bin 恒假红（本次加入校准文件时首次命中）。
+处理：C5 显式跳过 `*.bin`，并在注释里写明「将来新增别的二进制覆盖层时，这里与
+`.gitattributes` 要一起加」；二进制的完整性交给 C12。
+
+### 影响与回退
+
+- 对**本机**（`dev->var.fem = INT`）：加载的表只差 1 个字节（mt76 不解析的区域），
+  可以认为"无行为变化，但校准来源从上游挪到自己固件"。
+- 对**外部 FEM 的 H5000M**（若有）：那一槽从"别的板子的表"换成本系列正确的表。
+- 回退：删掉 `Files/lib/.../mt7996/` 两个文件即可 —— 固件退回「用 mt76 默认 eeprom」的旧行为
+  （README / CHANGELOG 相应段落同步删除即一致）。
+- 本次**未做**真机刷机验证（改动不触及运行中的设备，且本机校准逐字节已比对过）；
+  下一次 `H5000M-MT-AUTO` / 手动 `WRT-BUILD` 产物刷入后，
+  以 `dmesg` 仍是 `use default bin`（这条**不会**变，因为 nvmem 依旧全零）、
+  以及实际发射功率/速率无异常为准。
+
 ## [2026-09-30 · 三] netmode 换源：改用自有 fork（上游 `main` 的直接后代，v1.3.1-r2 → v1.3.4-r1）
 
 `Scripts/Packages.sh` 里 `luci-app-h5000m-netmode` 的克隆源由 `FAN789/luci-app-h5000m-netmode`

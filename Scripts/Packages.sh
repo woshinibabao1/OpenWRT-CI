@@ -368,8 +368,13 @@ INSTALL_NET_TUNING() {
 	#     那种"靠别处报错来兜底"的耦合不该继续。）
 	[ -d "$SRC_DIR" ] || { echo "::error::net-tuning: 源目录 $SRC_DIR 不存在 —— Files/ 覆盖层全部内容（TTL 规则 / sysctl / uci-defaults / init.d / hotplug）都不会进固件"; exit 1; }
 
-	mkdir -p "$DST_DIR/etc/uci-defaults" "$DST_DIR/etc/sysctl.d" "$DST_DIR/etc/nftables.d" "$DST_DIR/etc/hotplug.d/net"
-	cp -rf "$SRC_DIR/etc/." "$DST_DIR/etc/"
+	# ★ 2026-09-30：改为**整棵 Files/ 树**复制，不再只复制 etc/。
+	#   起因：往固件里固化 H5000M 的无线校准（Files/lib/firmware/mediatek/mt7996/*.bin），
+	#   它不在 etc/ 下。只复制 etc/ 的话，Files/lib/... 会被静默丢掉 —— 而下面的
+	#   完整性断言是「源里有什么、目标就必须有什么」，届时会直接判红而不是静默放过
+	#   （这正是要的：漏了会报错，不会悄悄少一份校准）。
+	mkdir -p "$DST_DIR"
+	cp -rf "$SRC_DIR/." "$DST_DIR/"
 
 	# ---- 可执行位（2026-09-22 改为按内容判定）--------------------------------
 	# 原来按目录写死三条 chmod（uci-defaults / init.d / hotplug.d/net）。那样只覆盖
@@ -386,7 +391,7 @@ INSTALL_NET_TUNING() {
 		[ "$(head -c 2 "$F" 2>/dev/null)" = '#!' ] || continue
 		chmod 0755 "$F" && EXEC_N=$((EXEC_N + 1))
 	done < <(find "$DST_DIR" -type f)
-	echo "net-tuning: 已注入 Files/etc → wrt/files/etc（识别为脚本并 +x 的 ${EXEC_N} 个）"
+	echo "net-tuning: 已注入 Files/ → wrt/files/（识别为脚本并 +x 的 ${EXEC_N} 个）"
 
 	# ---- 完整性断言 ----------------------------------------------------------
 	# P08：复制后无断言，调优脚本丢了没人知道（直接后果：刷完没网）。
