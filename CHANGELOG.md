@@ -1,5 +1,56 @@
 # 更新日志
 
+## [2026-09-30 · 三] netmode 换源：改用自有 fork（上游 `main` 的直接后代，v1.3.1-r2 → v1.3.4-r1）
+
+`Scripts/Packages.sh` 里 `luci-app-h5000m-netmode` 的克隆源由 `FAN789/luci-app-h5000m-netmode`
+换成 `woshinibabao1/luci-app-h5000m-netmode`。
+
+### 背景：上一版「保持上游」的理由已经过期
+
+2026-09-22 风扇温控换源时，这里**有意**把 netmode 留在上游，理由写进了当时的注释：
+「保持上游，是为了让 netmode 与厂家行为一致，避免不同 fork 之间的行为差异」。
+那个理由当时成立（两边是并行的两套改动），现在不成立了 —— 这个 fork 已经是上游 `main` 的
+**直接后代**，没有分叉行为，多出来的全部是性能与缺陷修复。
+
+### 依据（可复现，非推断）
+
+| 判据 | 命令 / 来源 | 结果 |
+| :-- | :-- | :-- |
+| 上游是不是 fork 的祖先 | `git merge-base --is-ancestor <FAN789>/main <fork>/main` | 返回 0（是祖先，无分叉） |
+| fork 多出的提交 | `git log --oneline <FAN789>/main..<fork>/main` | 3 个：`1a31fb2` 裁剪重复探测/写入/DOM 抖动、`6af1323` 收尾并发竞态、`8aadba0` status 54→11 进程 |
+| 包标识是否变 | `git diff <FAN789>/main..<fork>/main -- Makefile` | 只有 `PKG_VERSION`/`PKG_RELEASE`（1.3.1-r2 → 1.3.4-r1）；`PKG_NAME` / `LUCI_DEPENDS`(`+luci-base`) / `LUCI_PKGARCH` 不变 |
+| 默认配置 / uci-defaults / 菜单是否变 | `git diff ... -- root/etc/config root/etc/uci-defaults root/usr/share/luci/menu.d` | **无差异** |
+| 权限面是否变 | `git diff ... -- root/usr/share/rpcd/acl.d` | 只**收紧**：删掉视图根本用不到的 `uci: network / mt5700m` 读写授权 |
+| 是否多出第二个包 | 两个仓库里 `find -name Makefile` | 各只有根目录一个 `Makefile`（fork 新增的 `tests/` 里没有 Makefile，`luci.mk` 也不会安装它） |
+| 匿名 HTTPS 能否克隆 | `gh api repos/woshinibabao1/luci-app-h5000m-netmode` | `visibility=public`、`default_branch=main`（`UPDATE_PACKAGE` 走匿名 HTTPS，凭据零依赖） |
+| 版本序是否正常 | Makefile | 1.3.4-r1 > 1.3.1-r2，apk/ipk 升级判定正常 |
+
+换源换来的实际收益（真机 MT7987A 实测；LuCI 每 5 秒查一次状态，而 rpcd 是单线程的）：
+一次 `status` 由 **54 个外部进程 / 约 156 ms** 降到 **11 个 / 约 83 ms**；另外修掉
+「没有模组 IPv6 别名段时把 `usbv6_defaultroute`/`usbv6_auto` 谎报成 1」、
+「抢锁用 `rm -rf` + `mkdir`，两个实例可能互相删锁」、「状态查询失败会把界面连同选择一起重置」
+等问题（详见该 fork 的提交说明）。
+
+### 同步的文档
+
+| 文件 | 改动 |
+| :-- | :-- |
+| `Scripts/Packages.sh` | 克隆源改为 `woshinibabao1/luci-app-h5000m-netmode`；注释重写为「为什么现在换」+ 依据 + 回退方法 |
+| `README.md` | 致谢区的 netmode 链接改指上游并注明「本固件编的是其 fork」；第二节第 3 小节新增换源说明（与风扇温控同一体例） |
+| `CHANGELOG.md` | 本条目 |
+
+### 验证边界
+
+- `bash Scripts/SelfCheck.sh`：本地全绿（C1~C11，含 C9 的 README 结构树断言）。
+- 本次**没有**跑完整编译（本地环境编不了几小时的固件）：换源是否真能编出产物，由下一次
+  定时 `H5000M-MT-AUTO` 或手动 `WRT-BUILD` 实跑验证。风险面已在上表收敛为三条硬约束：
+  包标识不变、无新增依赖、仓库公开且分支为 `main`。
+
+### 回退
+
+把 `Scripts/Packages.sh` 里该行的 repo 改回 `FAN789/luci-app-h5000m-netmode` 即可 ——
+包名、Config 符号与安装路径都不变，README / CHANGELOG 的说明同步改回即一致。
+
 ## [2026-09-28 · 一] 修 `rustup component add rust-lld` —— 那个组件根本不存在（Custom Packages 必中断）
 
 真机 run：[`36408269360`](https://github.com/woshinibabao1/OpenWRT-CI/actions/runs/36408269360)

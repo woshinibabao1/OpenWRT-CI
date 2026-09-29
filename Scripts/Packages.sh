@@ -436,11 +436,26 @@ case "$MT_MODE" in
 		;;
 esac
 
-# H5000M 网络模式切换：仍用 FAN789 原版（netmode 与模组温度无关，没有要改的地方）。
-# ★ 别把这一行也跟着换成别处 fork —— 原注释写的「与风扇控制同源」已不成立：
-#   风扇温控 2026-09-22 起改用 woshinibabao1 的 fork（见上方），只有 netmode 还在上游。
-#   这里保持上游，是为了让 netmode 与厂家行为一致，避免不同 fork 之间的行为差异。
-UPDATE_PACKAGE "luci-app-h5000m-netmode" "FAN789/luci-app-h5000m-netmode" "main"
+# H5000M 网络模式切换：★ 2026-09-30 起改用**自己的 fork**（woshinibabao1/luci-app-h5000m-netmode）。
+#   上面那版注释写的是「保持 FAN789 上游，避免不同 fork 之间的行为差异」—— 那个理由
+#   现在已经不成立，因为 fork 不再是"另一套行为"，而是**上游 main 的直接后代**：
+#     · git 关系可验证：FAN789 的 main（c6710f8，v1.3.1-r2）是本 fork main 的祖先
+#       （`git merge-base --is-ancestor up/main fork/main` 返回 0），fork 只多 3 个提交：
+#         1a31fb2 perf: 裁剪重复探测、配置写入与 DOM 抖动
+#         6af1323 fix: 收尾并发竞态，安装路径不再去动在用接口
+#         8aadba0 perf: 一次 status 的外部进程 54 → 11，并补上状态/并发上的缺口
+#     · 包标识与接口零变化：PKG_NAME（luci-app-h5000m-netmode）、LUCI_DEPENDS（+luci-base）、
+#       Config 符号（CONFIG_PACKAGE_luci-app-h5000m-netmode）、安装路径（/usr/sbin/h5000m-netmode、
+#       /etc/config/h5000m_netmode、LuCI 视图与 rpcd ACL/menu）全部不变，也没有新增任何依赖
+#       （仍是 busybox + uci/ubus/ip/jsonfilter）。ACL 反而**收紧**了（去掉视图根本用不到的
+#       uci 读写授权），因此 Config 层与真机升级路径都不受影响。
+#     · 版本 1.3.1-r2 → 1.3.4-r1，高于上游，apk/ipk 的升级判定正常。
+#   为什么值得换（真机 MT7987A 实测，LuCI 每 5 秒查一次状态而 rpcd 是单线程）：
+#     一次 status 从 54 个外部进程 / 约 156 ms 降到 11 个 / 约 83 ms；并修掉
+#     「没有模组 IPv6 别名段时把 usbv6_defaultroute/usbv6_auto 谎报成 1」
+#     「抢锁用 rm -rf + mkdir，两个实例可能互相删锁」等缺陷。
+#   回退：把下面这行的 repo 改回 FAN789/luci-app-h5000m-netmode 即可（包名与符号都不变）。
+UPDATE_PACKAGE "luci-app-h5000m-netmode" "woshinibabao1/luci-app-h5000m-netmode" "main"
 
 #安装 Honk 预编译 APK（避免从源码编译 Rust/eBPF 导致超过 6 小时上限）
 # 流程：

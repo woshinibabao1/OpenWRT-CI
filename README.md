@@ -167,7 +167,7 @@ OpenWRT-CI/
 > * 🔗 **主页链接**：[https://github.com/FAN789](https://github.com/FAN789)
 > * 📦 **5G 模组控制**：[luci-app-mt5700m](https://github.com/LianXia233/luci-app-mt5700m)
 > * ❄️ **智能风扇温控**：[luci-app-h5000m-fancontrol](https://github.com/FAN789/luci-app-h5000m-fancontrol)（本固件编的是[其 fork](https://github.com/woshinibabao1/luci-app-h5000m-fancontrol)，仅补上 5G 模组取温，见第二节）
-> * 🔀 **网络模式切换**：[luci-app-h5000m-netmode](https://github.com/LianXia233/luci-app-h5000m-netmode)
+> * 🔀 **网络模式切换**：[luci-app-h5000m-netmode](https://github.com/FAN789/luci-app-h5000m-netmode)（本固件编的是[其 fork](https://github.com/woshinibabao1/luci-app-h5000m-netmode)，同源的性能与缺陷修复，包名与接口不变，见第二节）
 
 ---
 
@@ -216,6 +216,16 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 
 ### 3. 网络模式无缝切换 (`luci-app-h5000m-netmode`)
 所有配置均包含此插件，用于应对复杂的网络接入环境（5G 蜂窝与传统有线宽带双接入），提供极简的管理体验。
+
+> **关于本固件用的 fork（2026-09-30 换源）**：上游 FAN789 原版停在 v1.3.1-r2，本固件改用
+> [woshinibabao1/luci-app-h5000m-netmode](https://github.com/woshinibabao1/luci-app-h5000m-netmode)
+> —— 它是上游 `main` 的**直接后代**（只多 3 个提交，v1.3.4-r1），包名、Config 符号、安装路径与
+> UCI 配置结构全部不变，也没有新增任何依赖；ACL 只做了收紧（去掉视图用不到的 uci 授权）。
+> 换源换来的是运行开销与缺陷修复：真机上一次状态查询从 **54 个外部进程 / 约 156 ms** 降到
+> **11 个 / 约 83 ms**（LuCI 每 5 秒轮询一次状态，而 rpcd 是单线程的），并修掉
+> 「没有模组 IPv6 别名段时把 `usbv6_defaultroute`/`usbv6_auto` 谎报成 1」、
+> 「抢锁用 `rm -rf` + `mkdir`，两个实例可能互相删锁」等问题。
+> 回退方式：把 `Scripts/Packages.sh` 里该行的 repo 改回 `FAN789/...` 即可。
 
 ### 4. MT 插件模式（MT_MODE）
 
