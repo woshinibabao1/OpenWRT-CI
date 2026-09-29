@@ -22,6 +22,7 @@
 #   C11 Rust 交叉编译前提：不赌组件名 + 按产物验收 rust-lld
 #   C12 二进制覆盖层行尾保护（*.bin binary）+ 若固化无线校准则校验其格式
 #   C13 Wi-Fi MAC 唯一化守卫（CID 派生 / 不覆盖用户值 / 不重建无线配置）
+#   C14 uci-defaults 幂等性守卫（保留配置升级会重放它们 → 会覆盖用户设置的键必须有标记）
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -579,6 +580,34 @@ else
 fi
 
 [ "$FAIL" -eq "$N" ] && pass "Wi-Fi MAC 唯一化与厂家残留清理脚本就位，且红线（CID 派生 / 不覆盖 / 不重建配置）都在"
+
+# ---------- C14：uci-defaults 幂等性（防"每次升级抹掉用户设置"复发）----------
+# 根因（2026-09-30 核实到上游源码 + 真机）：eMMC 机型 sysupgrade 走 emmc_copy_config，
+# 保留配置升级只还原 keep.d 里列出的文件，而 `/etc/uci-defaults/*` 来自**新 rootfs**
+# → 这些脚本**每次刷机都会再执行一遍**。任何"无条件覆盖用户设置"的写法，都会在每次
+#   升级后把用户手改的值抹回产品默认（已发生过的两处：5G 信道/频宽、NTP 源；真机证据
+#   见 CHANGELOG 2026-09-30 第五节）。
+# 本门只钉**确实会覆盖用户设置**的那两个键，要求对应文件必须带"只应用一次"的标记守卫：
+#   · Files/etc/uci-defaults/99-mt5700-net → wireless.radio1 的 channel/htmode
+#   · Files/etc/uci-defaults/99-mt5700-sys → system.ntp.server
+# 判据不是"文件里出现过 .applied 字样"（注释也能满足），而是**条件判断里真的测试了标记**
+#   —— 形如 `[ ! -e /etc/config/h5000m-defaults-*.applied ]`。删掉该条件即判红。
+echo "-- C14 uci-defaults 幂等性（保留配置升级会重放它们）"
+N=$FAIL
+for pair in "Files/etc/uci-defaults/99-mt5700-net:wireless.radio1.channel" \
+            "Files/etc/uci-defaults/99-mt5700-sys:system.ntp.server"; do
+	C14_F="${pair%%:*}"
+	C14_KEY="${pair##*:}"
+	if [ ! -f "$C14_F" ]; then
+		fail "C14 缺少 $C14_F（它负责写 $C14_KEY 的产品默认值）"
+		continue
+	fi
+	# 该文件已不再写这个键 → 本门对它不适用（不误伤有意的删除/改名）
+	grep -qF "$C14_KEY" "$C14_F" || continue
+	awk '/\[ *!? *-e .*h5000m-defaults-[a-z]+\.applied *\]/ { ok = 1 } END { exit ok ? 0 : 1 }' "$C14_F" \
+		|| fail "C14 $C14_F 会写 $C14_KEY，但缺少「只在标记不存在时才应用」的守卫：保留配置升级后本脚本会重跑，用户手改的值会被抹回产品默认（标记路径形如 /etc/config/h5000m-defaults-*.applied；标记放 /etc/config/ 下才能跨升级存活，见 keep.d/base-files）"
+done
+[ "$FAIL" -eq "$N" ] && pass "两处会覆盖用户设置的 uci-defaults 都带上了「只应用一次」标记守卫"
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then

@@ -86,7 +86,7 @@ OpenWRT-CI/
 │   ├── VerifyNoSingBox.sh    # 编译前后双断言 sing-box / homeproxy 未编入
 │   ├── Handles.sh            # feeds 源码修补（主题配色 / 组件冲突 / 软件页安装行为）
 │   └── Settings.sh           # 默认 IP / 主机名 / Wi-Fi / 主题
-│   └── SelfCheck.sh          # 编译前静态自检（C1~C13，见 CHANGELOG 顶部清单）
+│   └── SelfCheck.sh          # 编译前静态自检（C1~C14，见 CHANGELOG 顶部清单）
 ├── LICENSE
 └── README.md
 ```
