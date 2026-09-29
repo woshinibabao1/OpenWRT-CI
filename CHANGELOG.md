@@ -1,5 +1,20 @@
 # 更新日志
 
+### 五、同日第二次修正（静态审计复核后落地，都是"每次刷机都会重跑 uci-defaults"这一条根因引出的）
+
+| 问题 | 修法 |
+| :-- | :-- |
+| **保留配置升级会重放 `/etc/uci-defaults/*`**（eMMC 走 `emmc_copy_config`，只还原 keep.d，脚本来自新 rootfs）→ 而 `99-mt5700-net` 的 `radio1.channel=36/htmode=EHT160` 与 `99-mt5700-sys` 的 NTP 列表是**无条件覆盖** → 用户手改的 5G 信道/频宽、NTP 源**每次升级都被抹掉**（真机佐证：当前 `channel='auto'`、`htmode='HE160'`，与脚本所设不符） | 两处都改为**带标记只应用一次**：`/etc/config/h5000m-defaults-wifi.applied`、`/etc/config/h5000m-defaults-ntp.applied`（真机确认 `keep.d/base-files:1` 就是 `/etc/config/`，整目录跨升级保留）。想恢复产品默认就删标记再重启 |
+| 上一提交里两个新脚本各带一条 `( sleep 8; wifi reload ) &` | **删掉**：uci-defaults 由 S10boot 执行，早于 S11sysctl/S20network，无线还要再晚（真机约 25 秒才进 ap0）—— 配置在 wpad 读它之前就已就位，本来不需要 reload；而 sleep 8 正好落在建 AP 的窗口里，**是我自己引入的打断建链风险**。手工重跑脚本时才需自己补 `wifi reload` |
+| 日志只有 128KB 内存环（`logd -S 128`），重启即清零 —— 掉线/复位的现场最容易丢 | `system.@system[0].log_size` 提到 512KB（纯 RAM；本机 available 734MB，logd 自身 1.7MB）。**不**加 `log_ip`、**不**落盘（避免 flash 写放大） |
+
+**复核后未采纳**（静态审计里的其余条目）：无线 IRQ 亲和（MTK PCI-MSI 单向量不支持，且实测 144 次/秒无需迁移）、
+`xps_cpus`（eth2/无线设备不支持）、`disassoc_low_ack='0'`（hostapd 默认踢掉低 ACK 客户端是合理的 BSS 保护，
+CPE 场景不该留死客户端）、`noscan`（默认 0 会按共存自动回落，非缺陷）、邻居表 `gc_thresh`（本机 `neigh` 表远未
+接近上限，属"阈值只增上限"的保险而非修复）、5G 出口探活自愈（误判会来回切路由 = 主动引入不稳定，需长期观察）、
+每服务 respawn 加固（现依赖内核 watchdog 31s + `panic_on_oops` 链路，加更多脚本反而增加面）、
+`proxy_arp_pvlan` 收窄到 br-lan（无线 AP 接口是动态创建的，按名字收窄会漏；`all`+`default` 才是稳的做法）。
+
 ## [2026-09-30 · 三] 稳定性体检：NTP 源去掉被反绑定保护拦掉的域名；并把"兜底已就位 / 已知限制"固化成文档
 
 判据只有一条：**会不会掉线 / 抖动 / 复位 / 丢配置**。全部读数来自真机 192.168.10.1，未做任何会中断

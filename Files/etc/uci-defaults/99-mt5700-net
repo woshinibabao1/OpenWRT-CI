@@ -241,11 +241,25 @@ done
 #      **5 秒** AP 即恢复，iwinfo 报 `HT Mode: EHT160`，未触发 DFS 阻塞；
 #      已关联的 Wi-Fi 6 客户端仍按 160MHz HE-MCS 11 HE-NSS 2 协商（向下兼容无损），
 #      EHT 4096-QAM 的收益待 Wi-Fi 7 客户端接入时体现。
-if [ "$(uci -q get wireless.radio1.band)" = "5g" ]; then
+# ★ 2026-09-30：本节改为**每台机器只应用一次**（标记文件），原因是个确定性缺陷：
+#   eMMC 机型的 sysupgrade 走 emmc_copy_config（上游 filogic platform.sh 里
+#   `hiveton,h5000m` 属 emmc 组、platform_copy_config() → emmc_copy_config），
+#   保留配置升级只还原 keep.d 列出的文件，而 `/etc/uci-defaults/*` 来自**新 rootfs**
+#   —— 于是这些脚本**每次刷机都会再执行一遍**。原先这里是无条件覆盖，结果就是：
+#   用户在 LuCI 里把 5G 信道改成 auto、频宽改成 HE160 这类选择，会在每次升级后被
+#   抹回 36/EHT160。真机佐证：192.168.10.1 当前 `channel='auto'`、`htmode='HE160'`，
+#   与该机 SSID/加密方式一样都是手改过的值。
+#   现在：只在标记文件不存在时写入（首次安装/首次刷入即产品默认），之后一律尊重用户选择；
+#   想让产品默认重新生效就删掉标记再重启。
+#   标记放 /etc/config/ 下：真机 `grep -rn /etc/config /lib/upgrade/keep.d/` 显示
+#   `base-files:1:/etc/config/`，即该目录整棵被保留，标记能跨"保留配置升级"存活。
+if [ "$(uci -q get wireless.radio1.band)" = "5g" ] \
+   && [ ! -e /etc/config/h5000m-defaults-wifi.applied ]; then
 	uci -q set wireless.radio1.channel='36'
 	uci -q set wireless.radio1.htmode='EHT160'
 	uci -q set wireless.radio1.country='CN'
+	uci -q commit wireless
+	touch /etc/config/h5000m-defaults-wifi.applied
 fi
-uci -q commit wireless
 
 exit 0

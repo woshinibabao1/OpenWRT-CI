@@ -75,7 +75,9 @@ done
 [ "$changed" = "1" ] || exit 0
 uci commit wireless || exit 1
 
-# 改完配置要重载一次无线才生效。首启/升级后的场景，后台跑，不阻塞 rcS。
-( sleep 8; wifi reload >/dev/null 2>&1 ) &
+# ★ 2026-09-30：不做 `wifi reload`（初版有 `( sleep 8; wifi reload ) &`）：本脚本由 S10boot
+#   执行，早于 S20network，wpad 起 AP 还要更晚（真机约 25 秒）—— 配置在无线启动前就已就位，
+#   不需要 reload；而 sleep 8 会落在建 AP 的窗口里，存在打断建链的风险。
+logger -t h5000m-wifi-scrub "已清理厂家残留私有键，随无线启动生效（无需 reload）"
 
 exit 0

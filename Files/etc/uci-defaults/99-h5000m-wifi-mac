@@ -72,9 +72,12 @@ done
 
 if [ "$changed" = "1" ]; then
 	uci commit wireless || exit 1
-	# 首次开机时无线可能已经起来了：后台重载一次让它生效（首启场景，不打扰任何人）。
-	# 用 nohup 语义的 & 让 rcS 不必等它。
-	( sleep 8; wifi reload >/dev/null 2>&1 ) &
+	# ★ 2026-09-30：这里**故意不做 `wifi reload`**（初版写过 `( sleep 8; wifi reload ) &`，是个隐患）：
+	#   uci-defaults 由 S10boot 执行，**早于** S11sysctl / S20network；无线是 netifd/wpad 之后
+	#   才起来的（真机约 25 秒才进 ap0）—— 这份配置在 wpad 读它之前就写好了，本来就不需要
+	#   reload；而 sleep 8 恰好落在 wpad 建 AP 的窗口里，反而可能打断建链。
+	#   只有手工重跑本脚本时才需要自己补一次 `wifi reload`。
+	logger -t h5000m-wifi-mac "已写入本机唯一 Wi-Fi MAC，随无线启动生效（无需 reload）"
 fi
 
 exit 0

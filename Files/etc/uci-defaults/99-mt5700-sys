@@ -93,7 +93,13 @@ fi
 #   不采用"给该域名加 rebind 白名单"的做法：`rebind_domain` 是整域放行，
 #   为 NTP 一个名字削弱反绑定保护不划算。
 #   只在 system.ntp 段已存在时改，避免给别的机型凭空建段。
-if uci -q get system.ntp >/dev/null 2>&1; then
+# ★ 2026-09-30（同日第二次修正）：加**标记文件**，让本节只在每台机器上应用一次。
+#   原因：eMMC 机型 sysupgrade 走 emmc_copy_config，保留配置升级只还原 keep.d 里的文件，
+#   而 /etc/uci-defaults/* 来自新 rootfs、**每次刷机都会重跑**。原先这里先 delete 再重写，
+#   等于每次升级都把用户自己改过的 NTP 列表抹掉 —— 与 99-mt5700-net 的 5G 信道是同一类缺陷。
+#   标记放 /etc/config/ 下（真机确认 keep.d/base-files:1 就是 `/etc/config/`，整目录保留）。
+#   想让本节的默认值重新生效：删掉标记再重启。
+if [ ! -e /etc/config/h5000m-defaults-ntp.applied ] && uci -q get system.ntp >/dev/null 2>&1; then
 	uci -q delete system.ntp.server 2>/dev/null
 	for SVR in ntp.tencent.com ntp1.aliyun.com ntp.ntsc.ac.cn; do
 		uci -q add_list "system.ntp.server=$SVR"
@@ -101,7 +107,16 @@ if uci -q get system.ntp >/dev/null 2>&1; then
 	uci -q set system.ntp.enabled='1'
 	uci -q set system.ntp.enable_server='0'
 	uci -q commit system
+	touch /etc/config/h5000m-defaults-ntp.applied
 fi
+
+# ---------- 4b. 日志缓冲从 128KB 提到 512KB（2026-09-30 补）----------
+# 真机 `ps` 显示 `logd -S 128`、`uci get system.@system[0].log_size` = 128 —— 即默认的
+# 128KB **内存**环形缓冲，重启即清零。恰恰是"掉线/复位"这类最需要回看的现场最容易丢。
+# 提到 512KB 只占 RAM（本机 available 734MB，`logd` 本身才 1.7MB RSS），不写 flash、
+# 不影响寿命，只是能多留几倍历史。**不**改 `log_ip`（本机没有远程日志服务器）。
+uci -q set system.@system[0].log_size='512'
+uci -q commit system
 
 # ---------- 5. apk 索引缓存持久化：启用 apk-index-cache ----------
 # 症状：每次重启后 LuCI「系统 → 软件」都用不了 —— 可用包列表是空的、点安装/卸载
