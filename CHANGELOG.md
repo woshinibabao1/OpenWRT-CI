@@ -1,5 +1,73 @@
 # 更新日志
 
+## [2026-09-30 · 三] 稳定性体检：NTP 源去掉被反绑定保护拦掉的域名；并把"兜底已就位 / 已知限制"固化成文档
+
+判据只有一条：**会不会掉线 / 抖动 / 复位 / 丢配置**。全部读数来自真机 192.168.10.1，未做任何会中断
+现网的改动（本轮**没有**重启无线、没有刷机、没有改设备配置）。
+
+### 一、唯一确定该改的：NTP 源里有被 dnsmasq 反绑定保护拦掉的域名
+
+```
+$ nslookup cn.ntp.org.cn 223.5.5.5
+    Address: 111.203.6.13      ← 公网
+    Address: 10.48.49.44       ← 10/8 私网地址
+$ logread | grep rebind
+    daemon.warn dnsmasq: possible DNS-rebind attack detected: cn.ntp.org.cn   ← 每几分钟一条
+```
+
+本机 `dhcp.@dnsmasq[0].rebind_protection=1`（配置里没有 `rebind_domain` 白名单），所以该域名解析被拦、
+ntpd 对它的查询作废。四个源里其余三个（`ntp.tencent.com` / `ntp1.aliyun.com` / `ntp.ntsc.ac.cn`）
+工作正常，设备时间实测准确 —— 所以这不是"掉线"，而是**日志噪声 + 一个源白配**；
+更麻烦的是它会**淹没真正的反绑定告警**（那条是要当安全信号看的）。
+
+处理：`Files/etc/uci-defaults/99-mt5700-sys` 的 NTP 列表去掉 `cn.ntp.org.cn`。
+**不用** `rebind_domain` 白名单 —— 那是整域放行，为一个 NTP 名字削弱反绑定保护不划算。
+
+### 二、已经就位的兜底（正面结论，写下来是为了别再去加）
+
+| 机制 | 真机证据 |
+| :-- | :-- |
+| 硬件看门狗 | `mtk-wdt: Watchdog enabled (timeout=31 sec, nowayout=0)`，`/dev/watchdog0` |
+| 崩溃自动恢复 | `kernel.panic=3` + `kernel.panic_on_oops=1` → oops 即 panic、3 秒后重启，不会停在半死状态 |
+| 崩溃现场留存 | `ramoops` 已注册、`/sys/fs/pstore/` 存在且**当前 0 个转储** → 这段时间没有内核崩溃 |
+| 内存 | `available 734MB`、zram 512M `Used=0`、`oom_kill=0` → 无内存压力 |
+| 闪存 | eMMC `life_time=0x01`（<10%）、`pre_eol_info=0x01`、`/overlay` 3%、`/tmp` 972K |
+| 掉电保护 | `K90umount` 含 `sync`；f2fs 挂 `lazytime,noatime,checkpoint_merge,fsync_mode=posix`；开机日志有 `f2fs_recover_fsync_data`（说明确实发生过非正常关机，且自恢复成功） |
+| 中断量级 | 无线 IRQ79 ≈ **144/s**、USB IRQ74 ≈ 15/s、`NET_RX` ≈ 41/s → 4 核 A53 毫无压力 |
+| 无线链路 | 两个客户端 10.8 小时内只有 3 次 DISCONNECT（一次是我这条 SSH 所在设备休眠）；无 beacon loss 记录 |
+| 接口质量 | `eth2`/`br-lan`/`phy0.1-ap0` 的 errors/dropped 全 0，3 秒增量全 0 |
+
+### 三、已知限制（不是缺陷，别再花时间）
+
+| 现象 | 结论 |
+| :-- | :-- |
+| 无线 IRQ 79 的 `smp_affinity` 写不进去（5.6M 次中断 100% 在 CPU0） | MTK PCI-MSI 单向量不支持亲和设置；按上面的量级**根本不需要迁**。文档原先列为待优化，现撤销 |
+| `eth2`/`phy0.1-ap0`/`br-lan` 的 `xps_cpus` 写入**失败** | 这些设备不支持 XPS（不是漏设）；`eth0`/`eth1` 可写且已是 `f` |
+| `bootcount` 空跑、**没有自动回滚** | `p1`（512KB，PARTLABEL=u-boot-env）前 64 字节全零、`strings` 无变量、`/etc/fw_env.config` 不存在 → `fw_printenv/fw_setenv` 不可用。刷坏的恢复只有 U-Boot web recovery 或串口 —— **刷机前必须留退路** |
+| `ubihealthd` 空跑 | eMMC 无 MTD/UBI；启动即退出，收益≈0，不动 |
+| `radius`(disabled=1) / `sqm`(全部 enabled=0) / `autoreboot`(计划 enabled=0) / `relayd`(无配置) / `usbmuxd`(无 iOS 设备) | 都**不生效或无对象**；为微小资源收益去动服务不划算，保持现状（`cpufreq` 实测是 `schedutil`，也是好的默认） |
+
+### 四、设备侧（不在本仓库，但直接决定"稳不稳"的观感）
+
+1. **DNS 上游链路会卡 20 秒**：真机是 `客户端 → dnsmasq(53) → AdGuardHome(127.0.0.1#53335) → 上游`，
+   AdGuardHome 日志里 `119.29.29.29:53 over udp ... i/o timeout`，**每次超时 20.003 秒**。
+   缓存命中的域名没事，但**新域名首次解析会卡很久** —— 观感就是"有些网站打不开/很慢"。
+   建议（属 AdGuardHome 自己的配置）：上游换 `223.5.5.5` 或 DoH/DoT、配多个上游并缩短超时。
+   ★ 顺带确认：本仓 `min_cache_ttl=3600` + `use_stale_cache=3600` **现在看是对的**（掩盖上游抖动），
+   代价是域名变更滞后；v024 用 60 是另一头的取舍。
+2. **LAN IPv6 在"自我撤销"**：`odhcpd: No default route present, setting ra_lifetime to 0!` 每几分钟一条
+   —— 5G 出口没有 IPv6 默认路由，odhcpd 只能把 RA 默认路由寿命归零，客户端 IPv6 反复失效。
+   属功能取舍，本仓不擅自动：不用 IPv6 就关掉（`dhcp.lan.ra/ndp=disabled` + 删 `ip6assign`），
+   要用就保持现状（**不要**用 `ra_default=1`，那会把 IPv6 流量丢给没有出口的路由器）。
+3. `network.wwan` 是个没有 device 的 dhcp 接口（厂家固件残留）：不会掉线，但每次 reload 都会被尝试，
+   确认不用可删。
+
+### 验证
+
+- 全部读数为真机现场取证（前几轮的脚本都在会话工作区，可重跑）。
+- `bash Scripts/SelfCheck.sh` 全绿（README 改动不影响任何闸门）。
+- 本轮**未改设备**：NTP 改动只写进固件覆盖层，要等下次刷机才生效。
+
 ## [2026-09-30 · 三] Wi-Fi MAC 唯一化（全机型 BSSID 相同）+ 三处运行时加固；并**回退**当天的无线校准固化
 
 本轮起因是"从厂家固件里找无线校准"。结论是：**校准不用搬（也搬错了对象），但顺着这条线挖出了一个真缺陷** ——

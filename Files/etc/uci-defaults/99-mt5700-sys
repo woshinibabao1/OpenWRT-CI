@@ -80,10 +80,22 @@ fi
 # OpenWrt 默认的 pool.ntp.org 在国内解析与往返都慢，5G CPE 冷启动后
 # 系统时间可能要拖很久才同步 —— 时间不对会让 HTTPS 证书校验失败，
 # 表现为「能上网但所有 https 站点都报证书错误」。
-# 只在 system.ntp 段已存在时改，避免给别的机型凭空建段。
+# ★ 2026-09-30：从列表里**去掉 cn.ntp.org.cn**。真机实测（192.168.10.1）：
+#     nslookup cn.ntp.org.cn 223.5.5.5
+#       Address: 111.203.6.13      ← 公网
+#       Address: 10.48.49.44       ← **10/8 私网地址**
+#   而本机 dnsmasq 开着 `stop-dns-rebind`（dhcp.@dnsmasq[0].rebind_protection=1），
+#   于是每几分钟就刷一条
+#     daemon.warn dnsmasq: possible DNS-rebind attack detected: cn.ntp.org.cn
+#   并且 ntpd 对这个名字的解析被拦掉、该源实际作废。四个源里剩下三个仍然好用
+#   （设备时间实测准确），所以这条不是"掉线"，而是**日志噪声 + 一个源白配**；
+#   但它会掩盖真正的 DNS 反绑定告警（那条是要当安全信号看的）—— 所以删掉它。
+#   不采用"给该域名加 rebind 白名单"的做法：`rebind_domain` 是整域放行，
+#   为 NTP 一个名字削弱反绑定保护不划算。
+#   只在 system.ntp 段已存在时改，避免给别的机型凭空建段。
 if uci -q get system.ntp >/dev/null 2>&1; then
 	uci -q delete system.ntp.server 2>/dev/null
-	for SVR in ntp.tencent.com ntp1.aliyun.com ntp.ntsc.ac.cn cn.ntp.org.cn; do
+	for SVR in ntp.tencent.com ntp1.aliyun.com ntp.ntsc.ac.cn; do
 		uci -q add_list "system.ntp.server=$SVR"
 	done
 	uci -q set system.ntp.enabled='1'

@@ -329,5 +329,65 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 
 <br>
 
+## 🧪 四、 稳定性体检（2026-09-30 真机实测，192.168.10.1）
+
+> 判断标准只有一条：**会不会掉线 / 抖动 / 复位 / 丢配置**。下面每条都来自真机读数，不是推断；
+> 写成文档的目的是**避免以后重复调研同一条**（本项目已经为 WED、mtk-puncture 等做过这种记录）。
+
+### 4.1 已经就位的兜底（正面结论，别再去加）
+
+| 机制 | 真机证据 | 意味着 |
+| :-- | :-- | :-- |
+| 硬件看门狗 | `mtk-wdt 1001c000.watchdog: Watchdog enabled (timeout=31 sec, nowayout=0)`，`/dev/watchdog0` 存在 | 系统挂死 31 秒会硬复位 |
+| 内核崩溃自动恢复 | `kernel.panic=3`、`kernel.panic_on_oops=1` | oops 即 panic，3 秒后自动重启 —— 不会停在半死状态 |
+| 崩溃现场留存 | `ramoops` 已注册、`/sys/fs/pstore/` 存在；**当前 0 个转储** | 真发生内核崩溃时重启后能查到现场；现在为空 = 这段时间没崩过 |
+| 内存与交换 | `available 734MB`、zram 512M **`Used=0`**、`oom_kill=0` | 没有内存压力；zram 是纯兜底（未用到） |
+| 闪存寿命 | eMMC `life_time=0x01`（<10%）、`pre_eol_info=0x01`（正常）、`/overlay` 用 3% | 无磨损担忧 |
+| 掉电保护 | `/etc/init.d/umount` 含 `sync`、f2fs 挂 `lazytime,noatime,checkpoint_merge,fsync_mode=posix` | 正常关机路径会把数据落盘；异常掉电后 f2fs 能自恢复（开机日志有 `f2fs_recover_fsync_data`，说明确实发生过非正常关机） |
+| 中断负载 | 无线 IRQ 79 ≈ **144 次/秒**、USB IRQ 74 ≈ 15 次/秒、`NET_RX` ≈ 41 次/秒 | 量级极低，4 核 A53 毫无压力 |
+
+### 4.2 已知限制（**不是缺陷，别再花时间**）
+
+| 现象 | 结论 |
+| :-- | :-- |
+| 无线 IRQ 79 的 `smp_affinity` 改不动（RC=1，5.6M 次中断 100% 落在 CPU0） | MTK PCI-MSI 单向量不支持亲和设置；且按上面量级**根本不需要迁**。文档原先把它列为待优化项，现撤销 |
+| `eth2`（USB 网卡）/`phy0.1-ap0`/`br-lan` 的 `xps_cpus` 写入失败 | 这些设备**不支持 XPS**（实测写入直接失败），不是"漏设"。`eth0`/`eth1` 可写且已是 `f` |
+| 没有 u-boot 环境分区内容 → `bootcount` 空跑、无自动回滚 | `p1`（512KB，PARTLABEL=u-boot-env）**前 64 字节全零、`strings` 无任何变量**，且 `/etc/fw_env.config` 不存在 → `fw_printenv/fw_setenv` 虽在但不可用。**刷坏的恢复途径只有 U-Boot 的 web recovery（eMMC 里的更U-Boot）或串口** —— 刷机前务必留一条退路 |
+| `ubihealthd` 在 eMMC 机型空跑 | 无 MTD/UBI（`/proc/mtd` 为空、`lsmod` 无 ubi），启动即退出，收益≈0，**不动** |
+| `radius`/`relayd`/`usbmuxd`/`sqm`/`autoreboot` 等服务 enabled | 逐个查过：`radius.disabled=1`、`sqm.*.enabled=0`、`autoreboot` 计划 `enabled=0`、`relayd` 无配置、`usbmuxd` 无 iOS 设备 —— 都**不生效或无对象**，为微小资源收益去动它们不划算，**保持现状** |
+
+### 4.3 唯一确定该改的一条（已改）：NTP 源里有被 DNS 反绑定保护拦掉的域名
+
+```
+真机 nslookup cn.ntp.org.cn 223.5.5.5 →
+    Address: 111.203.6.13      ← 公网
+    Address: 10.48.49.44       ← 10/8 私网地址
+后果：每几分钟一条 daemon.warn dnsmasq: possible DNS-rebind attack detected: cn.ntp.org.cn
+     且 ntpd 对该源解析失败（另外三个源正常，设备时间实测准确）
+```
+`Files/etc/uci-defaults/99-mt5700-sys` 已把该域名从 NTP 列表删除（**不**用 `rebind_domain` 白名单 ——
+那会整域放行、削弱反绑定保护；而这条 warn 本身是要当安全信号看的，不能被噪声淹没）。
+
+### 4.4 设备侧（不属于本仓库，但会影响"稳不稳"的观感）
+
+1. **DNS 上游链路**：真机是 `客户端 → dnsmasq(53) → AdGuardHome(127.0.0.1#53335) → 上游`，
+   而 AdGuardHome 日志里 `119.29.29.29:53 over udp ... i/o timeout` **每次超时 20 秒**。
+   缓存命中的域名没事（`min_cache_ttl=3600` + `use_stale_cache=3600` 正好掩盖了它），
+   但**新域名的首次解析会卡很久**，观感就是"有些网站打不开/很慢"。
+   建议（属 AdGuardHome 自己的配置，不在本仓）：上游换成 `223.5.5.5` 或 DoH/DoT、
+   给多个上游并缩短超时；或让 dnsmasq 直连运营商 DNS。
+   ★ 顺带结论：本仓把 `min_cache_ttl` 设成 3600 是**有意为之且现在看是对的** —— 它掩盖了上游抖动；
+   代价是域名变更/运营商跳转页会滞后（v024 用 60，那是拿抖动换新鲜度，两者取舍不同）。
+2. **LAN IPv6 一直在"自我撤销"**：`odhcpd: No default route present, setting ra_lifetime to 0!`
+   每几分钟一条 —— 因为 5G 出口没有 IPv6 默认路由（`ip -6 route show default` 为空），
+   odhcpd 只能把 RA 的默认路由寿命归零，客户端侧 IPv6 因此反复失效。
+   两条路选一条（**属功能取舍，本仓不擅自改**）：
+   - 不用 IPv6 → `uci set dhcp.lan.ra='disabled'; uci set dhcp.lan.ndp='disabled'; uci delete network.lan.ip6assign; uci commit`，抖动消失；
+   - 要用 IPv6 → 保持现状，或用 `ra_default='1'`（**不推荐**：那会让客户端把 IPv6 流量丢给一个没有 IPv6 出口的路由器）。
+3. **`network.wwan` 是个没有 device 的 dhcp 接口**（`uci show network.wwan`），疑似厂家固件残留；
+   它不会导致掉线，但每次 reload 都会被尝试。确认不用可 `uci delete network.wwan && uci commit network`。
+
+<br>
+
 > 📅 *文档更新日期：2026年9月*
 > 💡 *本说明文档由项目编译配置与社区开源信息整合生成。*
