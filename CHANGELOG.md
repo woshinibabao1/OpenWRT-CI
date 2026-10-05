@@ -58,6 +58,33 @@ PPE 引擎**已 attach**：`dmesg` 有 `eth0/eth1: mediatek frame engine at 0xff
 `falling back`。只能看三条同时成立：`ppe0/entries` 计数涨 + `ppe0/bind` 非空 + CPU 下降。
 若将来 WAN 改走有线 `eth1`（现配置里有但未插线），`on-hw` 才有意义。
 
+### 六、2026-10-06 刷机后验收：新默认值在真机上全部落地
+
+用户刷入含本次改动的固件后逐项核对，**四处默认值 + 三个 init 服务 + sysctl + nft 片段全部到位**：
+
+| 验收项 | 期望 | 真机实测 |
+| :-- | :-- | :-- |
+| `firewall.@defaults[0].flow_offloading` | `1` | **`1`** ✅ |
+| `firewall.@defaults[0].flow_offloading_hw` | `0` | `0` ✅ |
+| `/etc/mt5700/flow-offload` | `MODE=on` | `MODE=on` ✅ |
+| nft 里的 flowtable | 存在且 devices 含 `eth2` | **`flowtable ft { devices = { br-lan, eth1, eth2 } }`** ✅ |
+| TTL 归一 chain | 已挂 `postrouting` | `mangle_ttl_unify`（hook postrouting/300，规则齐全）✅ |
+| `mt5700-rps` | 无线避开硬中断核、其它全核 | `phy0.1-ap0=0xe`、其余 7 个 `0xf`、XPS 64 个 `0xf` ✅ |
+| `mt5700-smp` | 中断分摊 | `3 个已分摊到 4 核；1 个不可迁移（驱动限制）` ✅ |
+| sysctl | BBR / fq / budget | `bbr`、`fq`、`netdev_budget=600`、`netdev_budget_usecs=20000` ✅ |
+
+⇒ **默认开启的决定在真机固件层面完整落地，且 TTL 规则、offload 两者共存不冲突**
+（TTL chain 与 flowtable 是两个独立 base chain，前者在 `postrouting`、后者在 `ingress`）。
+
+⚠️ 顺带更正一条探测口径：**`flow_offloading` 在本版 OpenWrt 里只有
+`firewall.@defaults[0].flow_offloading` 这一处**，不再是 `network.@device[0]` ——
+后者取值恒为空，据此判断会误以为「配置没写进去」。本仓脚本本来只写 `firewall` 段（C15 覆盖），
+但手工验收时别再查 `network` 段。
+
+📌 仍未竟事项：flow offload 的 **CPU 收益量化**依旧没有可信数据（三重环境障碍见
+`.workbuddy/` 现场记录：开发机双网卡分流、外网源限流、5G 链路测试期间多次重拨）。
+本次验收只证明「落地正确、不阻断连接」，不构成性能量化。
+
 ### 六、新增守卫 C15
 
 默认值在两个月内被反转过**两次**（09-21 开 → 09-22 关 → 10-05 又开），每次都只改了几处、

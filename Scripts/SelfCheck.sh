@@ -702,6 +702,47 @@ fi
 
 [ "$FAIL" -eq "$N" ] && pass "全仓无 init.d/firewall4 调用"
 
+# ---------- C17：TTL 归一链的结构不能被改坏 ----------
+# 2026-10-06 刷机验收实测：`mangle_ttl_unify`（hook postrouting/300）与
+# `flowtable ft`（hook ingress）是**两个各自独立的 base chain**，同时存在、互不干扰。
+# 这正是「offload 默认开」能安全落地的结构前提：TTL 规则失效只是"快转包绕过它"，
+# 不是"两个 hook 打架"。
+#
+# 本门钉住三处一旦改坏就会静默失效的地方：
+#   ① 必须声明为 chain（自带 hook）。若被改成普通 chain 再靠别处 jump 过来，
+#      语义会变，且 `nft list ruleset | grep ttl` 仍能搜到 → 肉眼查不出来。
+#   ② 必须自己带 hook postrouting。挂在 forward 上取不到真实出接口 oifname。
+#   ③ 必须用 $wan_devices 而不是写死接口名（写死 "wan" 在本机一条都匹配不上）。
+echo "-- C17 TTL 归一链是独立的 postrouting base chain"
+N=$FAIL
+
+TTL_NFT="Files/etc/nftables.d/12-mangle-ttl-128.nft"
+if [ -f "$TTL_NFT" ]; then
+	grep -q '^chain mangle_ttl_unify {' "$TTL_NFT" \
+		|| fail "C17 $TTL_NFT 里没有顶格声明 \`chain mangle_ttl_unify {\`。fw4 的 nftables.d 片段在 inet fw4 表内被 include，此处必须自成一个带 hook 的 base chain（实测正确形态：\`chain mangle_ttl_unify { type filter hook postrouting priority 300; ... }\`）。若改成普通 chain 靠别处 jump，规则会静默不生效，而 grep 仍搜得到"
+	grep -q 'hook postrouting priority 300' "$TTL_NFT" \
+		|| fail "C17 $TTL_NFT 的 chain 声明里没有 \`hook postrouting priority 300\`。必须在 postrouting（路由决策之后）才能拿到真实出接口 oifname，且 priority 300 要大于 fw4 srcnat 的 100 以保证 SNAT 之后再改 TTL"
+	grep -q 'oifname \$wan_devices' "$TTL_NFT" \
+		|| fail "C17 $TTL_NFT 的规则没有用 \$wan_devices。写死 oifname \"wan\"/\"pppoe-wan\" 是 x86 软路由的习惯命名，在本机（H5000M）一条都匹配不上、规则静默失效；本机实测 wan_devices = { \"eth1\", \"eth2\" }（eth1=有线WAN，eth2=5G模组）"
+	# ★ 上一条只是「至少有一处用了变量」，对本文件有两处规则（ip ttl / ip6 hoplimit）
+	#   的结构**不设防** —— 只把其中一处换成写死的 oifname，grep 仍能命中剩余那处，
+	#   守卫就静默放过了（2026-10-06 反向验证实测判红 4/5，漏的就是这一条）。
+	#   所以补一条**定位断言**：禁止出现任何带引号的字面 oifname。
+	#   ⚠️ 必须先剥掉注释行再判 —— 本文件注释里正解释着「原方案写死 oifname "wan" /
+	#   "pppoe-wan" 是 x86 习惯命名」，直接 grep 会把这段说明当成违规
+	#   （2026-10-06 首次跑就误报，还原后仍判红）。
+	# 同理 chain 名也不能只按「有 chain 声明」判，必须顶格且与本链同名。
+	LITERAL_OIF=$(grep -v '^[[:space:]]*#' "$TTL_NFT" | grep -n 'oifname "' || true)
+	if [ -n "$LITERAL_OIF" ]; then
+		echo "$LITERAL_OIF"
+		fail "C17 $TTL_NFT 的规则代码里出现了写死的 \`oifname \"...\"\`（已排除注释行）。本文件所有出方向匹配必须用 \$wan_devices（本机实测 = { \"eth1\", \"eth2\" }）。写死 \"wan\"/\"pppoe-wan\" 是 x86 软路由的习惯命名，在本机一条都匹配不上 ⇒ 规则静默失效，而 grep wan_devices 仍会命中本文件里的另一处规则，所以不能只靠「有没有用变量」来判"
+	fi
+else
+	fail "C17 缺少 $TTL_NFT（TTL 归一规则被删了）。该规则即便在 offload 开启时不处理快转包，也仍是 offload 关闭时的功能项，不应消失"
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "TTL 归一链是独立的 postrouting base chain 且用 \$wan_devices"
+
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then
 	echo "::error::静态自检未通过，请修正后再编译"
