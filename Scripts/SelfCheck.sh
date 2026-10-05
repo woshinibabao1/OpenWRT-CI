@@ -669,6 +669,39 @@ fi
 
 [ "$FAIL" -eq "$N" ] && pass "flow offload 四处默认值都是 on，auto 分支无 TTL 阻断且保留 SQM 互斥"
 
+# ---------- C16：全仓禁止 init.d/firewall4（真机上不存在，且错误被重定向吞掉）----------
+# 这条守卫来自 2026-10-05 一次真实的、连续多轮数据作废的排查。
+#
+# 【坑】本机（ImmortalWrt SNAPSHOT / nft 体系）的防火墙服务是
+#       /etc/init.d/firewall，**不是** /etc/init.d/firewall4。
+#       用错名字时 shell 报 `not found`，而 `cmd >/dev/null 2>&1` 会把这个错吃掉，
+#       于是「uci 写了 1 + reload 已执行」看起来都成立，实际 **nft 里一条 flowtable 规则都没有**。
+#       症状极具欺骗性：uci get 读回来确实是 1、fw4 print 也能生成 flowtable 片段，
+#       但设备上 `nft list table inet fw4 | grep -c flowtable` 恒为 0，
+#       conntrack 永远看不到 [OFFLOAD] 标记 —— 看起来像「卸载开了却不生效」。
+#       2026-10-05 换成 /etc/init.d/firewall 后，flowtable ft 立刻出现。
+#
+# 【本门范围】全仓扫描（含未来新增的脚本），但**排除本文件自身** ——
+#   本注释里就写着这个字符串，否则守卫会把自己判红。
+#   当前仓内**没有任何**脚本需要重载防火墙 —— 99-mt5700-net 只写 uci，
+#   且跑在 uci-defaults 阶段（彼时防火墙尚未启动，写完自然生效，无需 reload）。
+#   因此本门只做「禁止 firewall4」这一件事；将来若有人加了 reload 逻辑，
+#   必须同时补 flowtable 落地校验，理由见本注释。
+echo "-- C16 全仓禁止 init.d/firewall4（本机真机无此服务名）"
+N=$FAIL
+
+BAD_HITS=$(grep -rn 'init\.d/firewall4' \
+	--include='*.sh' --include='*.uc' --include='99-*' --include='*.yml' \
+	Files/ Scripts/ .github/ 2>/dev/null \
+	| grep -v '^\S*:[0-9]*: *#' \
+	| grep -v "^Scripts/SelfCheck\.sh:")
+if [ -n "$BAD_HITS" ]; then
+	echo "$BAD_HITS"
+	fail "C16 上列文件里调用了 /etc/init.d/firewall4。本机真机上该服务名不存在（实测 \`/etc/init.d/firewall4: not found\`），而重定向会把错误吞掉，导致 uci 写了 flow_offloading=1 却**一条 flowtable 规则都没生成**。正确服务名是 /etc/init.d/firewall（2026-10-05 实测：换对之后 nft 里立刻出现 flowtable ft）。若你确实要重载，还必须紧跟一次 \`nft list table inet fw4 | grep -c flowtable\` 校验——写完 uci 不等于生效"
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "全仓无 init.d/firewall4 调用"
+
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then
 	echo "::error::静态自检未通过，请修正后再编译"
