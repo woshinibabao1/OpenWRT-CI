@@ -27,14 +27,27 @@
 ## 300 大于 fw4 的 srcnat（nat 类型，priority 100），保证在 SNAT 之后再改 TTL，
 ## 不会干扰 nat 链里的接口判定。
 ##
+## ── ⚠️ 生效条件：只在 flow offload 关闭时有效（2026-10-05 定案）──────────
+## 本固件的 flow offload 编译期默认是 **MODE=on**（软件卸载），
+## 此时**本文件对已建立的连接完全不生效**，这是**有意接受的取舍，不是故障**：
+##   · 开卸载后 flow 走 nf_flow_table fastpath，**绕过整条 postrouting 链**，
+##     所以这里的 `ttl set 128` 一个包都处理不到（实测 postrouting 计数器 packets 0）；
+##   · 但包照发不误 —— flowtable 在 `neigh_xmit()` 前自行递减 TTL
+##     （内核文档原话：the TTL is decremented before calling neigh_xmit），
+##     所以**「本规则失效」≠「客户端断网」**。
+##
+## ★ 这里曾有一段注释声称「卸载一开就断网（HTTP 25s 超时）」，该结论**已于 2026-10-05 作废**：
+##   那次测试的流量根本没经过这台路由器 —— 开发机双网卡且有线优先
+##   （192.168.8.103 跃点 25 优先于 Wi-Fi 192.168.10.202 跃点 30），
+##   tracert 显示公网第一跳是另一台路由器的 192.168.8.1。
+##   绑定源地址重测：开卸载后 conntrack 带 [OFFLOAD]、44.15 MB / 39s 全部收完、不断网。
+##
+## 需要本规则真正生效（保留 TTL 归一）：把编译入口的 FLOW_OFFLOAD 选 **off**，
+## 或刷机后 `uci set firewall.@defaults[0].flow_offloading=0 && uci commit firewall
+## && /etc/init.d/firewall restart`。
+##
 ## ── 两条已实测确认的前提（2026-09-21 真机，H5000M / kernel 6.18.52）──────
-## 1. **必须关闭 flow offload，否则本规则完全不生效。**
-##    软件卸载把连接从 nftables 路径上摘走（与 UA2F 必须关卸载同理）。实测：
-##      · 卸载开：客户端 HTTP 25s 超时；conntrack 条目带 [OFFLOAD]；
-##        正向 10 包 / 951B，反向只回收 1 包 / 52B（仅 SYN-ACK）；
-##        postrouting 计数器 packets 0 —— 本规则一个包都没处理。
-##      · 卸载关：同一请求 HTTP 200 / 1.02s / 2381B，连接进出各 13 包、无 OFFLOAD 标记。
-##    故 CI 侧 flow-offload 默认值已由 auto 改为 off（见 Scripts/ApplyFlowOffload.sh）。
+## 1. 卸载关闭时本规则工作正常：出口抓包 TTL=128。
 ## 2. **5G 模组（eth2）不会把 TTL 改回去。** 模组自身确实再做一层 NAT
 ##    （eth2 = 100.76.8.240/8，CGNAT 段），但出口抓包实测为 TTL=128：
 ##      TTLFIN IN=br-lan OUT=eth2 SRC=100.76.8.240 DST=111.45.11.5 ... TTL=128

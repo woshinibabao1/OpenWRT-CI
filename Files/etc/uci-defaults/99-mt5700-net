@@ -10,33 +10,52 @@
 
 # ---------- 1. flow offload：编译期选型（/etc/mt5700/flow-offload）+ 运行期与 SQM 互斥 ----------
 # 选型来源：构建期由 Scripts/ApplyFlowOffload.sh 写入固件 files 覆盖层
-#   /etc/mt5700/flow-offload（一行 MODE=<auto|off|on|on-hw>。
-#   ★ 设计默认是 **off**，不是 auto（见本节末的解释与 WRT-CORE 的 `default: 'off'`）；
-#     下面第 40 行把 MODE 的**变量初值**设成 auto，只是「文件缺失时的兜底」，
+#   /etc/mt5700/flow-offload（一行 MODE=<auto|off|on|on-hw>）。
+#   ★ 设计默认是 **on**，不是 auto（见本节末的解释与 WRT-CORE 的 `default: 'on'`）；
+#     下面第 46 行把 MODE 的**变量初值**设成 auto，只是「文件缺失时的兜底」，
 #     两者不是一回事 —— 原注释写成「默认 auto」会让人以为默认值变了。）
 #   也可刷机后在「网络 → 防火墙 → 常规设置」或 uci 改 firewall.@defaults[0].flow_offloading。
-# 实测依据（2026-09-18 真机只读体检，固件 r0-3e24625 / kernel 6.18.44）：
-#   · /sys/kernel/debug/ppe0 与 ppe1 存在 → MediaTek PPE 硬件转发表在；
-#   · eth0 / eth1 的 `ethtool -k` 显示 hw-tc-offload: on → mtk_soc_eth 支持
-#     nf_flow_table 硬件卸载；
-#   · /lib/modules/<kver>/ 里没有 mtk_wed.ko → WiFi 侧硬件转发（WED）本基线缺失；
-#   · 上网出口是 eth2（5G 模组，USB CDC-NCM），PPE 只挂在 SoC 以太网口上，
-#     管不到 USB 口。
-# 结论（★ 2026-09-21 更正本段旧说法）：软件卸载（nf_flow_table 快转路径）对**所有**
-#       接口都有效，包括 USB 5G WAN，是本机型唯一确定拿得到的加速。
-#       **但默认值是 off，不是 auto** —— Files/etc/mt5700/flow-offload 写的是 MODE=off，
-#       Scripts/ApplyFlowOffload.sh 的兜底默认也是 off。因为本固件带 TTL 归一规则，而卸载
-#       会把连接从 nftables 路径上摘走，两者不可共存（真机实证：开着卸载时客户端 HTTP
-#       25 秒超时、conntrack 带 [OFFLOAD]、出口 TTL 不受规则控制；关掉后同一请求 HTTP 200
-#       / 1.0 秒）。即：下面 auto 分支里的 TTL 探测只在**显式**选择 auto 时才会走到。
-#       硬件卸载在这台机器上只可能命中「有线 LAN↔有线 LAN」这一类流量，
-#       命中率≈0，开了还会让 nft 计数器看不到流量（排障变难），故 on-hw 也仅在有线场景有意义。
-#       （MT7987 的 WED 经查属上游未完成：设备树有 wed 节点，但 modules.builtin 里没有
-#        mtk_wed、主线驱动无该 SoC 匹配、上游 linux-firmware 无 mt7987_wo.bin —— 见
-#        CLOSED_SOURCE_AUDIT.md。等上游补齐后再谈 on-hw。）
+#
+# ★★ 2026-10-05 默认值由 off 改为 on。原先的「必须关」依据已被实测证伪，
+#    原依据（记录在此以免重犯）声称：
+#      「卸载开 → 客户端 HTTP 25s 超时、conntrack 带 [OFFLOAD]、正向 10 包只回收 1 包；
+#        卸载关 → 同一请求 HTTP 200 / 1.0s」
+#    **那次测试的流量根本没经过这台路由器** —— 开发机双网卡且有线优先：
+#      有线 192.168.8.103 跃点 25 / Wi-Fi 192.168.10.202 跃点 30，
+#      tracert 显示公网第一跳是 192.168.8.1（另一台路由器）。
+#    改用「绑定源地址 192.168.10.202 + 查 conntrack 的 [OFFLOAD] 标记」重测后结论相反：
+#      关：  OFFLOAD 标记 0
+#      开：  OFFLOAD 标记 42，3 条长连接全程正常，44.15 MB / 39s 全部收完，无超时无丢包
+#    ⇒ 软件卸载在本机**确定生效且不断网**。
+#
+# 本机硬件加速能力（2026-10-05 三段式取证结论，勿凭旧印象推翻）：
+#   · 软件卸载（SFO / nf_flow_table）：**可用，已实测生效**。对所有接口有效，
+#     包括 USB 5G WAN，是本机型唯一确定拿得到的加速。
+#   · 硬件卸载（HFO）：**内核能力在，但本机拓扑命中不了**。
+#     PPE 引擎已 attach（dmesg: `eth0/eth1: mediatek frame engine at 0xffffffc081880000, irq 67`），
+#     但 `mtk_ppe_offload.c` 的 `mtk_flow_set_output_device()` 只接受
+#     mtk_soc_eth 自己的 netdev[0..2]（映射到 PSE_GDM1/2/3_PORT），
+#     其它设备一律 `return -EOPNOTSUPP`，**无 fallback**。
+#     而实际出口是 eth2 = 5G 模组（USB CDC-NCM）⇒ 每条 flow 都会被拒。
+#   · 硬件卸载的**真实判据不能看 UCI、也不能看 fw4 的告警**：
+#     fw4 的 `nft_try_hw_offload()` 只用 `nft -c` 做**语法检查**，
+#     而 `flags offload` 在本机（无 PPE）同样 rc=0 ⇒ 恒为假阳性。
+#     真在用只能看三条同时成立：ppe0/entries 计数涨 + ppe0/bind 非空 + CPU 下降。
+#   · WED（WiFi 侧硬件转发）：胶水层完整（30 个 mtk_wed_* 符号），
+#     但缺固件 blob（官方源只有 mt7981/7986/7988-wo-firmware，无 mt7987）⇒ 开不了。
+#
+# ⇒ on-hw 在本机**与 on 实际效果相同**（多写一个 flags offload 而已），
+#   保留该选项仅为将来硬件拓扑变化（WAN 改走有线 eth1）时可用，默认不选。
+#
+# ★ TTL 归一规则的取舍（2026-10-05 定案，以性能/稳定性优先）：
+#   /etc/nftables.d/12-mangle-ttl-128.nft 在 postrouting priority 300 改 TTL。
+#   开卸载后已建立的 flow 走 fastpath **绕过整条 postrouting**，该规则对快转包零命中
+#   （内核文档：flowtable 在 neigh_xmit() 前自行递减 TTL，包照发不误）。
+#   即：规则失效是真的，但**不会因此断网**。按「唯一重性能、稳定性」的口径，
+#   接受该失效；仍想保留 TTL 归一就把 MODE 设成 off。
 #
 # 与 SQM/CAKE 互斥：被卸载的连接完全绕过 qdisc，CAKE/HTB 一律失效。
-#   故 auto 模式下先查 SQM：已启用就保持 offload 关闭（保住整形），两者只能二选一；
+#   这是**真互斥**（与 TTL 不同），故 auto 模式下仍必须查 SQM：已启用就保持 offload 关闭；
 #   on/on-hw 模式用户显式要卸载，则按显式值执行，但 SQM 启用时记一条警告（SQM 会失效）。
 #
 # 回滚：网络 → 防火墙 → 常规设置，取消「Flow Offloading」；或
@@ -65,23 +84,22 @@ flow_offloading=0
 flow_offloading_hw=0
 case "$MODE" in
 	auto)
-		# ★ TTL 统一规则优先判定：offload 会把连接从 nftables 路径上摘走，
-		#   TTL 规则（postrouting）对快转包完全不执行 —— 真机实证见下方注释。
-		#   即使 SQM 未启用，只要固件带了 TTL 规则就必须关卸载，否则规则形同虚设。
-		TTL_RULE=0
-		for F in /etc/nftables.d/*.nft; do
-			[ -f "$F" ] || continue
-			if grep -q 'ip ttl set' "$F" 2>/dev/null; then TTL_RULE=1; break; fi
-		done
-		if [ "$TTL_RULE" -eq 1 ]; then
+		# ★★ 2026-10-05：这里原先有一段「检测到 TTL 统一规则就关卸载」的阻断，
+		#   连同上面第 90 行的 TTL_RULE 探测循环**已整段删除**。理由：
+		#   那条阻断的依据（卸载开会断网）已于同日被真机 A/B 证伪 —— 原测试的流量
+		#   根本没经过本机（开发机双网卡，有线 192.168.8.103 跃点 25 优先于
+		#   Wi-Fi 192.168.10.202 跃点 30，tracert 第一跳是另一台路由器的 192.168.8.1）。
+		#   绑定源地址重测：开卸载 → conntrack 带 [OFFLOAD]、44MB/39s 全程正常、不断网。
+		#   TTL 规则失效是真的（快转包绕过 postrouting），但**不导致断网**。
+		#   保留探测反而有害：它会让 auto 永远退化成 off，等于默认值改了也不生效。
+		#
+		#   仅保留 SQM 互斥 —— 那是**真互斥**（被卸载的连接完全绕过 qdisc）。
+		if [ "$SQM_ON" -eq 1 ]; then
 			flow_offloading=0; flow_offloading_hw=0
-			logger -t mt5700-net "检测到 TTL 统一规则，保持 flow offload 关闭（offload 绕过 nftables，TTL 改不到）"
-		elif [ "$SQM_ON" -eq 1 ]; then
-			flow_offloading=0; flow_offloading_hw=0
-			logger -t mt5700-net "SQM 已启用，保持 flow offload 关闭（二者互斥：offload 绕过 qdisc）"
+			logger -t mt5700-net "SQM 已启用，保持 flow offload 关闭（二者真互斥：offload 绕过 qdisc）"
 		else
 			flow_offloading=1; flow_offloading_hw=0
-			logger -t mt5700-net "已开启软件 flow offload（auto 且 SQM/TTL 规则均未启用，无冲突）；硬件卸载留待 mtk_wed 就位"
+			logger -t mt5700-net "已开启软件 flow offload（auto 且 SQM 未启用）；TTL 归一规则对快转包失效但不影响连通性"
 		fi
 		;;
 	off)
@@ -92,12 +110,19 @@ case "$MODE" in
 		if [ "$SQM_ON" -eq 1 ]; then
 			logger -t mt5700-net "警告：MODE=on 但 SQM 已启用，offload 会绕过 qdisc 使 SQM 失效"
 		fi
+		logger -t mt5700-net "已开启软件 flow offload（MODE=on）。WAN 出口 TTL 归一规则对已建立的快转包不再生效——这是取舍，不是故障（不影响连通性）"
 		;;
 	on-hw)
 		flow_offloading=1; flow_offloading_hw=1
 		if [ "$SQM_ON" -eq 1 ]; then
 			logger -t mt5700-net "警告：MODE=on-hw 但 SQM 已启用，offload 会绕过 qdisc 使 SQM 失效"
 		fi
+		# ★ 别被 fw4 静默通过骗了：本机 PPE 引擎虽已 attach，但
+		#   mtk_ppe_offload.c 的 mtk_flow_set_output_device() 只接受 mtk_soc_eth 自己的
+		#   netdev[0..2]，实际出口 eth2 是 USB CDC-NCM ⇒ 每条 flow 都会 EOPNOTSUPP。
+		#   且 fw4 的能力探测只做 `nft -c` 语法检查（无 PPE 时 flags offload 同样 rc=0），
+		#   恒为假阳性 ⇒ 不会报 falling back。判真在用只能看 ppe0/entries 与 ppe0/bind。
+		logger -t mt5700-net "已开启软件+硬件 flow offload（MODE=on-hw）。注意：本机 5G 出口是 USB CDC-NCM，PPE 只接 SoC 以太网口，硬件卸载实际不会命中；判真在用请看 /sys/kernel/debug/ppe0/entries 与 bind"
 		;;
 esac
 uci -q set firewall.@defaults[0].flow_offloading="$flow_offloading"

@@ -24,8 +24,8 @@ on:
         required: false
         type: string
       FLOW_OFFLOAD:
-        description: 'Flow Offload 选型（默认 off；workflow_run 触发时取空，走默认 off）'
-        default: 'off'
+        description: 'Flow Offload 选型（默认 on：软件卸载已实测生效且不断网；workflow_run 触发时取空，走默认 on）'
+        default: 'on'
         required: false
         type: choice
         # ★ 2026-09-28 修复：options 里的 off / on 必须**加引号**。

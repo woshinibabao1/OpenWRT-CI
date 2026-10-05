@@ -75,8 +75,8 @@ OpenWRT-CI/
 │   │   ├── init.d/mt5700-smp            # 硬中断亲和（能搬的按负载分到四核）
 │   │   ├── init.d/apk-index-cache       # apk 索引缓存持久化（软件页重启后不必手动 Update lists）
 │   │   ├── hotplug.d/net/30-mt5700-rps  # 后出现的接口补设 RPS/中断亲和（无线 + USB 网卡重枚举）
-│   │   ├── nftables.d/12-mangle-ttl-128.nft  # WAN 出包 TTL/hoplimit 统一为 128
-│   │   ├── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw，默认 off）
+│   │   ├── nftables.d/12-mangle-ttl-128.nft  # WAN 出包 TTL/hoplimit 统一为 128（卸载开启时对快转包失效，见下）
+│   │   ├── mt5700/flow-offload          # flow offload 编译期选型（MODE=auto|off|on|on-hw，默认 on）
 │   │   └── rc.local                     # ★ 停用内核温控，让 h5000m-fancontrol 独占风扇 pwm1（见第三节）
 ├── Scripts/                  # 编译前自定义脚本
 │   ├── Packages.sh           # 拉取第三方插件与主题（含 MT 模式条件克隆/折叠）
@@ -143,10 +143,12 @@ OpenWRT-CI/
 > （能影响 `mac80211.uc` 的输出），而频宽改动触及 DFS，必须在真机带自动回滚验证后再合。
 
 > **Flow Offload 说明**（本固件最易被误解的开关，与 SQM/CAKE 互斥）：
-> 1. 四个取值通过 `WRT-BUILD` 手动页的 `FLOW_OFFLOAD` 选择（`auto` / `off` / `on` / `on-hw`），**默认 `off`**；定时自动编译（`H5000M-MT-AUTO`）同样取 `off`。
-> 2. `auto` 模式先查 SQM 是否启用：启用则关；未启用则**再查固件是否带 TTL 统一规则**（`/etc/nftables.d/*.nft` 含 `ip ttl set`）—— 带就一律关。本固件自带该规则，所以 **`auto` 在这台机器上等价于 `off`**。
-> 3. 为什么默认宁可不开：offload 把连接从 nftables 路径上摘走，TTL 规则对快转包零命中，运营商按「多设备共享」丢弃客户端 TCP 包。真机实测（kernel 6.18.52）：卸载开 → 客户端 HTTP 25s 超时、conntrack 带 `[OFFLOAD]`；卸载关 → 同一请求 HTTP 200 / 1.0s，出口抓到 TTL=128。
-> 4. `on-hw`（硬件卸载）在本机命中率≈0：本基线无 `mtk_wed`（WiFi 侧硬件转发缺失），且 5G WAN 是 USB CDC-NCM（PPE 管不到 USB 口），开了只会让 nft 计数器看不到流量。
+> 1. 四个取值通过 `WRT-BUILD` 手动页的 `FLOW_OFFLOAD` 选择（`auto` / `off` / `on` / `on-hw`），**默认 `on`**；定时自动编译（`H5000M-MT-AUTO`）同样取 `on`。
+> 2. **为什么默认开**（2026-10-05 真机 A/B 实测，H5000M / kernel 6.18.52）：开启后 conntrack 条目带 `[OFFLOAD]` 标记（关时为 0），3 条长连接全程正常，**44.15 MB / 39s 全部收完，无超时无丢包**。这是本机型**唯一确定拿得到**的加速 —— 软件卸载对所有接口生效，包括 USB 5G WAN。
+> 3. **代价**：WAN 出口的 TTL 归一规则（`12-mangle-ttl-128.nft`）对已建立的快转包不再生效（快转路径绕过整条 postrouting）。**这是取舍不是故障** —— flowtable 在 `neigh_xmit()` 前自行递减 TTL，包照发不误。需要保留 TTL 归一就把 `FLOW_OFFLOAD` 选 `off`。
+> 4. ⚠️ **本文件此前写的「默认 off」及其实证依据均已作废。** 原依据声称「卸载开 → 客户端 HTTP 25s 超时、正向 10 包只回收 1 包」，但**那次测试的流量根本没经过这台路由器**：开发机双网卡且有线优先（`192.168.8.103` 跃点 25 优先于 Wi-Fi `192.168.10.202` 跃点 30），`tracert` 显示公网第一跳是另一台路由器的 `192.168.8.1`。绑定源地址重测后结论完全相反。
+> 5. `on-hw`（硬件卸载）默认**不选**，且在本机**不会命中**：PPE 引擎其实已 attach（`dmesg` 有 `mediatek frame engine at 0xffffffc081880000, irq 67`），但 `mtk_ppe_offload.c` 的 `mtk_flow_set_output_device()` 只接受 `mtk_soc_eth` 自己的 `netdev[0..2]`，其它设备一律 `return -EOPNOTSUPP` 且无 fallback —— 而 5G WAN 是 `eth2`（USB CDC-NCM）。
+> 6. ⚠️ **别被 fw4 的静默通过骗了**：它的能力探测 `nft_try_hw_offload()` 只做 `nft -c` 纯语法检查，而本机（无 PPE 时）`flags offload` 同样 `rc=0` ⇒ 恒为假阳性，**不会**报 `falling back`。判硬件卸载真在用只能看三条同时成立：`/sys/kernel/debug/ppe0/entries` 计数涨 + `ppe0/bind` 非空 + CPU 下降。若将来 WAN 改走有线 `eth1`（现配置里有但未插线），`on-hw` 才有意义。
 
 <br>
 
@@ -370,22 +372,24 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 
 ### 4.4 设备侧（不属于本仓库，但会影响"稳不稳"的观感）
 
-1. **DNS 上游链路**：真机是 `客户端 → dnsmasq(53) → AdGuardHome(127.0.0.1#53335) → 上游`，
-   而 AdGuardHome 日志里 `119.29.29.29:53 over udp ... i/o timeout` **每次超时 20 秒**。
-   缓存命中的域名没事（`min_cache_ttl=3600` + `use_stale_cache=3600` 正好掩盖了它），
-   但**新域名的首次解析会卡很久**，观感就是"有些网站打不开/很慢"。
-   建议（属 AdGuardHome 自己的配置，不在本仓）：上游换成 `223.5.5.5` 或 DoH/DoT、
-   给多个上游并缩短超时；或让 dnsmasq 直连运营商 DNS。
-   ★ 顺带结论：本仓把 `min_cache_ttl` 设成 3600 是**有意为之且现在看是对的** —— 它掩盖了上游抖动；
-   代价是域名变更/运营商跳转页会滞后（v024 用 60，那是拿抖动换新鲜度，两者取舍不同）。
+1. ~~**DNS 上游链路曾被 AdGuardHome 拖慢**~~ **【已解决 · 2026-10-05 实测】**
+   早期真机链路是 `客户端 → dnsmasq(53) → AdGuardHome(127.0.0.1#53335) → 上游`，
+   AdGuardHome 对上游 `119.29.29.29:53` **每次超时 20 秒**，新域名首次解析会卡很久。
+   **现状：AdGuardHome 与 oxidns 均已从设备移除**（无进程、无二进制、`5335` 未监听），
+   现在是 **dnsmasq 直接管 53**。实测新域名解析耗时 **0.04 秒**，`network.wwan` 残留也已清掉。
+   ★ 本仓把 `min_cache_ttl` 设成 3600 的初衷（掩盖上游抖动）**已不再需要**，
+   但它仍保留：代价只是"域名变更/运营商跳转页滞后最多 1 小时"，
+   而收益是**上游一旦再抖动就有兜底**。属有意取舍，不建议为了"新鲜度"改回 60。
 2. **LAN IPv6 一直在"自我撤销"**：`odhcpd: No default route present, setting ra_lifetime to 0!`
    每几分钟一条 —— 因为 5G 出口没有 IPv6 默认路由（`ip -6 route show default` 为空），
    odhcpd 只能把 RA 的默认路由寿命归零，客户端侧 IPv6 因此反复失效。
    两条路选一条（**属功能取舍，本仓不擅自改**）：
    - 不用 IPv6 → `uci set dhcp.lan.ra='disabled'; uci set dhcp.lan.ndp='disabled'; uci delete network.lan.ip6assign; uci commit`，抖动消失；
    - 要用 IPv6 → 保持现状，或用 `ra_default='1'`（**不推荐**：那会让客户端把 IPv6 流量丢给一个没有 IPv6 出口的路由器）。
-3. **`network.wwan` 是个没有 device 的 dhcp 接口**（`uci show network.wwan`），疑似厂家固件残留；
-   它不会导致掉线，但每次 reload 都会被尝试。确认不用可 `uci delete network.wwan && uci commit network`。
+3. ~~**`network.wwan` 是个没有 device 的 dhcp 接口**~~ **【已清理 · 2026-10-05 实测】**
+   它是厂家固件残留（无 device 的 dhcp 接口），每次 reload 都会被尝试。
+   **现已删除**：真机 `uci show network.wwan` 返回 `Entry not found`。
+   新增机器若又出现（换固件后），`uci delete network.wwan && uci commit network` 即可。
 
 <br>
 

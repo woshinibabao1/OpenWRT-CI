@@ -1,5 +1,86 @@
 # 更新日志
 
+## [2026-10-05] flow offload 默认值改回「开」——原先「必须关」的实测依据已被证伪
+
+### 一、结论
+
+| 项 | 改前 | 改后 |
+| :-- | :-- | :-- |
+| `Files/etc/mt5700/flow-offload` | `MODE=off` | **`MODE=on`** |
+| `Scripts/ApplyFlowOffload.sh` 兜底 | `${WRT_FLOW_OFFLOAD:-off}` | **`:-on`** |
+| `WRT-CORE.yml` / `WRT-BUILD.yml` / `H5000M-MT-AUTO.yml` 的 `FLOW_OFFLOAD` | `default: 'off'` | **`default: 'on'`** |
+| `flow_offloading_hw`（硬件卸载） | 关 | **仍关**（理由已更新，见下） |
+| `99-mt5700-net` 的 `auto` 分支 | 遇 TTL 规则即强制关 | **删掉该阻断**，只留 SQM 互斥 |
+
+### 二、为什么改：原依据的实测流量根本没经过这台路由器
+
+原注释（2026-09-21 真机实证）称：「卸载开 → 客户端 HTTP 25 秒超时、conntrack 条目带 `[OFFLOAD]`、
+正向 10 包只回收 1 包（仅 SYN-ACK）；卸载关 → 同一请求 HTTP 200 / 1.0 秒」，据此定默认 `off`。
+
+**那次测试的公网流量走的是另一台路由器。** 开发机双网卡且有线优先：
+
+```
+有线 192.168.8.103  跃点 25   ← 实际出口
+Wi-Fi 192.168.10.202 跃点 30  ← 被跳过的正是本机
+tracert 公网第一跳 = 192.168.8.1（不是 192.168.10.1）
+```
+
+### 三、2026-10-05 真机 A/B 重测（H5000M / kernel 6.18.52）
+
+判据换成两个可靠信号：**绑定源地址 `192.168.10.202` 强制走 Wi-Fi** + **查 conntrack 的 `[OFFLOAD]` 标记**。
+
+| 档位 | `_offloading(_hw)` | flowtable devices | OFFLOAD 标记 | 大流量传输 |
+| :-- | :-- | :-- | :-- | :-- |
+| 关 | 0 / 0 | —— | **0** | ——（基线） |
+| 软件开 | 1 / 0 | `{ br-lan, eth1, eth2 }` | **42** | **44.15 MB / 39s 全成功** |
+| 硬件也开 | 1 / 1 | `{ eth0, eth1, eth2, phy0.1-ap0 }` | **42** | **44.15 MB / 39s 全成功** |
+
+3 条长连接全程正常收发，无超时、无丢包。⇒ **软件卸载确定生效且不断网。**
+
+### 四、TTL 规则失效 ≠ 断网（原论证的因果链后半段是错的）
+
+TTL 归一规则（`postrouting` priority 300）在卸载后对快转包零命中 —— 这部分是真的。
+但 **flowtable 在 `neigh_xmit()` 前自行递减 TTL**（内核文档：*the TTL is decremented before
+calling neigh_xmit()*），包照发不误。原论证从「规则失效」跳到「运营商丢弃 → 断网」，
+这一步没有任何依据支撑。按「唯一重性能、稳定性」的口径接受该失效；
+需保留 TTL 归一时把 `FLOW_OFFLOAD` 选 `off`。
+
+### 五、硬件卸载仍关，但理由换了（原理由「缺驱动」是错的）
+
+PPE 引擎**已 attach**：`dmesg` 有 `eth0/eth1: mediatek frame engine at 0xffffffc081880000, irq 67`
+（两个 2.5G MAC 共用一个 FE + IRQ 67）。真正的卡点是**拓扑** ——
+`mtk_ppe_offload.c` 的 `mtk_flow_set_output_device()` 只接受 `mtk_soc_eth` 自己的 `netdev[0..2]`
+（映射 `PSE_GDM1/2/3_PORT`），其它设备一律 `return -EOPNOTSUPP` 且无 fallback；
+而 5G WAN 是 `eth2`（USB CDC-NCM）⇒ 每条 flow 都被拒。
+
+⚠️ **判硬件卸载真在用不能看 UCI、也不能看 fw4 的告警**：`nft_try_hw_offload()` 只做 `nft -c`
+纯语法检查，而本机（无 PPE 时）`flags offload` 同样 `rc=0` ⇒ **恒为假阳性**，不会报
+`falling back`。只能看三条同时成立：`ppe0/entries` 计数涨 + `ppe0/bind` 非空 + CPU 下降。
+若将来 WAN 改走有线 `eth1`（现配置里有但未插线），`on-hw` 才有意义。
+
+### 六、新增守卫 C15
+
+默认值在两个月内被反转过**两次**（09-21 开 → 09-22 关 → 10-05 又开），每次都只改了几处、
+其余靠注释互相"提醒"。C15 钉住：四处默认取值必须都是 `on`；`auto` 分支不得再出现
+`TTL_RULE` 判定；但 SQM 互斥（真互斥：被卸载的连接完全绕过 qdisc）必须保留。
+已做反向验证 —— 7 条变异全部判红，基线与复原均绿。
+
+### 七、顺带更正三处前版错误
+
+1. WED attach 失败的真因是**固件 blob 缺失**（官方源只有 `mt7981/7986/7988-wo-firmware`，无 `mt7987`），
+   **不是「与 PPE 捆绑」**。WED 胶水层其实完整（30 个 `mtk_wed_*` 符号，含 `mtk_wed_ppe_check`）。
+2. 主线 `mtk_eth_soc.c` 的 PPE 初始化是**内联**的（`mtk_ppe_init(eth, eth->base + reg_map->ppe_base, ...)`），
+   **不存在**「补一个 `hnat@15000000` DT 节点就能启用」的说法。
+3. `nft -c` 对 `{eth0,eth1}+flags offload`、`{eth0,eth1}`、`{eth2}(USB)+flags offload` 三组**全 rc=0**
+   ⇒ 再次确认它不检查设备是否支持硬件卸载。
+
+### 八、这次踩的坑（方法论）
+
+★★ **验证路由器行为前，必须先证明流量真的经过了它。** `tracert` 看第一跳、`conntrack` 看
+有没有对应条目、绑定源地址强制路径 —— 三样都做，才拿得出可信的 A/B。
+本项目因缺这一步，把「我没在正确的路径上测到」写成了「卸载会导致断网」，
+并据此做了两次默认值反转，误导了整整两个月。
+
 ### 五、同日第二次修正（静态审计复核后落地，都是"每次刷机都会重跑 uci-defaults"这一条根因引出的）
 
 | 问题 | 修法 |

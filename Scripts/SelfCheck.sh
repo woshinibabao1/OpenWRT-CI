@@ -23,6 +23,7 @@
 #   C12 二进制覆盖层行尾保护（*.bin binary）+ 若固化无线校准则校验其格式
 #   C13 Wi-Fi MAC 唯一化守卫（CID 派生 / 不覆盖用户值 / 不重建无线配置）
 #   C14 uci-defaults 幂等性守卫（保留配置升级会重放它们 → 会覆盖用户设置的键必须有标记）
+#   C15 flow offload 默认值四处一致且为 on（该默认值两个月内反转过两次，auto 不得有 TTL 阻断）
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -608,6 +609,65 @@ for pair in "Files/etc/uci-defaults/99-mt5700-net:wireless.radio1.channel" \
 		|| fail "C14 $C14_F 会写 $C14_KEY，但缺少「只在标记不存在时才应用」的守卫：保留配置升级后本脚本会重跑，用户手改的值会被抹回产品默认（标记路径形如 /etc/config/h5000m-defaults-*.applied；标记放 /etc/config/ 下才能跨升级存活，见 keep.d/base-files）"
 done
 [ "$FAIL" -eq "$N" ] && pass "两处会覆盖用户设置的 uci-defaults 都带上了「只应用一次」标记守卫"
+
+# ---------- C15：flow offload 默认值四处一致，且默认是 on ----------
+# 这条守卫存在的原因：flow offload 的默认值在两个月内被反转过**两次**
+#   （2026-09-21 开 → 2026-09-22 关 → 2026-10-05 又开），
+# 而每次反转都只改了其中几处、其余靠注释互相"提醒"，必然留下不一致。
+# 更糟的是：两次反转的依据都不可靠 —— 支撑「卸载开就断网」的实测，
+# 流量根本没经过这台路由器（开发机双网卡，有线 192.168.8.103 跃点 25 优先于
+# Wi-Fi 192.168.10.202 跃点 30，tracert 第一跳是另一台路由器的 192.168.8.1）。
+# 2026-10-05 绑定源地址重测：开 → conntrack 带 [OFFLOAD]、44.15 MB/39s 全成功、不断网。
+#
+# 本门钉两件事：
+#   ① 四处默认取值必须都是 on（改一处漏三处 = 用户拿到不自洽的固件）：
+#      Files/etc/mt5700/flow-offload            → MODE=on
+#      Scripts/ApplyFlowOffload.sh              → WRT_FLOW_OFFLOAD:-on
+#      WRT-BUILD.yml / H5000M-MT-AUTO.yml / WRT-CORE.yml 的 FLOW_OFFLOAD → 'on'
+#   ② 99-mt5700-net 的 auto 分支**不得**再出现"检测到 TTL 规则就强制关卸载"的阻断 ——
+#      留着它会让 auto 永远退化成 off，等于默认值改了也不生效。
+#      SQM 互斥判定必须保留（那是真互斥：被卸载的连接完全绕过 qdisc）。
+echo "-- C15 flow offload 默认值一致且为 on"
+N=$FAIL
+
+# ① 四处默认值。判据用"实际取值那行"而不是全文搜 on/off —— 注释里满是
+#    auto|off|on|on-hw 的枚举与历史结论，搜关键词必然误判。
+for f in Files/etc/mt5700/flow-offload Scripts/ApplyFlowOffload.sh; do
+	[ -f "$f" ] || fail "C15 缺少 $f（flow offload 默认值的来源之一）"
+done
+if [ -f Files/etc/mt5700/flow-offload ]; then
+	grep -qx 'MODE=on' Files/etc/mt5700/flow-offload \
+		|| fail "C15 Files/etc/mt5700/flow-offload 的默认值不是 MODE=on。2026-10-05 真机 A/B 实测：开启后 conntrack 带 [OFFLOAD]、44.15 MB/39s 全程正常、不断网（原先「默认 off」所依据的「HTTP 25s 超时」实测，流量根本没经过本机——开发机双网卡且有线优先，tracert 第一跳是另一台路由器的 192.168.8.1）。确需关闭请在编译入口选 FLOW_OFFLOAD=off 并在 PR 里说明"
+fi
+if [ -f Scripts/ApplyFlowOffload.sh ]; then
+	grep -q 'WRT_FLOW_OFFLOAD:-on' Scripts/ApplyFlowOffload.sh \
+		|| fail "C15 Scripts/ApplyFlowOffload.sh 的兜底默认值不是 on（应与 flow-offload 文件一致，否则老调用方不传参时会写出与固件默认值相反的选型）"
+fi
+for wf in .github/workflows/WRT-CORE.yml .github/workflows/WRT-BUILD.yml .github/workflows/H5000M-MT-AUTO.yml; do
+	[ -f "$wf" ] || continue
+	# WRT-CORE 是被调用方（inputs 级 default），另两个是 workflow_dispatch 级
+	awk '/^ *WRT_FLOW_OFFLOAD:|^ *FLOW_OFFLOAD:/ {inblk=1; next}
+	     inblk && /default:/ { if ($0 !~ /'"'"'on'"'"'/) { print FILENAME": "FNR": "$0; bad=1 } inblk=0 }
+	     inblk && /^[A-Za-z_]/ && !/^ / { inblk=0 }
+	     END { exit bad ? 1 : 0 }' "$wf" \
+		|| fail "C15 $wf 里 FLOW_OFFLOAD 的 default 不是 'on'（四处必须一致，理由见本门注释）"
+done
+
+# ② auto 分支不得再有 TTL 阻断，但 SQM 互斥必须保留
+NET="Files/etc/uci-defaults/99-mt5700-net"
+if [ -f "$NET" ]; then
+	# 判据：TTL_RULE 这个变量名只允许出现在注释里，代码里出现即判红。
+	# ★ 必须先剥掉行首空白再判 `#` —— 本仓脚本大量用 tab 缩进，注释行是 "\t\t# ..."，
+	#   直接用 /^[^#]/ 会把注释误判成代码行（第一版就踩了，C15 首次跑即误报）。
+	awk '{ line = $0; sub(/^[ \t]+/, "", line) }
+	     line !~ /^#/ && line ~ /TTL_RULE/ { print FNR": "line; bad=1 }
+	     END { exit bad ? 1 : 0 }' "$NET" \
+		|| fail "C15 $NET 的 auto 分支里又出现了 TTL_RULE 判定（代码行）。该阻断会让 auto 永远退化成 off，等于默认值改了也不生效。2026-10-05 已确认：TTL 规则失效是真的（快转包绕过 postrouting），但不导致断网（flowtable 在 neigh_xmit() 前自行递减 TTL），故该阻断已删除"
+	grep -q 'SQM_ON' "$NET" \
+		|| fail "C15 $NET 里 SQM 互斥判定（SQM_ON）不见了。它必须保留：被卸载的连接完全绕过 qdisc，CAKE/HTB 一律失效——那才是真互斥"
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "flow offload 四处默认值都是 on，auto 分支无 TTL 阻断且保留 SQM 互斥"
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then

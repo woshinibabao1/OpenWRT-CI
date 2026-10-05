@@ -38,8 +38,8 @@ on:
         options:
           - MT5700
       FLOW_OFFLOAD:
-        description: 'Flow Offload 选型（默认 off：开卸载会让固件的 TTL 统一规则失效）'
-        default: 'off'
+        description: 'Flow Offload 选型（默认 on：软件卸载已实测生效且不断网；代价是 WAN 出口 TTL 归一规则对快转包失效）'
+        default: 'on'
         required: false
         type: choice
         # ★ 2026-09-28 修复：options 里的 off / on 必须**加引号**。

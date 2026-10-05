@@ -82,22 +82,28 @@ on:
         type: string
         default: ""
       # Flow Offload 选型（独立配置层，全机型复用）：
-      #   auto —— SQM 未启用时开软件卸载，启用时关（二者互斥）；
-      #           ★ 若固件带 TTL 统一规则（/etc/nftables.d/*.nft 含 ip ttl set）则一律关，
-      #             因为 offload 绕过 nftables 会让 TTL 规则完全失效
-      #   off  —— 始终关闭【默认】
-      #   on   —— 强制开软件卸载（SQM 启用时仍执行，但记一条警告：offload 会让 SQM 失效）
-      #   on-hw —— 强制开软件 + 硬件卸载
+      #   auto —— SQM 未启用时开软件卸载，启用时关（二者**真互斥**：被卸载的连接绕过 qdisc）
+      #   off  —— 始终关闭
+      #   on   —— 强制开软件卸载【默认】（SQM 启用时仍执行，但记一条警告：offload 会让 SQM 失效）
+      #   on-hw —— 强制开软件 + 硬件卸载（本机 5G 出口是 USB CDC-NCM，PPE 只接 SoC 以太网口，
+      #            硬件卸载实际不会命中；保留仅为将来 WAN 改走有线 eth1 时可用）
       # 非法值在编译期即 ::error:: + exit 1（见 Scripts/ApplyFlowOffload.sh），绝不带进固件。
-      # 默认值 off（不是 auto）：固件自带 TTL 统一规则，而 flow offload 会把连接从 nftables
-      # 路径上摘走，TTL 规则对快转包完全不执行。真机实证（2026-09-21 / kernel 6.18.52）：
-      #   卸载开 → 客户端 HTTP 25s 超时，conntrack 带 [OFFLOAD]，正向 10 包仅回收 1 包；
-      #   卸载关 → 同一请求 HTTP 200 / 1.0s，出口抓到 TTL=128。
+      #
+      # ★★ 2026-10-05 默认值由 off 改为 on。原注释引用的真机实证
+      #   （2026-09-21：卸载开 → HTTP 25s 超时）**已作伪** —— 那次测试的流量根本没经过本机：
+      #   开发机双网卡且有线优先（192.168.8.103 跃点 25 优先于 Wi-Fi 192.168.10.202 跃点 30），
+      #   tracert 显示公网第一跳是另一台路由器的 192.168.8.1。
+      #   改用「绑定源地址 + 查 conntrack 的 [OFFLOAD] 标记」重测（2026-10-05）：
+      #     关 → OFFLOAD 标记 0
+      #     开 → OFFLOAD 标记 42，3 条长连接全程正常，44.15 MB / 39s 全部收完，无超时无丢包
+      #   ⇒ 软件卸载在本机确定生效且不断网。TTL 归一规则对快转包失效是真的
+      #     （快转路径绕过整条 postrouting），但 flowtable 会自行递减 TTL（内核文档：
+      #     decremented before calling neigh_xmit()），包照发不误 —— 「失效 ≠ 断网」。
       # 老调用方（WRT-BUILD / H5000M-MT-AUTO）不传也能跑（红线1）。
       WRT_FLOW_OFFLOAD:
         required: false
         type: string
-        default: 'off'
+        default: 'on'
 
 # ★ 2026-09-28：移除 job 级 `GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}`。
 #   原先它挂在 env 下，于是**本 job 的每一步**都能读到这个 contents: write 的令牌，包括：
@@ -673,16 +679,26 @@ jobs:
           body: |
             本 Release 只含 **Hiveton H5000M** 一个设备的固件（单 profile 编译，无需挑机型）。
 
-            ## 加速现状（勿误读：两种 offload 默认都是关的）
+            ## 加速现状
 
-            - **软件 flow offload（`nf_flow_table`）：默认关闭。**
-              本固件在 WAN 出口用 nft 统一改写 TTL，而任何 flow offload 都会把连接
-              从 nftables 路径上摘走 → TTL 规则零命中 → 运营商按「多设备共享」丢弃
-              客户端 TCP 包，表现为「路由器自己正常、手机电脑全断」（真机实测）。
-              需要卸载加速时请在编译入口显式选 `on`，并先确认所在网络没有 TTL 检测。
-            - **硬件卸载（`flow_offloading_hw`）：关闭，且在本机没有意义。**
-              本基线没有 `mtkhnat` / `mtk_wed`；5G WAN 走 USB CDC-NCM（eth2），
-              而 PPE 只挂在 SoC 以太网口上、管不到 USB 口 —— 命中率 ≈ 0。
+            - **软件 flow offload（`nf_flow_table`）：默认开启。**
+              2026-10-05 真机 A/B 实测：开启后 conntrack 条目带 `[OFFLOAD]` 标记，
+              3 条长连接全程正常，44.15 MB / 39s 全部收完，无超时无丢包。
+              这是本机型**唯一确定拿得到**的加速（对所有接口生效，含 USB 5G WAN）。
+              代价：WAN 出口的 TTL 归一规则（postrouting）对已建立的快转包不再生效 ——
+              这是**取舍不是故障**，快转路径会自行递减 TTL，包照发不误。
+              需要保留 TTL 归一时把 `FLOW_OFFLOAD` 选 `off`。
+            - **硬件卸载（`flow_offloading_hw`）：默认关闭。**
+              内核能力其实在 —— dmesg 有 `eth0/eth1: mediatek frame engine at 0xffffffc081880000, irq 67`，
+              PPE 引擎已 attach。但 `mtk_ppe_offload.c` 的 `mtk_flow_set_output_device()`
+              只接受 mtk_soc_eth 自己的 netdev[0..2]（映射 PSE_GDM1/2/3_PORT），
+              其它设备一律 `return -EOPNOTSUPP` 且无 fallback；而 5G WAN 是 eth2（USB CDC-NCM）
+              ⇒ 每条 flow 都会被拒，命中率 ≈ 0。
+              ⚠️ **别被 fw4 静默通过骗了**：它的能力探测 `nft_try_hw_offload()` 只做 `nft -c`
+              纯语法检查，而本机（无 PPE 时）`flags offload` 同样 rc=0 ⇒ 恒为假阳性，
+              不会报 `falling back`。判真在用只能看 `/sys/kernel/debug/ppe0/entries` 增长
+              + `ppe0/bind` 非空 + CPU 下降，三条同时成立。
+              若将来 WAN 改走有线 `eth1`（现配置里有但未插线），`on-hw` 才有意义。
 
             完整取舍与实测过程见仓库 `FIRMWARE_OPTIMIZATION_REPORT.md`。
 
