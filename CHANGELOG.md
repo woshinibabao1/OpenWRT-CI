@@ -1,5 +1,143 @@
 # 更新日志
 
+## [2026-10-06] WiFi 硬件转发加速取证：三层机制逐一查清，全部走不通
+
+起因：刷机验收时注意到 `mt7996e` 模块参数 `wed_enable = N`，而 WED 硬件节点
+（`/sys/kernel/debug/wed0`、平台设备 `15010000.wed`）**确实存在且已 probe 成功**。
+这与前几轮"WED 因缺固件 blob 而失败"的说法冲突 —— 既然硬件在、胶水层在、只是没开，
+那就必须查清是"没开"还是"开了也没用"。
+
+### 一、三层机制与各自的断点
+
+| 层 | 是什么 | 本机状态 |
+| :-- | :-- | :-- |
+| **WED** | WiFi DMA ↔ 以太网 MAC 直通，绕过 CPU | 硬件节点在、驱动实现全在，但 **MT7987 无 SoC 寄存器表** ⇒ 不可用 |
+| **PPE 硬件卸载** | PPE 引擎做 NAT | 引擎已 attach（`ppe0`/`ppe1`），但**只接 SoC 以太网口**，WiFi netdev 进不去 |
+| **软件 flow offload** | nft flowtable 快转 | ✅ **已开且生效**（这是目前 WiFi 转发唯一真正在用的加速） |
+
+### 二、决定性证据：上游 `mtk_wed.c` 里 MT7987 出现 0 次
+
+稀疏检出 torvalds/linux（`drivers/net/ethernet/mediatek` + `package/kernel/mt76`）实测：
+
+```
+$ grep -n "mtk_wed_soc_data\s\+\w*_data" drivers/net/ethernet/mediatek/mtk_wed.c
+59:static const struct mtk_wed_soc_data mt7622_data = {
+72:static const struct mtk_wed_soc_data mt7986_data = {
+85:static const struct mtk_wed_soc_data mt7988_data = {
+
+$ grep -c "mt7987\|7987" drivers/net/ethernet/mediatek/mtk_wed.c
+0
+```
+
+WED 靠**每 SoC 一张寄存器表**（`mtk_wed_soc_data`：wpdma 环偏移、reset 掩码、
+`wo_support`…）。上游只有 7622/7986/7988 三张，**MT7987 一张都没有** ⇒
+`mtk_wed_device_attach()` 找不到对应 soc_data，无法挂载。
+
+⇒ ★ 所以「把 `wed_enable` 从 N 改成 Y 就能开」是**错的**：实测写入确实成功
+（读回 `Y`），但 `/sys/kernel/debug/wed0/` 下 `rxinfo`/`txinfo`/`amsdu` 全部仍为
+**0 字节**、`dmesg` 无任何 attach 日志 —— 因为驱动 probe 时那张表根本不存在。
+（该参数只在 probe 时读一次，运行中改无效，要验证也必须重启+带参数。）
+
+### 三、PPE 侧：WiFi netdev 走不通的那一行代码
+
+`mtk_ppe_offload.c` 的 `mtk_flow_set_output_device()` 其实**有**接受 WiFi 的分支：
+
+```c
+if (mtk_flow_get_wdma_info(dev, dest_mac, &info) == 0) {   /* ← 硬件 WDMA 路径 */
+        mtk_foe_entry_set_wdma(eth, foe, info.wdma_idx, ...);
+        pse_port = PSE_WDMA0/1/2_PORT;                     /* 专为 WED 预留的端口 */
+        *wed_index = info.wdma_idx;
+        goto out;
+}
+/* ↓ 非 WDMA 路径：只认 SoC 以太网口 */
+if      (dev == eth->netdev[0]) pse_port = PSE_GDM1_PORT;
+else if (dev == eth->netdev[1]) pse_port = PSE_GDM2_PORT;
+else if (dev == eth->netdev[2]) pse_port = PSE_GDM3_PORT;
+else                           return -EOPNOTSUPP;
+```
+
+而 `mtk_flow_get_wdma_info()` 的唯一判据是：
+
+```c
+if (!IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED)) return -1;
+...
+if (path->type != DEV_PATH_MTK_WDMA) { err = -EINVAL; goto err_out; }
+```
+
+`DEV_PATH_MTK_WDMA` 这种 forward path **只由 WED 注册**。所以三层是串联的：
+WED 不通 → 没有 WDMA path → PPE 拿 WiFi 设备只能撞 `EOPNOTSUPP`。
+
+⚠️ 这里也纠正一处说法：前几轮说「PPE 只接 SoC 以太网口」**对但不完整** ——
+代码**预留了** `PSE_WDMA0/1/2_PORT` 给 WiFi，只是那条路要 WED 先跑起来。
+结论（WiFi 进不了 PPE）不变，但原因是串联链条的第一环断了，不是白名单本身。
+
+### 四、本机客观事实（一律实测，不靠推断）
+
+```
+$ lsmod | grep wed                → 无独立 mtk_wed 模块（胶水层在 mtk_eth 里内联）
+$ cat /sys/module/mt7996e/parameters/wed_enable    → N
+$ ls /sys/kernel/debug/wed0/     → amsdu regidx regval rro rtqm rxinfo txinfo（7 个节点都在）
+$ cat /sys/devices/platform/soc/15010000.wed/uevent
+  OF_COMPATIBLE_0=mediatek,mt7987-wed  OF_COMPATIBLE_1=syscon   ← DT 节点完整、probe 成功
+$ ls -d /sys/kernel/debug/ppe*    → ppe0 ppe1（两个引擎）
+ethtool -k phy0.1-ap0            → rx-checksumming on / tx-checksumming **off [fixed]**
+                                    tx-tcp-segmentation off [fixed]、SG off [fixed]
+$ nft ... flowtable devices      → { br-lan, eth1, eth2 }   ← **不含 phy0.1-ap0**
+```
+
+⚠️ `ethtool` 那两行值得单独说：`tx-checksumming` / `tx-tcp-segmentation` / `SG`
+全是 **`off [fixed]`** —— `[fixed]` 意味着**驱动写死了关、无法打开**，不是配置问题。
+即 WiFi 出方向连软件 checksum/TSO 都没有，所有这些都由 CPU 做。
+
+### 五、结论
+
+**WiFi 侧硬件转发加速在本机（MT7987A + MT7992E + 上游内核 6.18）不可用**，
+且不是"少开一个开关"：
+
+1. **WiFi 硬件 NAT（PPE 卸载）**：需要 WED 提供 WDMA path → MT7987 无 soc_data → 断。
+2. **WED 直通**：需要 SoC 寄存器表 → 上游没有 → 断（实测改 `wed_enable` 无任何效果）。
+3. **MT7992 芯片自身的独立 NAT 引擎**：`/proc/device-tree/soc/` 下只有
+   `ethernet@15100000` 与 `wed@15010000`，**无 hnat/ppe 节点** → 不存在。
+4. **当前真正在生效的只有软件 flow offload**（`flowtable ft`，已确认
+   `devices = { br-lan, eth1, eth2 }`）。它对 WiFi 转发同样有效 —— 因为流量
+   从 `phy0.1-ap0` 收进来后已进 flowtable，只是**省的是 CPU 遍历协议栈，不是硬件 NAT**。
+
+**已经做到的（软件侧）**：WiFi RPS 避开硬中断核（`phy0.1-ap0 rps_cpus=0xe`）、
+`generic-receive-offload: on`、`mq` 队列参与分摊。这些都是 CPU 分摊，不是硬件卸载。
+
+### 六、若将来想走通，需要同时满足（缺一不可）
+
+1. 内核侧：给 `mtk_wed.c` 增加 `mt7987_data`（V3.1 寄存器图：wpdma 环偏移、
+   reset 掩码、`hw_rro` 枚举 …）。本仓历史上做过（`999-mtk7987-wed-v31.patch`），
+   但因**内核侧改了 `wlan.wpdma_tx` 标量→数组、mt76 侧未同步**导致编译失败，
+   已于 Run #33100607008 永久移除（见本文件 2600~2660 行）。重做需两侧同 commit 校准。
+2. 驱动侧：mt76 侧配套的 `hw_rro` 枚举补丁，且必须与内核补丁同一基线。
+3. 设备树：WED 的 DLM 节点（`wo-dlm`）与 `wo-ccif` 缺失会报 `failed to attach wed device`。
+4. DTS：SoC 侧需与 MT7992 的双 WDMA 环匹配。
+
+⇒ **代价与风险远高于收益**（要维护跨仓双补丁 + 每次内核/mt76 升级都要重新校准），
+**维持软件 flow offload 方案**。
+
+### 七、守卫：把这三条结论钉住，防止被反复重查
+
+本次取证花了多轮，而"WiFi 硬件加速能不能开"这个问题会周期性地被再问一遍。
+已加 **C18** 钉住三条可静态验证的事实（SoC 表只有 3 个 SoC / 不含 MT7987；
+`ethtool` 的 `[fixed]` 项不可改；flowtable devices 不含 WiFi 时不得声称硬件卸载生效）。
+
+### 八、这次踩的坑（方法论）
+
+★ **`/sys/module/*/parameters/` 里能写的参数 ≠ 运行中生效。**
+`wed_enable` 写入成功、读回 `Y`，看起来成功了，但驱动只在 probe 时读一次，
+且真正的前提（SoC 寄存器表）根本不存在。
+**参数写入成功只是"必要条件之一"，不是"生效"。**
+
+★ **"硬件节点存在"与"驱动实现了该硬件"是两件事。**
+`/sys/kernel/debug/wed0/` 七个节点齐、平台设备 probe 成功、驱动符号 130 个且地址非零 ——
+全都在，但缺一张 SoC 表就一步都走不出去。**取证必须查到"驱动侧的结构体表"这一层**，
+只数符号个数会被彻底误导（本项目此前就因此得出过错误结论）。
+
+---
+
 ## [2026-10-05] flow offload 默认值改回「开」——原先「必须关」的实测依据已被证伪
 
 ### 一、结论
@@ -94,8 +232,10 @@ PPE 引擎**已 attach**：`dmesg` 有 `eth0/eth1: mediatek frame engine at 0xff
 
 ### 七、顺带更正三处前版错误
 
-1. WED attach 失败的真因是**固件 blob 缺失**（官方源只有 `mt7981/7986/7988-wo-firmware`，无 `mt7987`），
-   **不是「与 PPE 捆绑」**。WED 胶水层其实完整（30 个 `mtk_wed_*` 符号，含 `mtk_wed_ppe_check`）。
+1. ~~WED attach 失败的真因是**固件 blob 缺失**~~ —— **2026-10-06 修正：这只是次要因素，
+   主因是上游内核根本没有 MT7987 的 WED 实现。** 见下方「九」。
+   （WED 胶水层确实完整：设备上 `mt7996_mmio_wed_init` / `mt7996_wed_init_buf` /
+   `mt76_wed_dma_setup` / `mt76_wed_offload_enable` 等符号全部在，且都有非零地址。）
 2. 主线 `mtk_eth_soc.c` 的 PPE 初始化是**内联**的（`mtk_ppe_init(eth, eth->base + reg_map->ppe_base, ...)`），
    **不存在**「补一个 `hnat@15000000` DT 节点就能启用」的说法。
 3. `nft -c` 对 `{eth0,eth1}+flags offload`、`{eth0,eth1}`、`{eth2}(USB)+flags offload` 三组**全 rc=0**

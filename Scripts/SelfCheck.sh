@@ -743,6 +743,91 @@ fi
 
 [ "$FAIL" -eq "$N" ] && pass "TTL 归一链是独立的 postrouting base chain 且用 \$wan_devices"
 
+# ---------- C18：WiFi 硬件转发加速「不可用」这个结论不许被静默推翻 ----------
+# 2026-10-06 真机取证结论（每一层都有代码/命令级证据，见 CHANGELOG 同日章节）：
+#
+# 【层一】WED（WiFi DMA ↔ 以太网 MAC 直通，绕过 CPU）
+#   硬件节点齐（/sys/kernel/debug/wed0 有 7 个文件）、平台设备 15010000.wed probe 成功
+#   （uevent 里 OF_COMPATIBLE_0=mediatek,mt7987-wed）、驱动符号 130 个且地址非零
+#   （mt7996_mmio_wed_init / mt7996_wed_init_buf / mt76_wed_dma_setup …）
+#   ⇒ **看起来全都在，只差没开**。但上游 torvalds/linux 的 mtk_wed.c 里
+#      `mtk_wed_soc_data` 只有 mt7622_data / mt7986_data / mt7988_data 三张，
+#      `grep -c "7987"` = **0** —— MT7987 没有 SoC 寄存器表，
+#      mtk_wed_device_attach() 无从挂载。
+#   ★ 实测 `echo 1 > /sys/module/mt7996e/parameters/wed_enable` 写入成功、读回 Y，
+#     但 wed0 下 rxinfo/txinfo/amsdu 仍全 0 字节、dmesg 无 attach 日志。
+#     ⇒ 「参数能写」不等于「生效」，何况它只在 probe 时读一次。
+#
+# 【层二】PPE 硬件 NAT
+#   mtk_ppe_offload.c 的 mtk_flow_set_output_device() 确实**预留了** WiFi 分支
+#   （mtk_flow_get_wdma_info() 成功 → pse_port = PSE_WDMA0/1/2_PORT），
+#   但 mtk_flow_get_wdma_info() 的唯一判据是 path->type == DEV_PATH_MTK_WDMA，
+#   而这种 forward path **只由 WED 注册**。三层串联，第一环断了后面全断。
+#   非 WDMA 分支才是白名单（只认 eth->netdev[0..2] → 否则 -EOPNOTSUPP）。
+#   ★ 所以「PPE 只接 SoC 以太网口」对但不完整：白名单本身不是原因。
+#
+# 【层三】MT7992 芯片自身的独立 NAT 引擎
+#   /proc/device-tree/soc/ 下只有 ethernet@15100000 与 wed@15010000，
+#   **无 hnat/ppe 节点** ⇒ 不存在这种引擎。
+#
+# ⇒ 结论：本机 WiFi 侧**没有**硬件转发加速，真正在生效的只有软件 flow offload
+#   （它对 WiFi 转发同样有效，省的是 CPU 遍历协议栈，不是硬件 NAT）。
+#
+# 本门的作用不是判代码对错，而是**挡住那些会让人重新下结论的表述**：
+# 将来若有人写「打开 wed_enable 即可加速」「WiFi 走 PPE 的 WDMA 端口」之类的注释或文档，
+# 那是在重复已被证伪的说法 —— 除非同时给出 MT7987 的 soc_data 已被合入的证据。
+echo "-- C18 不声称 WiFi 有硬件转发加速（WED/PPE 在 MT7987 上均不可用）"
+N=$FAIL
+
+# ① 不得声称打开 wed_enable 就能用（缺 MT7987 SoC 寄存器表）
+#    判据按**赋值语义**，两种写法都要抓（实测逐条验证过）：
+#      · `wed_enable=1|Y|yes|true|on`      —— 赋值形式
+#      · `echo Y > .../wed_enable`          —— 重定向形式（值在参数名**之前**）
+#    放行：`wed_enable=N|0`、以及仅出现在注释里的任何写法。
+#
+#    ★ 本条判据被返工过两轮，两个错都记在这儿：
+#      ① 第一版用 `wed_enable[^0-9A-Za-z]*(1|[Yy]es|true|on)\b`，实测**什么都不匹配** ——
+#         Git-Bash 的 grep -E **不支持 `\b`**（也不支持 `\<` `\>`），而 `[[:space:]]` 支持。
+#         记忆红线里已有「Windows Git-Bash 对字符类匹配恒失败」这条，此处是同族坑。
+#      ② 第二版试图 `sed 's/.*wed_enable.*//'` 取「参数名之后」的部分 —— 方向错了：
+#         `echo 1 > .../wed_enable` 里参数名在**行尾**，后面什么都没有，整行被删空 ⇒ 恒不匹配。
+#         重定向写法的值在参数名**之前**，赋值写法的值在**之后**，两者要分别判。
+#    ★ 排除注释行必须先剥行首空白：grep -v '^\S*:[0-9]*: *#' 只认「行首 #」，
+#      而本仓脚本大量 tab 缩进（注释是 "\t\t# ..."），会漏掉 ⇒ 恒红。
+BAD_WED=$(
+	grep -rn 'wed_enable' \
+		--include='*.sh' --include='*.uc' --include='99-*' --include='*.nft' --include='*.yml' \
+		Files/ Scripts/ .github/ 2>/dev/null \
+		| grep -v '^Scripts/SelfCheck\.sh:' \
+		| sed 's/^[^:]*:[0-9]*:[[:space:]]*//' \
+		| grep -v '^[[:space:]]*#' \
+		| grep -iE '(wed_enable[[:space:]]*=[[:space:]]*[Yy1]|(echo|printf)[[:space:]]+[Yy1][^[:space:]]*.*>[[:space:]]*[^[:space:]]*wed_enable)'
+)
+if [ -n "$BAD_WED" ]; then
+	echo "$BAD_WED"
+	fail "C18 有脚本/配置在动 wed_enable。上游 mtk_wed.c 的 mtk_wed_soc_data 只有 mt7622/mt7986/mt7988 三张，grep '7987' = 0 —— MT7987 无 SoC 寄存器表，mtk_wed_device_attach() 挂不上。实测把 wed_enable 写成 Y 之后 wed0 下 rxinfo/txinfo/amsdu 仍全 0 字节、dmesg 无任何 attach 日志。真要启用必须先给内核加 mt7987_data（并同步 mt76 侧，见 CHANGELOG 2026-10-06 章节），不是翻一个开关"
+fi
+
+# ② 不得声称 flowtable 里的 WiFi 接口代表硬件卸载真的在跑
+#    判据：本仓任何文档/注释若把 phy0.1-ap0 写进 flowtable devices 当作硬件卸载证据，
+#    那是把「软件 flowtable 收 WiFi 流量」误当成「WiFi 走了 PPE 硬件 NAT」。
+BAD_PPE=$(grep -rn 'PSE_WDMA\|WDMA0_PORT' \
+	--include='*.sh' --include='*.uc' --include='99-*' --include='*.yml' \
+	Files/ Scripts/ .github/ 2>/dev/null \
+	| grep -v '^Scripts/SelfCheck\.sh:')
+if [ -n "$BAD_PPE" ]; then
+	echo "$BAD_PPE"
+	fail "C18 有文件引用了 PPE 的 WDMA 端口。PSE_WDMA0/1/2_PORT 是上游为 WED 预留的出口，而它依赖 path->type == DEV_PATH_MTK_WDMA —— 该 path 只由 WED 注册，MT7987 上没有。WiFi netdev 进 mtk_flow_set_output_device() 只能落到 netdev[0..2] 白名单之外、返回 -EOPNOTSUPP"
+fi
+
+# ③ 硬件卸载开关必须仍是 0（本机 5G 出口是 USB CDC-NCM，PPE 接不到）
+if [ -f Files/etc/mt5700/flow-offload ]; then
+	grep -qx 'MODE=on' Files/etc/mt5700/flow-offload \
+		|| fail "C18 Files/etc/mt5700/flow-offload 的默认值变了。必须是 \`MODE=on\`（纯软件卸载）；**不要**改成 on-hw 或引入硬件卸载开关 —— 本机 5G 出口是 USB CDC-NCM（eth2），WiFi 侧又因 MT7987 缺 WED soc_data 进不了 PPE，两个方向都没有硬件卸载可用（2026-10-06 取证）"
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "未声称 WiFi 有硬件转发加速（WED/PPE 在 MT7987 上均不可用）"
+
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then
 	echo "::error::静态自检未通过，请修正后再编译"
