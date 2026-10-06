@@ -1,5 +1,62 @@
 # 更新日志
 
+## [2026-10-06 晚] WED 断因 v3：撤回上一轮「缺内核 CONFIG」的错误结论
+
+上一轮（`27df209` / `2495016`）把 WED 断因写成「内核缺 `CONFIG_NET_MEDIATEK_SOC_WED`」。
+**这条结论本身是错的，本条撤回。** 本轮改用固件的精确上游基底
+（ImmortalWrt `8735c68` = 设备内核 `r0-8735c68`；linux `6.18.54`，
+树哈希 `9df30b02dd81…`）重查源码，v2 与 v1 一样不成立。
+
+### 三代归因对照
+
+| 代 | 说法 | 判定 | 依据 |
+| :-- | :-- | :-- | :-- |
+| v1 | 旧说法：「MT7987 没有 SoC 寄存器表」 | ✗ 已推翻 | 补丁 750 的 `mt7987_data` 存在，`.version = 3`，走 `mtk_wed_add_hw()` 的 `case 3` 拿 `mt7988_data` |
+| v2 | 旧说法：「内核缺 `CONFIG_NET_MEDIATEK_SOC_WED`」 | ✗ 已推翻 | 上游 `filogic/config-6.18` 明写 `CONFIG_NET_MEDIATEK_SOC_WED=y`；真机 `mtk_wed.o` 的 60 个符号全在、`wed0` debugfs 已建 |
+| v3 | 内核未链接 `mtk_wed_ops.o` | ✓ 现行 | 见下 |
+
+### v3 的判定链
+
+- `mt7996e.ko` 的 undefined 符号里**有** `mtk_soc_wed_ops`（模块在等它）
+- 内核 `/proc/kallsyms` 里该符号**计数 = 0**（内核没有）
+- 全仓唯一定义处是 `drivers/net/ethernet/mediatek/mtk_wed_ops.c`，
+  整个单元只做一件事：`EXPORT_SYMBOL_GPL(mtk_soc_wed_ops)`
+- 由 `Makefile` 的 `obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o` 编入
+- ⇒ 掉的是**这一个 `.o`**，其余 WED 单元都在 ⇒ 不是 CONFIG 开关问题
+
+### ★ 为什么 dmesg 里一条日志都没有（排查时最大的坑）
+
+```c
+/* mt7996/mmio.c */
+if (mtk_wed_device_attach(wed)) {
+        dev->mt76.hwrro_mode = MT76_HWRRO_OFF;
+        return 0;                    /* 失败路径，不打任何日志 */
+}
+```
+
+而 CONFIG 关掉时该函数整体 `#else return 0` —— **外部行为完全一致**。
+所以光看 dmesg 永远无法区分「config 没开」与「attach 失败」，
+唯一可分辨的是符号表对照。
+
+### 守卫变更（C20 重写）
+
+- 判据从「禁止写 v1 那句」扩到**同时禁止写 v2 那句**（新增 `PAT_CFG_OFF`）
+- 自证要素从 3 项增到 4 项，新增 `wed0` 留档，**且要求 GENERAL.txt 与
+  CHANGELOG.md 各自都有**（只要求「某个文件有」是弱断言，反向验证已证明会漏）
+- 反向验证扩到 8 组，全部判红、复原全绿：
+  M1 = v1 归因复活 / M2·M2b·M2c = 三种「CONFIG 未生效」的中文与符号写法 /
+  M3·M4 单独删两个文件里的 `wed0` / M5 删 `mtk_soc_wed_ops` / M6 删 `mtk_wed_ops`
+
+### 排查方法留档
+
+- `openwrt/linux` 仓库**不存在**，别去那儿找 6.18；内核要查 stable 的 `v6.18.54` tag
+- 内核源码哈希在 `target/linux/generic/kernel-6.18`（不在 mediatek 目录里）
+- `wed_enable` 已能正常生效：写 `/etc/modules.d/mt7996e` 内容为
+  `mt7996e wed_enable=1`，读回 `/sys/module/mt7996e/parameters/wed_enable` 为 `Y`。
+  直跑 `modprobe mt7996e wed_enable=1` 会被 procd 按 modules.d 重载覆盖，
+  这是 OpenWrt 正常行为不是 bug。
+
+
 ## [2026-10-06 晚] WED 断点归因最终更正：不是「缺 SoC 表」，是内核缺 CONFIG
 
 起因：被要求「打破固有认知」去查 WiFi 硬件加速，于是把上一轮当成定论的

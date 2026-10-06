@@ -348,6 +348,71 @@ CONFIG_PACKAGE_kmod-nft-xfrm=y
 #   5G 出口是 USB CDC-NCM 的 eth2，其 hw-tc-offload 为 `off [fixed]`（内核写死），
 #   mtk_flow_set_output_device() 拿不到 mtk_soc_eth 或 WED 产生的 DEV_PATH_MTK_WDMA
 #   ⇒ 仍返回 -EOPNOTSUPP。WED 的收益是 WiFi↔以太网的 DMA 直通，不是 NAT 硬件化。
+#
+#   ★★ WED 断因 v3（2026-10-06 晚，最终结论，此前 v1/v2 均已被推翻）
+#
+#   源码基底：ImmortalWrt 8735c68（= 设备内核 r0-8735c68）/ linux 6.18.54
+#   仓库：immortalwrt/immortalwrt @8735c68，内核树哈希
+#         LINUX_VERSION-6.18 = .54
+#         LINUX_KERNEL_HASH-6.18.54 = 9df30b02dd81...
+#   ⚠️ openwrt/linux 不存在，别去那儿找 6.18；内核要查 stable 的 v6.18.54 tag。
+#
+#   ── 三代归因 ──────────────────────────────────────────────
+#   v1「MT7987 无 SoC 寄存器表」              ✗ 已推翻
+#   v2「内核缺 CONFIG_NET_MEDIATEK_SOC_WED」  ✗ 已推翻（本文档修正对象）
+#   v3「内核未链接 mtk_wed_ops.o」            ✓ 现行结论
+#
+#   ── v2 为何错（这是最容易重犯的方向）────────────────────
+#   上游 target/linux/mediatek/filogic/config-6.18 明写：
+#       CONFIG_NET_MEDIATEK_SOC=y
+#       CONFIG_NET_MEDIATEK_SOC_WED=y
+#   且真机实测（kernel 6.18.54 r0-8735c68）：
+#       mtk_wed.o 的符号全在 —— mtk_wed_add_hw / wo_init / flow_add 共 60 个，
+#       其中 mtk_wed_add_hw、mtk_wed_wo_init、mtk_wed_flow_add 为大写 T（已 EXPORT）
+#       /sys/kernel/debug/wed0/ 已建，内含 amsdu / rro / rtqm / rxinfo / txinfo
+#   ⇒ config 生效、mtk_wed_add_hw 已跑通、hw_list[0] 已分配。
+#   设备树侧也无须改：mt7987.dtsi 的 wed@15010000 compatible = "mediatek,mt7987-wed"，
+#   ethernet 节点有 mediatek,wed phandle，补丁 750 给 mt7987_data 设了
+#   .version = 3 与 .offload_version = 2，并注册了 { "mediatek,mt7987-eth" }。
+#   ⇒ 走 mtk_wed_add_hw() 的 case 3 拿 mt7988_data，不需要 pcie-mirror/hifsys。
+#
+#   ── v3 正解 ───────────────────────────────────────────────
+#   mt7996e.ko 的 undefined 符号里**有** mtk_soc_wed_ops（模块在等它），
+#   而内核 /proc/kallsyms 里该符号**计数 = 0**（内核没有它）。
+#   全仓唯一定义处：drivers/net/ethernet/mediatek/mtk_wed_ops.c
+#       const struct mtk_wed_ops __rcu *mtk_soc_wed_ops;
+#       EXPORT_SYMBOL_GPL(mtk_soc_wed_ops);
+#   由 Makefile: obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o 编入。
+#   该 .o 只做这一件事 ⇒ 掉的就是它，其余 WED 单元都在。
+#   ⇒ 这**不是 CONFIG 开关问题**，是单个编译单元没进 vmlinux。
+#
+#   ── ★★ 为什么 dmesg 里一条日志都没有（排查时最大的坑）────────
+#   mt7996_mmio_wed_init() 末尾：
+#       if (mtk_wed_device_attach(wed)) {
+#               dev->mt76.hwrro_mode = MT76_HWRRO_OFF;
+#               return 0;                    ← 失败路径，不打任何日志
+#       }
+#   而 CONFIG 关掉时该函数整体 `#else return 0`，外部行为**完全一致**。
+#   ⇒ 只看 dmesg 永远无法区分「config 没开」与「attach 失败」。
+#   唯一可分辨的判据是符号表对照：
+#       模块侧 mt7996e.ko 有 mtk_soc_wed_ops（U）
+#     ∧ 内核侧 /proc/kallsyms 无 mtk_soc_wed_ops  ⇒ 必是 .o 未链接（v3）
+#     若内核侧**有**该符号 ⇒ 才轮到查 attach 的三个失败点：
+#         a) pci_domain_nr(pci_dev->bus) > 1   —— 你的 WiFi 在 0000:01:00.0，domain 0，不成立
+#         b) hw->wed_dev 已被占用
+#         c) mtk_wed_is_v1(hw)（version==1）    —— .version=3，不成立
+#   本机 a/c 均已排除；因内核侧无 ops 符号，根本走不到 a/b/c。
+#
+#   ── 修复方向（需改内核重编，本仓库改动无效）─────────────────
+#   要么修内核构建让 mtk_wed_ops.o 进 vmlinux；要么给该单元加
+#   __used/__attribute__((used)) 之类防 GC 标记（根因未最终定位，属推测，不建议盲改）。
+#   ★ 在拿到确定结论前，不要在 C18/C20 里写「已修好」。
+#
+#   ── 附：wed_enable 已可正常写入 ────────────────────────────
+#   /etc/modules.d/mt7996e 内容写成 `mt7996e wed_enable=1` 后，
+#   /sys/module/mt7996e/parameters/wed_enable 读回 Y。
+#   （直��� `modprobe mt7996e wed_enable=1` 会被 procd 按 modules.d 重载覆盖掉，
+#     这是 OpenWrt 用 procd 管 /etc/modules.d 的正常行为，不是 bug。）
 
 #   本固件是自编译内核（`cat /proc/version` 里带我们自己 runner 的 build 号），
 #   在线仓库里的同名 kmod 是给官方内核编的 —— 装上去要么被 apk 直接拒绝，

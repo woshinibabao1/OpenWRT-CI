@@ -25,7 +25,7 @@
 #   C14 uci-defaults 幂等性守卫（保留配置升级会重放它们 → 会覆盖用户设置的键必须有标记）
 #   C15 flow offload 默认值四处一致且为 on（该默认值两个月内反转过两次，auto 不得有 TTL 阻断）
 #   C19 软件卸载生效判据必须组合式（flowtable + 至少一条 [OFFLOAD] + 出口计数器上涨）
-#   C20 WED 断点归因必须写成「内核缺 CONFIG」，不许再写成「MT7987 缺 SoC 表」
+#   C20 WED 断因是内核未链接 mtk_wed_ops.o；不许写成「缺 SoC 表」或「缺内核 CONFIG」
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -849,7 +849,7 @@ if [ -f Files/etc/mt5700/flow-offload ]; then
 		|| fail "C18 Files/etc/mt5700/flow-offload 的默认值变了。必须是 \`MODE=on\`（纯软件卸载）；**不要**改成 on-hw 或引入硬件卸载开关 —— 本机 5G 出口是 USB CDC-NCM（eth2，ethtool -k 的 hw-tc-offload 是 off [fixed]），WiFi 侧则因内核缺 CONFIG_NET_MEDIATEK_SOC_WED（mtk_soc_wed_ops 符号不存在）进不了 PPE，两个方向都没有硬件卸载可用（2026-10-06 取证）"
 fi
 
-[ "$FAIL" -eq "$N" ] && pass "未声称 WiFi 有硬件转发加速（断点是内核缺 CONFIG_NET_MEDIATEK_SOC_WED，非 SoC 表缺失）"
+[ "$FAIL" -eq "$N" ] && pass "未声称 WiFi 有硬件转发加速（断点是内核未链接 mtk_wed_ops.o（CONFIG 本身已是 =y））"
 
 # ---------- C19：SFO 生效判据必须是组合式，不许拿 conntrack 计数当命中量 ----------
 # 2026-10-06 真机复测发现一个会误导人的判据（详见 CHANGELOG 同日章节）：
@@ -937,12 +937,36 @@ fi
 #
 # 本门的作用：防止把更正前的错误归因重新写回文档/注释，并强制留存
 # 「怎么自证」的判据（不能只写一句「不可用」）。
-echo "-- C20 WED 断点归因是内核缺 CONFIG，不是缺 SoC 表；自证判据在册"
+echo "-- C20 WED 断因是内核未链接 mtk_wed_ops.o；四项自证判据在册"
 N=$FAIL
 
-# ① 不得把断因写成「缺 SoC 寄存器表 / 缺 mt7987_data 表」
-#    放行：留档段落（删除线 / 「已被推翻」 / 「是错的」 / 「不是」 /
-#          「禁止把断因」……）、Markdown 引述行（> 开头）。
+#   C20 WED 断因不得写成「MT7987 缺 SoC 寄存器表」，也不得写成「缺内核 CONFIG」
+#   C21 attach 静默失败必须留档（mtk_wed_device_attach 失败无日志）
+
+# ---------------------------------------------------------------------
+# C20：断因表述守卫
+#
+# ★ 历史归因（均已被推翻，勿再当真）：
+#   v1「MT7987 无 SoC 寄存器表」——错：补丁 750 的 mt7987_data 存在且
+#       .version=3，走 mtk_wed_add_hw() 的 case 3 拿 mt7988_data。
+#   v2「内核缺 CONFIG_NET_MEDIATEK_SOC_WED」——也错：上游
+#       target/linux/mediatek/filogic/config-6.18 里明写
+#       CONFIG_NET_MEDIATEK_SOC=y 与 CONFIG_NET_MEDIATEK_SOC_WED=y，
+#       且真机 mtk_wed.o 的 60 个符号全在、wed0 debugfs 已建
+#       ⇒ config 生效、add_hw 已跑通。
+#
+# ★ 正确断因（v3，源码级取证，基底 immWrt 8735c68 / kernel 6.18.54）：
+#   mt7996e.ko 的 undefined 符号里**有** mtk_soc_wed_ops，
+#   而内核 /proc/kallsyms 里该符号**0 命中**。
+#   mtk_soc_wed_ops 的全仓唯一定义在 drivers/net/ethernet/mediatek/mtk_wed_ops.c，
+#   由 Makefile 的 `obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o` 编入，
+#   整个单元只做一件事：EXPORT_SYMBOL_GPL(mtk_soc_wed_ops)。
+#   ⇒ 掉的是**这一个 .o**，其余 WED 单元都在。这不是 CONFIG 开关问题。
+#
+# ★ 为什么 dmesg 里什么都看不到（踩过的坑）：
+#   mt7996_mmio_wed_init() 里 `if (mtk_wed_device_attach(wed)) { ...; return 0; }`
+#   失败路径**不打任何日志**；而 CONFIG 关掉时函数整体 return 0，
+#   外部行为完全一致 ⇒ 光看 dmesg 无法区分两者，必须查符号表。
 #
 #    ★ 必须分两组扫（合并扫 + 排除 # 开头行会漏掉最要守的地方）：
 #      - 文档/配置类（md/txt/yml）：Config/GENERAL.txt **整个文件都是 # 注释**，
@@ -950,7 +974,8 @@ N=$FAIL
 #        （反向验证的变异 1 就是这么漏的。）
 #      - 脚本类（sh/uc/99-*）：# 开头的确实是代码注释且很多，才排除。
 PAT_CAUSE='(缺|没有|无)[[:space:]]*(MT7987|mt7987)?[[:space:]]*(的)?[[:space:]]*(SoC|soc)[[:space:]]*(寄存器)?[[:space:]]*表'
-ALLOW_CAUSE='~~|已被推翻|是错的|错在|重新查了一遍|结论：那条归因|以前|原本|当时|错因|前版|禁止把断因|不声称|那条归因是错|不是'
+PAT_CFG_OFF='CONFIG_NET_MEDIATEK_SOC_WED[[:space:]]*(未生效|没开|未开|关闭|n|=n|为 *n)|(没|未|不)[[:space:]]*(有)?[[:space:]]*开[[:space:]]*CONFIG_NET_MEDIATEK_SOC_WED|CONFIG_NET_MEDIATEK_SOC_WED[[:space:]]*(是|为)[[:space:]]*关'
+ALLOW_CAUSE='~~|已.{0,2}推翻|是错的|错在|重新查了一遍|结论：那条归因|以前|原本|当时|错因|前版|禁止把断因|不声称|那条归因是错|不是|历史上|v1「|v2「|断因是内核缺'
 	DOC_CAUSE=$(
 		grep -rnE "$PAT_CAUSE" --include='*.md' --include='*.txt' --include='*.yml' Config/ .github/ CHANGELOG.md README.md 2>/dev/null | \
 		sed 's/^[^:]*:[0-9]*:[[:space:]]*//' | \
@@ -969,12 +994,35 @@ ALLOW_CAUSE='~~|已被推翻|是错的|错在|重新查了一遍|结论：那条
 	WRONG_CAUSE=$(printf '%s\n%s\n' "$DOC_CAUSE" "$SH_CAUSE")
 if [ -n "$WRONG_CAUSE" ]; then
 	echo "$WRONG_CAUSE"
-	fail "C20 有文本把 WED 断因写成「MT7987 缺 SoC 寄存器表」。这是 2026-10-06 已被推翻的归因：mt7987_data 存在于补丁 750 且 .version=3，走 case 3 拿 mt7988_data，probe 也成功（wed0 debugfs 即证）。正确断点是内核未编入 mtk_wed_ops.o ⇒ 唯一跨模块入口 mtk_soc_wed_ops 在 kallsyms 里 0 命中"
+	fail "C20 有文本把 WED 断因写成「MT7987 缺 SoC 寄存器表」。这是 v1 归因，已被推翻：mt7987_data 存在于补丁 750 且 .version=3，走 case 3 拿 mt7988_data，probe 也成功（wed0 debugfs 即证）。正确断因见本段注释的 v3：内核未链接 mtk_wed_ops.o"
 fi
 
-# ② 断因判据必须在册：三项自证要素**各至少有一处**留痕
-#    ① mtk_soc_wed_ops（mt76 唯一跨模块入口）② CONFIG_NET_MEDIATEK_SOC_WED
-#    ③ mtk_wed_ops.o（未编入的唯一 EXPORT 单元）
+# ①c 断因不得写成「CONFIG 未开」——这条同样已被推翻
+	DOC_CFG_OFF=$(
+		grep -rnE "$PAT_CFG_OFF" --include='*.md' --include='*.txt' --include='*.yml' Config/ .github/ CHANGELOG.md README.md 2>/dev/null | \
+		sed 's/^[^:]*:[0-9]*:[[:space:]]*//' | \
+		grep -vE '^[[:space:]]*>' | \
+		grep -vE "$ALLOW_CAUSE" || true
+	)
+	SH_CFG_OFF=$(
+		grep -rnE "$PAT_CFG_OFF" --include='*.sh' --include='*.uc' --include='99-*' Files/ Scripts/ 2>/dev/null | \
+		grep -v '^Scripts/SelfCheck\.sh:' | \
+		sed 's/^[^:]*:[0-9]*:[[:space:]]*//' | \
+		grep -vE '^[[:space:]]*#' | \
+		grep -vE '^[[:space:]]*>' | \
+		grep -vE "$ALLOW_CAUSE" || true
+	)
+	WRONG_CFG=$(printf '%s\n%s\n' "$DOC_CFG_OFF" "$SH_CFG_OFF")
+if [ -n "$WRONG_CFG" ]; then
+	echo "$WRONG_CFG"
+	fail "C20 有文本把 WED 断因写成「CONFIG_NET_MEDIATEK_SOC_WED 未生效/关闭」。这是 v2 归因，同样已被推翻：上游 filogic/config-6.18 明写 CONFIG_NET_MEDIATEK_SOC_WED=y，真机 mtk_wed.o 的 60 个符号全在、wed0 debugfs 已建 ⇒ config 生效且 add_hw 已跑通。正确断因是 mtk_wed_ops.o 未被链接"
+fi
+
+# ② 断因判据必须在册：四项自证要素**各至少有一处**留痕
+#    ① mtk_soc_wed_ops（mt76 唯一跨模块入口，模块侧 U / 内核侧 0 命中）
+#    ② CONFIG_NET_MEDIATEK_SOC_WED（=y 的事实，用于排除 v2 误判）
+#    ③ mtk_wed_ops.o（未链接的唯一 EXPORT 单元）
+#    ④ wed0 / debugfs（add_hw 已成功的证据，用于排除 v1 误判）
 #
 #    ★ 每条 grep 都写成**单行**（不用续行符）：续行与 | 混用时容易把
 #      路径列表变成管道右侧的待执行命令，而报错被 2>/dev/null 吞掉 →
@@ -983,20 +1031,32 @@ fi
 
 C20_HIT_mtk_soc_wed_ops=$(grep -rlF 'mtk_soc_wed_ops' --include='*.sh' --include='*.md' --include='*.uc' --include='*.txt' --include='*.yml' --include='99-*' Files/ Scripts/ Config/ .github/ CHANGELOG.md README.md 2>/dev/null | grep -v '^Scripts/SelfCheck\.sh$')
 if [ -z "$C20_HIT_mtk_soc_wed_ops" ]; then
-	fail "C20 本仓已无处记录自证判据「mtk_soc_wed_ops」。WED 不可用的正确断因是内核未编入 mtk_wed_ops.o ⇒ CONFIG_NET_MEDIATEK_SOC_WED 未生效 ⇒ 唯一跨模块入口 mtk_soc_wed_ops 在 kallsyms 里 0 命中。这三项必须留在文档/脚本里，否则下一个人又会重复「给 MT7987 加 SoC 表」的错误方向"
+	fail "C20 本仓已无处记录自证判据「mtk_soc_wed_ops」。WED 不可用的正确断因是内核未链接 mtk_wed_ops.o ⇒ 模块侧在等这个符号而内核侧 0 命中。这四项必须留在文档/脚本里，否则下一个人又会重复 v1「给 MT7987 加 SoC 表」或 v2「打开内核 CONFIG」的错误方向"
 fi
 
 C20_HIT_CONFIG_NET_MEDIATEK_SOC_WED=$(grep -rlF 'CONFIG_NET_MEDIATEK_SOC_WED' --include='*.sh' --include='*.md' --include='*.uc' --include='*.txt' --include='*.yml' --include='99-*' Files/ Scripts/ Config/ .github/ CHANGELOG.md README.md 2>/dev/null | grep -v '^Scripts/SelfCheck\.sh$')
 if [ -z "$C20_HIT_CONFIG_NET_MEDIATEK_SOC_WED" ]; then
-	fail "C20 本仓已无处记录自证判据「CONFIG_NET_MEDIATEK_SOC_WED」。WED 不可用的正确断因是内核未编入 mtk_wed_ops.o ⇒ CONFIG_NET_MEDIATEK_SOC_WED 未生效 ⇒ 唯一跨模块入口 mtk_soc_wed_ops 在 kallsyms 里 0 命中。这三项必须留在文档/脚本里，否则下一个人又会重复「给 MT7987 加 SoC 表」的错误方向"
+	fail "C20 本仓已无处记录自证判据「CONFIG_NET_MEDIATEK_SOC_WED」。必须同时记下它在上游 filogic/config-6.18 里已是 =y，否则下一个人会把断因误判成「config 没开」而去反复改 config"
 fi
 
 C20_HIT_mtk_wed_ops=$(grep -rlF 'mtk_wed_ops' --include='*.sh' --include='*.md' --include='*.uc' --include='*.txt' --include='*.yml' --include='99-*' Files/ Scripts/ Config/ .github/ CHANGELOG.md README.md 2>/dev/null | grep -v '^Scripts/SelfCheck\.sh$')
 if [ -z "$C20_HIT_mtk_wed_ops" ]; then
-	fail "C20 本仓已无处记录自证判据「mtk_wed_ops」。WED 不可用的正确断因是内核未编入 mtk_wed_ops.o ⇒ CONFIG_NET_MEDIATEK_SOC_WED 未生效 ⇒ 唯一跨模块入口 mtk_soc_wed_ops 在 kallsyms 里 0 命中。这三项必须留在文档/脚本里，否则下一个人又会重复「给 MT7987 加 SoC 表」的错误方向"
+	fail "C20 本仓已无处记录自证判据「mtk_wed_ops」。Makefile 里 obj-\$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o 是全仓唯一 EXPORT mtk_soc_wed_ops 的单元，掉的就是它"
 fi
 
-[ "$FAIL" -eq "$N" ] && pass "WED 断因归到内核缺 CONFIG_NET_MEDIATEK_SOC_WED，且自证判据（mtk_soc_wed_ops）留档"
+# ★ 必须「两个文件都在」才算留档：只要求「某个文件有」是弱断言 ——
+#   反向验证 M3（只删 Config/GENERAL.txt 里的 wed0）曾因此判绿，
+#   因为 CHANGELOG.md 里还有一份顶着。⇒ 这里逐文件分别断言。
+C20_WED0_G=$(grep -cF 'wed0' Config/GENERAL.txt 2>/dev/null || true)
+if [ "$C20_WED0_G" -lt 1 ]; then
+	fail "C20 Config/GENERAL.txt 里已无处记录「wed0 debugfs 已建」这条排除性证据。它是 v1 归因（MT7987 缺 SoC 表）被推翻的直接依据：debugfs 目录存在即说明 add_hw 已走到 hw_list[index]=hw"
+fi
+C20_WED0_C=$(grep -cF 'wed0' CHANGELOG.md 2>/dev/null || true)
+if [ "$C20_WED0_C" -lt 1 ]; then
+	fail "C20 CHANGELOG.md 里已无处记录「wed0 debugfs 已建」。改日志时容易连带删掉这条排除性证据，删了之后下一个维护者又会重犯 v1 归因的错误方向"
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "WED 断因未写成「缺 SoC 表」或「缺内核 CONFIG」，四项自证判据均留档"
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then
