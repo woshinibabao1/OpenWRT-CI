@@ -1109,7 +1109,33 @@ if [ -n "$C22_PATCHES" ]; then
 		grep -qE '^--- a/(drivers|include)/' "$P" || fail "C22 $P 看起来不像内核补丁（没有 --- a/drivers/ 或 --- a/include/ 行）。内核补丁队列里的文件必须能对到内核源码树"
 	done
 
-	[ "$FAIL" -eq "$N" ] && pass "内核补丁用 __used 而非重复链接（无 multiple definition 风险），且为 LF 行尾"
+	# C22-e 头文件 hunk 里绝不能出现 wed_debug。
+	#   ★ 这条守的是一次真实的 CI 失败（run 37503259547，烧了 24 分钟）：
+	#     v1 补丁在 include/linux/soc/mediatek/mtk_wed.h 里写了 extern bool wed_debug;
+	#     而该头文件被 mt7996e.ko（mt76 驱动，外部模块）include，头里的 inline
+	#     函数是**展开进那个模块**的，于是它去引用 mtk_eth.ko 里未 EXPORT_SYMBOL 的
+	#     变量 ⇒ MODPOST 阶段报
+	#       ERROR: modpost: "wed_debug" [mt7996/mt7996e.ko] undefined!
+	#   铁律：模块之间不能用未 EXPORT 的变量通信。头文件里新增的任何标识符，
+	#   都必须是所有消费者都能解析的符号。
+	#   ★ 不能改成「加 EXPORT_SYMBOL_GPL(wed_debug)」：那会让 mt7996e.ko 硬依赖
+	#     mtk_eth.ko 加载，mtk_eth 起不来时 WiFi 直接瘫。
+	C22_HDR="$(sed -n '/^diff --git a\/include\/linux\/soc\/mediatek\/mtk_wed\.h/,$p' Patches/0980-wed-diag.patch 2>/dev/null || true)"
+	if [ -n "$C22_HDR" ] && printf '%s\n' "$C22_HDR" | grep -qE '^\+.*\bwed_debug\b'; then
+		fail "C22 头文件 mtk_wed.h 的改动里出现了 wed_debug。★ 真实 CI 失败（run 37503259547）：该头文件被 mt7996e.ko include，inline 函数展开进那个模块后会去引用 mtk_eth.ko 里未 EXPORT_SYMBOL 的变量，MODPOST 阶段报 \"wed_debug\" [mt7996/mt7996e.ko] undefined。诊断开关只能留在 mtk_wed.c 里"
+	fi
+
+	# C22-f 反过来，wed_debug 必须仍定义在 mtk_wed.c —— 它同时是
+	#   「补丁有没有进固件」的唯一可靠判据（/sys/module/mtk_eth/parameters/wed_debug），
+	#   挪走或删掉会让刷机后的验收手段失效。
+	if ! grep -qE '^\+bool wed_debug __read_mostly' Patches/0980-wed-diag.patch 2>/dev/null; then
+		fail "C22 补丁里找不到 wed_debug 的定义（bool wed_debug __read_mostly）。它既控制诊断输出，也是刷机后判定「补丁有没有进固件」的唯一可靠依据（cat /sys/module/mtk_eth/parameters/wed_debug），必须保留在 mtk_wed.c（mtk_eth.ko）里"
+	fi
+	if ! grep -qE '^\+module_param\(wed_debug, bool, 0644\);' Patches/0980-wed-diag.patch 2>/dev/null; then
+		fail "C22 补丁里找不到 module_param(wed_debug, bool, 0644)。没有它 /sys/module/mtk_eth/parameters/wed_debug 不存在，验收时无法区分「补丁没进固件」与「补丁没生效」"
+	fi
+
+	[ "$FAIL" -eq "$N" ] && pass "内核补丁用 __used 而非重复链接（无 multiple definition 风险），为 LF 行尾，且头文件不引用模块内符号"
 else
 	echo "  --  C22 跳过：Patches/ 下没有 .patch"
 fi

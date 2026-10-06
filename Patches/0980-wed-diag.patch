@@ -1,12 +1,16 @@
 diff --git a/drivers/net/ethernet/mediatek/mtk_wed.c b/drivers/net/ethernet/mediatek/mtk_wed.c
-index 1ed1f88..6782219 100644
+index 1ed1f88..f37278c 100644
 --- a/drivers/net/ethernet/mediatek/mtk_wed.c
 +++ b/drivers/net/ethernet/mediatek/mtk_wed.c
-@@ -48,6 +48,18 @@
+@@ -48,6 +48,22 @@
  #define MTK_WED_TX_BM_DMA_SIZE		65536
  #define MTK_WED_TX_BM_PKT_CNT		32768
  
-+/* mtk5700-console: one-shot WED link diagnostics */
++/* mtk5700-console: one-shot WED link diagnostics.
++ * Read only from this file.  mtk_wed.h must NOT reference it:
++ * that header is also included by mt7996e.ko, which cannot see
++ * this module's non-exported symbols.
++ */
 +bool wed_debug __read_mostly = true;
 +module_param(wed_debug, bool, 0644);
 +MODULE_PARM_DESC(wed_debug,
@@ -21,11 +25,12 @@ index 1ed1f88..6782219 100644
  static struct mtk_wed_hw *hw_list[3];
  static DEFINE_MUTEX(hw_lock);
  
-@@ -2394,6 +2406,11 @@ mtk_wed_attach(struct mtk_wed_device *dev)
+@@ -2394,6 +2410,12 @@ mtk_wed_attach(struct mtk_wed_device *dev)
  	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
  			 "mtk_wed_attach without holding the RCU read lock");
  
-+	wed_diag("attach enter bus_type=%u pci_domain=%d",
++	wed_diag("attach enter: bus=%u pci_domain=%d "
++		 "(domain>1 means not the WLAN bus)",
 +		 dev->wlan.bus_type,
 +		 dev->wlan.bus_type == MTK_WED_BUS_PCIE ?
 +		 pci_domain_nr(dev->wlan.pci_dev->bus) : -1);
@@ -33,7 +38,17 @@ index 1ed1f88..6782219 100644
  	if ((dev->wlan.bus_type == MTK_WED_BUS_PCIE &&
  	     pci_domain_nr(dev->wlan.pci_dev->bus) > 1) ||
  	    !try_module_get(THIS_MODULE))
-@@ -2408,6 +2425,11 @@ mtk_wed_attach(struct mtk_wed_device *dev)
+@@ -2401,13 +2423,20 @@ mtk_wed_attach(struct mtk_wed_device *dev)
+ 
+ 	rcu_read_unlock();
+ 
+-	if (ret)
++	if (ret) {
++		wed_diag("attach REJECTED before assign (ret=%d)", ret);
+ 		return ret;
++	}
+ 
+ 	mutex_lock(&hw_lock);
  
  	hw = mtk_wed_assign(dev);
  	if (!hw) {
@@ -45,7 +60,19 @@ index 1ed1f88..6782219 100644
  		module_put(THIS_MODULE);
  		ret = -ENODEV;
  		goto unlock;
-@@ -2803,6 +2825,9 @@ void mtk_wed_add_hw(struct device_node *np, struct mtk_eth *eth,
+@@ -2460,7 +2489,11 @@ mtk_wed_attach(struct mtk_wed_device *dev)
+ out:
+ 	if (ret) {
+ 		dev_err(dev->hw->dev, "failed to attach wed device\n");
++		wed_diag("attach FAILED ret=%d", ret);
+ 		__mtk_wed_detach(dev);
++	} else {
++		wed_diag("attach SUCCEEDED: DMA rings + RRO + WED "
++			"hardware path is now in use");
+ 	}
+ unlock:
+ 	mutex_unlock(&hw_lock);
+@@ -2803,6 +2836,9 @@ void mtk_wed_add_hw(struct device_node *np, struct mtk_eth *eth,
  	if (!np)
  		return;
  
@@ -55,7 +82,7 @@ index 1ed1f88..6782219 100644
  	pdev = of_find_device_by_node(np);
  	if (!pdev)
  		goto err_of_node_put;
-@@ -2816,6 +2841,7 @@ void mtk_wed_add_hw(struct device_node *np, struct mtk_eth *eth,
+@@ -2816,6 +2852,7 @@ void mtk_wed_add_hw(struct device_node *np, struct mtk_eth *eth,
  		goto err_put_device;
  
  	rcu_assign_pointer(mtk_soc_wed_ops, &wed_ops);
@@ -64,7 +91,7 @@ index 1ed1f88..6782219 100644
  	mutex_lock(&hw_lock);
  
 diff --git a/drivers/net/ethernet/mediatek/mtk_wed_ops.c b/drivers/net/ethernet/mediatek/mtk_wed_ops.c
-index a5d9d8a..0248102 100644
+index a5d9d8a..bbcff10 100644
 --- a/drivers/net/ethernet/mediatek/mtk_wed_ops.c
 +++ b/drivers/net/ethernet/mediatek/mtk_wed_ops.c
 @@ -4,5 +4,12 @@
@@ -75,26 +102,17 @@ index a5d9d8a..0248102 100644
 +/* mtk5700-console: keep this sole data symbol alive.
 + * This translation unit has no code -- its only product is the
 + * EXPORT_SYMBOL_GPL below -- so the linker is free to garbage
-+ * collect it under --gc-sections, leaving mtk7996e.ko waiting on
++ * collect it under --gc-sections, leaving mt7996e.ko waiting on
 + * an undefined symbol that nothing in vmlinux defines.  __used
 + * pins the section; it does not add a reference to anything.
 + */
 +const struct mtk_wed_ops __rcu __used *mtk_soc_wed_ops;
  EXPORT_SYMBOL_GPL(mtk_soc_wed_ops);
 diff --git a/include/linux/soc/mediatek/mtk_wed.h b/include/linux/soc/mediatek/mtk_wed.h
-index 3fa93bd..6abae98 100644
+index 3fa93bd..c33a36d 100644
 --- a/include/linux/soc/mediatek/mtk_wed.h
 +++ b/include/linux/soc/mediatek/mtk_wed.h
-@@ -228,6 +228,8 @@ struct mtk_wed_ops {
- };
- 
- extern const struct mtk_wed_ops __rcu *mtk_soc_wed_ops;
-+/* mtk5700-console: defined in mtk_wed.c, read from this inline */
-+extern bool wed_debug;
- 
- static inline int
- mtk_wed_device_attach(struct mtk_wed_device *dev)
-@@ -237,10 +239,18 @@ mtk_wed_device_attach(struct mtk_wed_device *dev)
+@@ -237,10 +237,18 @@ mtk_wed_device_attach(struct mtk_wed_device *dev)
  #ifdef CONFIG_NET_MEDIATEK_SOC_WED
  	rcu_read_lock();
  	dev->ops = rcu_dereference(mtk_soc_wed_ops);
@@ -102,14 +120,14 @@ index 3fa93bd..6abae98 100644
 +	if (dev->ops) {
  		ret = dev->ops->attach(dev);
 -	else
-+		if (wed_debug)
-+			pr_info("wed-diag: attach done ret=%d ops=%px\n",
-+				ret, dev->ops);
 +	} else {
-+		if (wed_debug)
-+			pr_info("wed-diag: attach ABORTED -- "
-+				"mtk_soc_wed_ops is NULL, i.e. mtk_wed_ops.o is not "
-+				"linked into vmlinux\n");
++		/* Unconditional and cross-module-reference free: this
++		 * header is inlined into mt7996e.ko too, so it must not
++		 * touch mtk_wed.c's non-exported module parameters.
++		 */
++		pr_info("wed-diag: attach ABORTED -- mtk_soc_wed_ops "
++			"is NULL, i.e. mtk_wed_ops.o is not linked into "
++			"vmlinux (or add_hw has not run yet)\n");
  		rcu_read_unlock();
 +	}
  

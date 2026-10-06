@@ -1,6 +1,62 @@
 # 更新日志
 
-## [2026-10-07 凌晨] 把 WED 补丁正式入库：修掉一个会让编译失败的错误改法
+## [2026-10-07 凌晨 2] WED 补丁 v2：修掉 CI 实测炸掉的 modpost 失败
+
+上一条提交（`eb294c0`）的补丁**经 CI 实测编译失败**（run `37503259547`，
+在 `Compile Firmware` 阶段，烧了 24 分钟）。守卫 C1~C23 全绿却没拦住 ——
+因为它们只查"补丁长什么样"，没查"补丁引入的符号能否被外部模块解析"。
+
+### 失败原因
+
+    ERROR: modpost: "wed_debug" [mt7996/mt7996e.ko] undefined!
+    make[7]: *** [scripts/Makefile.modpost:147: Module.symvers] Error 1
+
+事实链：
+
+- `mtk_wed.c` 编进 **`mtk_eth.ko`**（Makefile 第 8 行 `mtk_eth-y += mtk_wed.o`），
+  `wed_debug` 是它的模块参数，未 EXPORT_SYMBOL。
+- `mtk_wed.h` 被 **`mt7996e.ko`**（mt76 驱动，外部模块）也 include。
+- 头文件里的 `static inline mtk_wed_device_attach()` 是**展开进那个模块**的，
+  于是它去引用 `mt_eth.ko` 里不可见的 `wed_debug`。
+
+铁律：**模块之间不能用未 EXPORT 的变量通信。头文件里新增的任何标识符，
+都必须是所有消费者都能解析的符号。** 我 v1 只想到"符号会不会被 GC"，
+漏了"这个符号在别的模块可见吗"—— 两件事完全不同。
+
+### 修法
+
+头文件里**完全移除** `wed_debug`（不留任何间接引用），只剩一条无条件
+`pr_info`。它只在 probe 时触发一次、不是热路径，量级可忽略。
+其余诊断全部放回 `mtk_wed.c`（那里可以随意读自己的模块参数）。
+
+否决过的替代方案：给 `wed_debug` 加 `EXPORT_SYMBOL_GPL`。
+那会让 `mt7996e.ko` 硬依赖 `mtk_eth.ko` 加载 —— `mtk_eth` 起不来时
+WiFi 直接瘫，对一台要一直在线的 CPE 来说风险远大于当前问题。
+
+### 顺带发现并补上的静默失败点
+
+读真实源码时发现 `mtk_wed_attach()` 里 `if (ret) return ret;`
+（`try_module_get` / `pci_domain > 1` 失败）**完全不打任何日志**，
+是比 `mtk_wed_assign()` 更靠前、也更难猜的失败出口。已补 `wed_diag`。
+
+另外诊断宏 `wed_diag` 定义处的注释现在写明了"头文件不得引用它"及原因，
+避免后人（或未来的我）再犯同一个错。
+
+### 闸门
+
+C22 新增两条断言，把这次的真实故障钉死：
+
+- **C22-e** 头文件 hunk 里不得出现 `wed_debug`（`sed -n '/^diff --git a\/include\/linux\/soc\/mediatek\/mtk_wed\.h/,$p'` 之后不得有 `^+.*\bwed_debug\b`）
+- **C22-f** `wed_debug` 的定义与 `module_param` 必须都还在补丁里
+  （后者是刷机后判定"补丁有没有进固件"的唯一可靠依据
+  `cat /sys/module/mtk_eth/parameters/wed_debug`）
+
+反向变异 6 组（M0 基线 / M10 复现本次故障 / M11 删定义 / M12 删 module_param /
+M13 去 __used / M14 重复链接 / M9 复原），并给变异脚本加了
+**开跑前基准自检**（备份里必须已有 `__used` 且头文件 hunk 必须干净，
+否则直接 ABORT）—— v1 变异脚本就栽在"备份被上一轮污染"上。
+
+## [2026-10-07 凌晨 1] 把 WED 补丁正式入库：修掉一个会让编译失败的错误改法
 
 用户刷了新固件后我上机验收，四条判据（`wed-diag` 日志 / `mtk_soc_wed_ops` 符号 /
 WED 中断 / `attaching wed device`）全部与刷机前一致 —— 无线硬件加速没变化。

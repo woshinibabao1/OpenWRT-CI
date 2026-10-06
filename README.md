@@ -289,6 +289,24 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 > 当前在册：`0980-wed-diag.patch` —— 给 WED 的 `mtk_soc_wed_ops` 加 `__used`
 > 防止它被 `--gc-sections` 丢弃，并附 `wed_debug` 诊断日志。
 > 详见 CHANGELOG 顶部那一节。
+>
+> ⛔ **写内核补丁的两条铁律**（都是本仓实际踩过的，代价各20+ 分钟 CI 时间）：
+>
+> 1. **不要为了「强制链接」去改 Makefile 的 `obj-y` / `mtk_eth-y` 关系。**
+>    `mtk_wed_ops.o` 本来就由 `obj-$(CONFIG_...)` 编进 vmlinux；再加一次到
+>    `mtk_eth-y` ⇒ 同一 `.o` 进两次 ⇒ `EXPORT_SYMBOL_GPL` 的符号定义两次
+>    ⇒ 链接期 `multiple definition`。要钉住符号请用 `__used`。
+> 2. **头文件里不能引用模块内变量。**
+>    `include/linux/soc/mediatek/mtk_wed.h` 会被 `mt7996e.ko`（mt76，**外部模块**）
+>    include，头里的 `static inline` 是**展开进那个模块**的。若在头里
+>    `extern bool wed_debug;`（定义在 `mtk_eth.ko`、未 `EXPORT_SYMBOL`），
+>    MODPOST 阶段直接报
+>    `ERROR: modpost: "wed_debug" [mt7996/mt7996e.ko] undefined!`。
+>    → 头文件里新增的任何标识符，都必须是**所有消费者都能解析**的符号。
+>    → 不要用「加 `EXPORT_SYMBOL_GPL`」来绕过：那会让 `mt7996e.ko` 硬依赖
+>    `mtk_eth.ko` 加载，`mtk_eth` 起不来时 WiFi 直接瘫。
+>
+> 这两条由 `SelfCheck.sh` 的 **C22-e / C22-f** 守着。
 
 得益于 ImmortalWrt 优秀的底包基础，Hiveton H5000M 不仅具备卓越的基础路由性能，还将扩展性推向极致：
 
