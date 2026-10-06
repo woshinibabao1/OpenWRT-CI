@@ -203,8 +203,27 @@ CONFIG_PACKAGE_kmod-tcp-bbr=y
 #   递减 TTL（内核文档：decremented before calling neigh_xmit()），包照发不误 ——
 #   「规则失效 ≠ 断网」。按「唯一重性能、稳定性」的口径接受该失效；
 #   仍想保留 TTL 归一就把编译入口的 FLOW_OFFLOAD 选 off。
+# ★★ full cone NAT：已在用，但**它不是硬件加速**（2026-10-06 实测，概念别再混）
+#   · UCI `firewall.@defaults[0].fullcone = 1`（fullcone6 = 0，即只对 IPv4 生效）
+#   · 内核 `nft_fullcone.ko` 已加载（/lib/modules/6.18.54/，depends nf_conntrack/nf_tables/nf_nat）
+#   · nft 里两条规则已由 fw4 落地：
+#       chain dstnat_wan { meta nfproto ipv4 fullcone comment "!fw4: Handle wan IPv4 fullcone NAT dstnat traffic" }
+#       chain srcnat_wan { meta nfproto ipv4 fullcone comment "!fw4: Handle wan IPv4 fullcone NAT srcnat traffic" }
+#     挂在 `type nat hook prerouting/postrouting` 的 srcnat/dstnat chain 上。
+#   · 它改变的是 **NAT 映射行为**（UDP 端口映射更开放 ⇒ 利于 P2P / 主机发现 / 语音直连），
+#     代价是**仍然由 CPU 走 nft 路径**，一点都不省 CPU，更不是硬件卸载。
+#   · 与 SFO 兼容性：flowtable 在 `hook ingress`，早于 nat prerouting/postrouting，
+#     两者不冲突（实测 SFO 仍正常命中，见 CHANGELOG 2026-10-06 复测章节）。
+#   ⚠️ 用户态 nft v1.1.6 **不认识** fullcone 这个表达式（`nft describe fullcone` 报
+#     `syntax error, unexpected fullcone`），但 `nft -c` 解析规则文件却 rc=0。
+#     ⇒ 结论：**fullcone 只能由 fw4 生成后整表下发**，手工 `nft add rule ... fullcone`
+#       在本机会失败。想调整它只能改 UCI 的 fullcone/fullcone6 再重载防火墙。
+#
 # 硬件卸载（flow_offloading_hw）保持关闭，理由与「缺驱动」无关：
-#   PPE 引擎**已 attach**（dmesg: eth0/eth1: mediatek frame engine at 0xffffffc081900000, irq 67）。
+#   PPE 引擎**已 attach**（dmesg: `eth0/eth1: mediatek frame engine at 0xffffffc0818xxxxx, irq 67`）。
+#   ⚠️ 基址**每次启动都不同**（KASLR）：2026-10-06 两次取证分别读到 0xffffffc081900000 与
+#     0xffffffc081880000 ⇒ **不要把具体地址当事实记进文档**，只认 "frame engine at ... , irq 67"
+#     这个形态。（2026-10-06 曾据此把地址"更正"成 81900000，是错的，同日已撤回。）
 #   真正的卡点是拓扑 —— mtk_ppe_offload.c 的 mtk_flow_set_output_device() 只接受
 #   mtk_soc_eth 自己的 netdev[0..2]，其它设备一律 return -EOPNOTSUPP 且无 fallback；
 #   而 5G WAN 是 eth2（USB CDC-NCM）⇒ 每条 flow 都被拒，命中率≈0。
@@ -239,12 +258,33 @@ CONFIG_PACKAGE_kmod-crypto-hw-safexcel=y
 # 内核模块 - NFT 防火墙
 CONFIG_PACKAGE_kmod-nft-core=y
 CONFIG_PACKAGE_kmod-nft-nat=y
+# ★★ 这里有个容易混淆的同名陷阱，2026-10-06 实测澄清：
+#   「树外的 kmod-nft-fullcone」被禁 ≠ 「设备没有 full cone NAT 能力」。
+#   它们是**两个不同的东西**：
+#
+#   (A) 树外模块包 `kmod-nft-fullcone`（llccd/netfilter-full-cone-nat）
+#       —— 直接补丁 nftables 核心，源码停留在 2023-01-01，未适配 6.18.x，
+#          会让编译失败（exit code 2，Run #31556891052）⇒ 保持 not set。
+#
+#   (B) **主线内核自带的** `nft_fullcone.ko`（net/netfilter/nft_fullcone.c）
+#       —— kernel 6.18 已把 full cone NAT 收进主线，属 kmod-nft-nat 的依赖，
+#          **不需要任何额外包**。实测本机（kernel 6.18.54）：
+#            /lib/modules/6.18.54/nft_fullcone.ko   alias: nft-expr-fullcone
+#            depends: nf_conntrack, nf_tables, nf_nat
+#            lsmod 里 nft_fullcone 已加载（被 nf_nat / nft_tables 引用）
+#          UCI `firewall.@defaults[0].fullcone = 1`，fw4 已落地两条规则：
+#            chain dstnat_wan { meta nfproto ipv4 fullcone }
+#            chain srcnat_wan { meta nfproto ipv4 fullcone }
+#          ⇒ **本机 full cone NAT 本来就是开着的**，不需要动这一行。
+#
+#   ⚠️ 但 (B) **不是硬件加速**：它改的是 NAT 映射行为（UDP 映射更开放 ⇒ 利于
+#     P2P / 主机发现 / 语音直连），仍然由 CPU 走 nft 路径，不省 CPU。
+#     想省 CPU 要的是 flow offload（软件）与 PPE（硬件），与 fullcone 无关。
+#   ⚠️ 用户态 nft v1.1.6 **不认识** fullcone 表达式（`nft describe fullcone` →
+#     `syntax error, unexpected fullcone`），但 `nft -c` 解析规则文件仍 rc=0
+#     ⇒ fullcone 只能由 fw4 生成后整表下发，手工 `nft add rule ... fullcone`
+#       在本机会失败。要调整只能改 UCI 的 fullcone / fullcone6 再重载防火墙。
 # CONFIG_PACKAGE_kmod-nft-fullcone is not set
-# 说明：fullconenat（kmod-nft-fullcone）为树外内核模块，直接补丁 nftables 核心，
-# 其源码（llccd/netfilter-full-cone-nat）停留在 2023-01-01，未适配 immortalwrt master 内核 6.18.x，
-# 导致 OWRT-ALL / X86 在「Compile Firmware」步骤编译失败（exit code 2，Run #31556891052）。
-# 暂时禁用，待上游提供 6.18 兼容版本后取消下行注释即可恢复：
-# CONFIG_PACKAGE_kmod-nft-fullcone=y
 CONFIG_PACKAGE_kmod-nft-offload=y
 CONFIG_PACKAGE_kmod-nft-connlimit=y
 CONFIG_PACKAGE_kmod-nft-tproxy=y

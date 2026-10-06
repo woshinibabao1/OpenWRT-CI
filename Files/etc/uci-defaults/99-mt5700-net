@@ -45,7 +45,8 @@
 #       所以 `grep -c OFFLOAD` 的数字是「此刻多少条目处于已卸载状态」，
 #       不是命中量、也不是命中率。
 #   · 硬件卸载（HFO）：**内核能力在，但本机拓扑命中不了**。
-#     PPE 引擎已 attach（dmesg: `eth0/eth1: mediatek frame engine at 0xffffffc081900000, irq 67`），
+#     PPE 引擎已 attach（dmesg: `eth0/eth1: mediatek frame engine at 0xffffffc0818xxxxx, irq 67`；
+#     ⚠️ 基址每次启动都不同 —— 是 KASLR，别把具体地址当事实，更别写死在任何配置里），
 #     但 `mtk_ppe_offload.c` 的 `mtk_flow_set_output_device()` 只接受
 #     mtk_soc_eth 自己的 netdev[0..2]（映射到 PSE_GDM1/2/3_PORT），
 #     其它设备一律 `return -EOPNOTSUPP`，**无 fallback**。
@@ -55,6 +56,17 @@
 #     ★★ 旁证：`ethtool -k eth2` 显示 rx/tx-checksumming 与 scatter-gather 全
 #       `off [fixed]`、tcp-segmentation-offload 为 off —— USB CDC-NCM 连基础
 #       checksum/TSO 卸载都没有，PPE 就算接上也拿不到可卸载的包形态。
+#   · full cone NAT：**已经在用，但它不是硬件加速**（概念别混，2026-10-06 实测）。
+#     UCI `firewall.@defaults[0].fullcone = 1`（fullcone6 = 0，只对 IPv4）；
+#     内核 nft_fullcone.ko 已加载；fw4 已落地两条规则：
+#       chain dstnat_wan { meta nfproto ipv4 fullcone }
+#       chain srcnat_wan { meta nfproto ipv4 fullcone }
+#     它改的是 **NAT 映射行为**（UDP 映射更开放 ⇒ 利于 P2P / 主机发现 / 语音），
+#     **仍由 CPU 走 nft 路径**，不省 CPU、不是硬件卸载。
+#     与 SFO 不冲突：flowtable 在 hook ingress，早于 nat 的 prerouting/postrouting。
+#     ⚠️ 用户态 nft v1.1.6 不认识 fullcone 表达式（`nft describe fullcone` → syntax error），
+#       只能由 fw4 整表下发；手工 `nft add rule ... fullcone` 在本机会失败，
+#       要调整只能改 UCI 的 fullcone/fullcone6 再重载防火墙。
 #   · 硬件卸载的**真实判据不能看 UCI、也不能看 fw4 的告警**：
 #     fw4 的 `nft_try_hw_offload()` 只用 `nft -c` 做**语法检查**，
 #     而 `flags offload` 在本机（无 PPE）同样 rc=0 ⇒ 恒为假阳性。
