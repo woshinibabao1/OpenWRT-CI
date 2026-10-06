@@ -28,21 +28,43 @@
 #      开：  OFFLOAD 标记 42，3 条长连接全程正常，44.15 MB / 39s 全部收完，无超时无丢包
 #    ⇒ 软件卸载在本机**确定生效且不断网**。
 #
-# 本机硬件加速能力（2026-10-05 三段式取证结论，勿凭旧印象推翻）：
+# 本机硬件加速能力（2026-10-05 三段式取证 + 2026-10-06 复测，勿凭旧印象推翻）：
 #   · 软件卸载（SFO / nf_flow_table）：**可用，已实测生效**。对所有接口有效，
 #     包括 USB 5G WAN，是本机型唯一确定拿得到的加速。
+#     ★★ 判据是**三项组合**（2026-10-06 复测更正，别退回成只看 conntrack 标记）：
+#       ① nft 里存在 flowtable ft，且 devices 含真实出口（本机 = eth2）
+#          —— 实测形态：hook ingress priority filter / devices = { br-lan, eth1, eth2 }
+#       ② 打真实流量后，conntrack 里至少有一条**本次**连接带 [OFFLOAD]
+#       ③ 设备端 eth2 的 rx_bytes 随流量上涨（/sys/class/net/eth2/statistics/rx_bytes）
+#     ★ 为什么必须有 ③：前两次误判（2026-09-21「卸载开就断网」、2026-10-05 首轮）
+#       都是因为开发机双网卡、有线优先，流量根本没经过本机 —— 少了 ③，
+#       ② 很可能是在**另一台路由器**的 conntrack 里数出来的。
+#     ★★ 为什么 ② 不能只看计数：2026-10-06 实测并发 3 路 × 40 MB，sport=59416/59417
+#       各 46 MB 带 [OFFLOAD]，而 sport=59415（45 MB，最大的一条）**没有**标记
+#       —— flow 进快转路径后不再逐个过 conntrack 表，条目形态随生命周期变化。
+#       所以 `grep -c OFFLOAD` 的数字是「此刻多少条目处于已卸载状态」，
+#       不是命中量、也不是命中率。
 #   · 硬件卸载（HFO）：**内核能力在，但本机拓扑命中不了**。
-#     PPE 引擎已 attach（dmesg: `eth0/eth1: mediatek frame engine at 0xffffffc081880000, irq 67`），
+#     PPE 引擎已 attach（dmesg: `eth0/eth1: mediatek frame engine at 0xffffffc081900000, irq 67`），
 #     但 `mtk_ppe_offload.c` 的 `mtk_flow_set_output_device()` 只接受
 #     mtk_soc_eth 自己的 netdev[0..2]（映射到 PSE_GDM1/2/3_PORT），
 #     其它设备一律 `return -EOPNOTSUPP`，**无 fallback**。
 #     而实际出口是 eth2 = 5G 模组（USB CDC-NCM）⇒ 每条 flow 都会被拒。
+#     ★ 2026-10-06 实测三项判据全为零：ppe0/entries = 0 字节、ppe0/bind = 0 字节、
+#       ppe1/entries = 0 字节 ⇒ 没有任何一条 flow 进过硬件转发表。
+#     ★★ 旁证：`ethtool -k eth2` 显示 rx/tx-checksumming 与 scatter-gather 全
+#       `off [fixed]`、tcp-segmentation-offload 为 off —— USB CDC-NCM 连基础
+#       checksum/TSO 卸载都没有，PPE 就算接上也拿不到可卸载的包形态。
 #   · 硬件卸载的**真实判据不能看 UCI、也不能看 fw4 的告警**：
 #     fw4 的 `nft_try_hw_offload()` 只用 `nft -c` 做**语法检查**，
 #     而 `flags offload` 在本机（无 PPE）同样 rc=0 ⇒ 恒为假阳性。
 #     真在用只能看三条同时成立：ppe0/entries 计数涨 + ppe0/bind 非空 + CPU 下降。
 #   · WED（WiFi 侧硬件转发）：胶水层完整（30 个 mtk_wed_* 符号），
-#     但缺固件 blob（官方源只有 mt7981/7986/7988-wo-firmware，无 mt7987）⇒ 开不了。
+#     但缺 MT7987 的 SoC 寄存器表（上游 mtk_wed.c 的 mtk_wed_soc_data 只有
+#     mt7622/mt7986/mt7988 三张，grep '7987' = 0）⇒ 开不了。
+#     ★ 2026-10-06 复测：wed_enable = N 且 dmesg 中 'wed' 出现 0 次（从未 attach）。
+#     ★ 注意本条**不是**「缺固件 blob」（那条已被证伪，见 CHANGELOG 2026-10-06
+#       WiFi 硬件转发取证章节）—— 根因是内核侧没有 MT7987 的 soc_data。
 #
 # ⇒ on-hw 在本机**与 on 实际效果相同**（多写一个 flags offload 而已），
 #   保留该选项仅为将来硬件拓扑变化（WAN 改走有线 eth1）时可用，默认不选。

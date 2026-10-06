@@ -1,5 +1,101 @@
 # 更新日志
 
+## [2026-10-06] 刷机后复测：软件 flow offload 确认生效，硬件侧三项判据全为零
+
+上一节把「WiFi 没有硬件转发」查清了，但那次结论依赖的是 dmesg 与节点存在性。
+本次在**新固件（kernel 6.18.54 / r0-8735c68）**上造真实转发流量复测，
+把三层加速各自的**生效判据**都落到数值上。
+
+### 一、实测方法（这次修正了取证方式）
+
+前几轮踩过的坑这次一并避开：
+- 开发机双网卡，有线 `192.168.8.103`（跃点 25）优先于 Wi-Fi `192.168.10.202`（跃点 30），
+  流量会走另一台路由器 → 这次 **绑定源地址 `192.168.10.202`** 才确保经过 H5000M。
+  （Windows `curl --interface <IP>` 无效，直接失败 `http=000`；改用 Python `socket.bind()`。）
+- 只用国内明文 HTTP 源（`mirrors.tuna.tsinghua.edu.cn`）。`mirrors.aliyun.com` 的
+  80 端口返回 302、443 端口因明文请求返 400，ustc 返 403 —— 都不能当流量源。
+- 并发 3 路 × 40 MB，采样器在设备端 `setsid` 后台跑（设备无 `nohup`，`/tmp` 是 tmpfs）。
+
+### 二、层一：软件 flow offload —— 确认生效
+
+流量证据：设备端 `eth2` 的 `rx_bytes` 从 14883 涨到 138393751（**138 MB**），
+`/proc/interrupts` 的 IRQ 74（xhci USB）从 643 涨到 14698，PC 侧三路各收 40 MB 全部成功。
+
+conntrack 里带 `[OFFLOAD]` 的正是这三条流：
+
+```
+src=192.168.10.202 dst=101.6.15.130 sport=59416 dport=80 packets=15246 bytes=851345
+  src=101.6.15.130 dst=10.27.158.102 sport=80 dport=59416 packets=32584 bytes=46196152 [OFFLOAD]
+src=192.168.10.202 dst=101.6.15.130 sport=59417 dport=80 packets=14054 bytes=778849
+  src=101.6.15.130 dst=10.27.158.102 sport=80 dport=59417 packets=32890 bytes=46700436 [OFFLOAD]
+```
+
+nft 侧形态与 `MODE=on` 一致，且**这次确认了它挂在 ingress**：
+
+```
+flowtable ft { # handle 184
+	hook ingress priority filter
+	devices = { "br-lan", "eth1", "eth2" }
+	counter
+}
+```
+
+UCI 侧 `firewall.@defaults[0].flow_offloading=1` / `flow_offloading_hw=0`，
+`/etc/mt5700/flow-offload` = `MODE=on`，服务是 `/etc/init.d/firewall`（`S19firewall`，
+**没有** `firewall4`）—— 三处一致，没有出现「UCI 写了 1 但 nft 里没有 flowtable」那种假象。
+
+#### ★★ 顺带更正一条会误导人的判据
+
+第三路流（`sport=59415`）传了 **45 MB**，`conntrack` 里留下的是 `[ASSURED]` 而**没有**
+`[OFFLOAD]`，且在流进行中就已经是终态。⇒ **「`grep -c OFFLOAD` 的数字」不能当作
+"卸载命中了多少"的度量** —— 流量最大的一条反而没有标记。原因是 flow 已经进了快转路径、
+后续包不再逐个过 conntrack 表，条目形态随连接生命周期变化。
+
+⇒ 正确判据是**组合式**（本次三项同时成立才算 SFO 真在工作）：
+1. `nft list table inet fw4` 里有 `flowtable ft` 且 `devices` 含出口 `eth2`；
+2. 打真实流量后，`/proc/net/nf_conntrack` 里**至少有一条**本次连接带 `[OFFLOAD]`；
+3. 设备端 `eth2` 的 `rx_bytes` 确实随流量上涨（证明流量真的过了这台路由器）。
+
+第 ③ 条正是本节开头绑定源地址的理由 —— 少了它，第 ② 条可能是在另一台路由器的
+conntrack 里数出来的。
+
+### 三、层二：PPE 硬件 NAT —— 判据全零，且当前拓扑下改不动
+
+```
+ppe0/entries = 0 字节    ppe0/bind = 0 字节    ppe1/entries = 0 字节
+```
+
+三条硬件卸载判据**同时为零**，即没有任何一条 flow 进过硬件转发表。
+引擎本身是在的（`dmesg`: `eth0/eth1: mediatek frame engine at 0xffffffc081900000, irq 67`），
+但 `flow_offloading_hw=0`，且出口是 `eth2`（USB CDC-NCM）。
+
+补充一条本次才拿到的旁证：`ethtool -k eth2` 显示 `rx/tx-checksumming: off [fixed]`、
+`scatter-gather: off [fixed]`、`tcp-segmentation-offload: off` —— USB CDC-NCM 这条链路
+连基本的 checksum/TSO 卸载都标了 `[fixed]`，PPE 就算接上也拿不到可卸载的包形态。
+
+### 四、层三：WED —— 仍然从未 attach
+
+```
+/sys/module/mt7996e/parameters/wed_enable = N
+dmesg | grep -ci wed = 0
+/sys/kernel/debug/wed0/{rxinfo,txinfo,amsdu} = 0 字节
+```
+
+`wed0` 节点与 7 个 debugfs 文件都在（平台设备 probe 成功），但**从未 attach**，
+与上一节「MT7987 缺 `mtk_wed_soc_data`」的结论一致。
+
+### 五、本次未改任何配置
+
+三层状态与 `Config/GENERAL.txt`、`Files/etc/uci-defaults/99-mt5700-net` 里写的
+默认选型（软件开、硬件关）完全吻合，**上游配置无需改动**。本次新增的是一条守卫
+（见下）与上述判据的记录。
+
+### 六、新增守卫 C19
+
+「用 `grep -c OFFLOAD` 的计数当作卸载命中量」这个错误判据，在本仓注释里出现过
+（2026-10-05 那次写的是「开 → OFFLOAD 标记 42」，把计数当成了命中量）。
+C19 禁止再把该计数表述成命中量/命中率，也禁止只凭计数就断言 SFO 生效。
+
 ## [2026-10-06] WiFi 硬件转发加速取证：三层机制逐一查清，全部走不通
 
 起因：刷机验收时注意到 `mt7996e` 模块参数 `wed_enable = N`，而 WED 硬件节点

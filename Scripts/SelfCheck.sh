@@ -24,6 +24,7 @@
 #   C13 Wi-Fi MAC 唯一化守卫（CID 派生 / 不覆盖用户值 / 不重建无线配置）
 #   C14 uci-defaults 幂等性守卫（保留配置升级会重放它们 → 会覆盖用户设置的键必须有标记）
 #   C15 flow offload 默认值四处一致且为 on（该默认值两个月内反转过两次，auto 不得有 TTL 阻断）
+#   C19 软件卸载生效判据必须组合式（flowtable + 至少一条 [OFFLOAD] + 出口计数器上涨）
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -827,6 +828,76 @@ if [ -f Files/etc/mt5700/flow-offload ]; then
 fi
 
 [ "$FAIL" -eq "$N" ] && pass "未声称 WiFi 有硬件转发加速（WED/PPE 在 MT7987 上均不可用）"
+
+# ---------- C19：SFO 生效判据必须是组合式，不许拿 conntrack 计数当命中量 ----------
+# 2026-10-06 真机复测发现一个会误导人的判据（详见 CHANGELOG 同日章节）：
+#
+#   并发 3 路 × 40 MB 下载，PC 侧三路各收 40 MB 全成功、设备端 eth2 rx_bytes
+#   涨了 138 MB ⇒ 流量确实过了本机。其中：
+#     · sport=59416（46 MB 回程）conntrack 带 [OFFLOAD]
+#     · sport=59417（46 MB 回程）conntrack 带 [OFFLOAD]
+#     · sport=59415（45 MB 回程）conntrack 是 [ASSURED]，**没有** [OFFLOAD]，
+#       且在流进行中就已是终态
+#   ⇒ ★ **流量最大的那条反而没有 OFFLOAD 标记**。所以
+#     「`grep -c OFFLOAD /proc/net/nf_conntrack` 的数字」衡量的是
+#     *此刻有多少条目处于已卸载状态*，**不是**「卸载命中了多少」也不是命中率。
+#     原因：flow 一旦进快转路径，后续包不再逐个过 conntrack 表，条目形态
+#     随连接生命周期变化，流量大的连接反而更可能已离开该表。
+#
+# 本仓 2026-10-05 的注释写的「开 → OFFLOAD 标记 42」正是把计数当成了命中量，
+# 本门禁止这种表述继续存在。
+#
+# 正确的判据必须**三项组合**（缺一不可）：
+#   ① nft 里有 flowtable ft 且 devices 含真实出口（本机 = eth2）
+#   ② 打真实流量后 conntrack 里**至少一条**本次连接带 [OFFLOAD]
+#   ③ 设备端 eth2 的 rx_bytes 随流量上涨 ←── 证明流量真的过了这台路由器
+# 第 ③ 条是 2026-10-06 新增的：少了它，② 可能是在**另一台路由器的** conntrack
+# 里数出来的（开发机双网卡，有线优先，tracert 第一跳 192.168.8.1 —— 2026-09/10
+# 两次误判的根因）。
+echo "-- C19 SFO 判据是组合式，不把 conntrack 计数当命中量"
+N=$FAIL
+
+SFO_FILES=$(grep -rln 'OFFLOAD' \
+	--include='*.sh' --include='*.md' --include='*.uc' --include='*.yml' --include='*.txt' --include='99-*' \
+	Files/ Scripts/ Config/ .github/ CHANGELOG.md README.md 2>/dev/null \
+	| grep -v '^Scripts/SelfCheck\.sh$')
+
+BAD_SFO=
+if [ -n "$SFO_FILES" ]; then
+	# ① 禁止把计数与「命中/命中量/命中率/生效 N 条」这类词放在同一行
+	BAD_SFO=$(grep -nE 'OFFLOAD[^。\n]{0,40}(命中|命中量|命中率)|(命中|命中量|命中率)[^。\n]{0,40}OFFLOAD' \
+		$SFO_FILES 2>/dev/null \
+		| grep -v 'CHANGELOG.md' \
+		| grep -vE '^\S+:[0-9]+:[[:space:]]*(#|\*|//)' \
+		| grep -vE '不(是|许|能|该)|不是度量|错误判据|禁止|测得|看起来' || true)
+
+	# ② 禁止只凭 conntrack 计数就断言软件卸载生效（必须提设备端计数器或 flowtable）
+	BAD_SFO2=$(grep -nE '(OFFLOAD|卸载)[^。\n]{0,30}(标记|计数|grep)[^。\n]{0,30}(即|说明|证明|⇒|->|→)[^。\n]{0,20}(生效|命中|有效)' \
+		$SFO_FILES 2>/dev/null \
+		| grep -v 'CHANGELOG.md' \
+		| grep -vE '^\S+:[0-9]+:[[:space:]]*(#|\*|//)' || true)
+	BAD_SFO="$BAD_SFO
+$BAD_SFO2"
+fi
+
+if [ -n "$(echo "$BAD_SFO" | tr -d ' \n')" ]; then
+	echo "$BAD_SFO"
+	fail "C19 有文件把 conntrack 的 OFFLOAD 计数当成了卸载命中量/生效判据。2026-10-06 真机实测反例：并发 3 路 × 40 MB，sport=59416/59417 两条带 [OFFLOAD]（各 46 MB），而 sport=59415（45 MB）**没有** OFFLOAD 标记却是流量最大的一条 —— 因为 flow 进快转路径后不再逐个过 conntrack 表。正确判据必须三项组合：① nft 里 flowtable ft 的 devices 含真实出口 eth2；② 打流量后 conntrack 里至少一条本次连接带 [OFFLOAD]；③ 设备端 eth2 的 rx_bytes 随流量上涨（证明流量真的过了本机，否则可能数的是另一台路由器的表）"
+fi
+
+# ③ 正向要求：既然判据是组合式，那三项里的第 ③ 项（设备端计数器）必须在
+#    本仓讲 SFO 验证的地方出现过至少一次，防止以后只留一句「查 OFFLOAD 标记」。
+#    ⚠️ include 列表里**必须**有 '*.txt'：Config/ 下全是 .txt（GENERAL.txt 等），
+#       漏了它会让本判据恒红 —— 2026-10-06 首次跑就踩了（Config/GENERAL.txt
+#       里明明写着 rx_bytes 判据，却报「本仓已无处提到」）。
+NEED_RXB=$(grep -rlE 'statistics/rx_bytes|statistics/tx_bytes|stat_statistics_rx_bytes' \
+	--include='*.sh' --include='*.md' --include='*.uc' --include='*.txt' \
+	Files/ Scripts/ Config/ 2>/dev/null | grep -v '^Scripts/SelfCheck\.sh$' || true)
+if [ -z "$NEED_RXB" ]; then
+	fail "C19 本仓已无处提到设备端 rx_bytes 计数。SFO 验证的第三项判据（出口网卡计数器随流量上涨）必须留在文档/脚本里 —— 只查 conntrack 的 OFFLOAD 标记会在流量没经过本机时给出假阳性（2026-09/10 两次误判都是这个原因）"
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "SFO 判据是组合式（flowtable 存在 + 至少一条 [OFFLOAD] + 出口计数器上涨）"
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then

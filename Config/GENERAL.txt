@@ -175,15 +175,47 @@ CONFIG_PACKAGE_kmod-tcp-bbr=y
 #     关 → OFFLOAD 标记 0
 #     开 → OFFLOAD 标记 42；3 条长连接全程正常，44.15 MB / 39s 全部收完，无超时无丢包
 #   ⇒ 软件卸载在本机**确定生效且不断网**，是唯一确定拿得到的加速。
+
+# ★★ 2026-10-06 复测更正：上面那句「OFFLOAD 标记 42」**不能当命中量读**。
+#   并发 3 路 × 40 MB（绑定源地址 192.168.10.202，明文源 mirrors.tuna.tsinghua.edu.cn），
+#   设备端 eth2 rx_bytes 从 14883 涨到 138393751（138 MB）、IRQ 74 从 643 涨到 14698，
+#   PC 侧三路各收 40 MB 全成功。conntrack 里：
+#     sport=59416（回程 46 MB）带 [OFFLOAD]
+#     sport=59417（回程 46 MB）带 [OFFLOAD]
+#     sport=59415（回程 45 MB）是 [ASSURED]，**没有** [OFFLOAD]，且流进行中已是终态
+#   ⇒ **流量最大的那条反而没有标记**。flow 一旦进快转路径，后续包不再逐个过
+#     conntrack 表，条目形态随连接生命周期变化 ⇒ `grep -c OFFLOAD` 的数字衡量的是
+#     「此刻有多少条目处于已卸载状态」，不是命中量、更不是命中率。
+#   ⇒ 正确的 SFO 判据必须**三项组合**（守卫 C19 盯着这条）：
+#     ① nft 里存在 flowtable ft，且 devices 含真实出口（本机 = eth2）
+#        —— 实测形态：hook ingress priority filter / devices = { br-lan, eth1, eth2 } / counter
+#     ② 打真实流量后，conntrack 里**至少有一条**本次连接带 [OFFLOAD]
+#     ③ **设备端 eth2 的 rx_bytes 随流量上涨**（读 /sys/class/net/eth2/statistics/rx_bytes）
+#        ←── 这条是 2026-10-06 新增的，也是前两次误判的根治点：
+#        少了它，② 很可能是在**另一台路由器**的 conntrack 里数出来的
+#        （开发机双网卡，有线 192.168.8.103 跃点 25 优先于 Wi-Fi 192.168.10.202 跃点 30）。
+#   ⚠️ 打流取证的两个坑（都实测踩过）：
+#      · Windows 上 `curl --interface <IP>` 无效，直接失败 `http=000`（0.0015s），
+#        必须用 Python `socket.bind(('192.168.10.202', 0))` 绑源地址；
+#      · 国内源里 mirrors.aliyun.com 的 80 返 302、443 因明文请求返 400，
+#        ustc 返 403，只有 mirrors.tuna.tsinghua.edu.cn 的明文 80 可用（438 MB 实测）。
 #   TTL 归一规则失效是真的（快转路径绕过整条 postrouting），但 flowtable 会自行
 #   递减 TTL（内核文档：decremented before calling neigh_xmit()），包照发不误 ——
 #   「规则失效 ≠ 断网」。按「唯一重性能、稳定性」的口径接受该失效；
 #   仍想保留 TTL 归一就把编译入口的 FLOW_OFFLOAD 选 off。
 # 硬件卸载（flow_offloading_hw）保持关闭，理由与「缺驱动」无关：
-#   PPE 引擎**已 attach**（dmesg: eth0/eth1: mediatek frame engine at 0xffffffc081880000, irq 67）。
+#   PPE 引擎**已 attach**（dmesg: eth0/eth1: mediatek frame engine at 0xffffffc081900000, irq 67）。
 #   真正的卡点是拓扑 —— mtk_ppe_offload.c 的 mtk_flow_set_output_device() 只接受
 #   mtk_soc_eth 自己的 netdev[0..2]，其它设备一律 return -EOPNOTSUPP 且无 fallback；
 #   而 5G WAN 是 eth2（USB CDC-NCM）⇒ 每条 flow 都被拒，命中率≈0。
+#   ★ 2026-10-06 复测补齐了硬件侧三项判据的实测值（此前只是推断）：
+#     ppe0/entries = 0 字节、ppe0/bind = 0 字节、ppe1/entries = 0 字节
+#     ⇒ 三条同时为零，没有任何一条 flow 进过硬件转发表。
+#   ★★ 旁证（同日新增，此前没注意）：`ethtool -k eth2` 显示
+#     `rx-checksumming: off [fixed]`、`tx-checksumming: off [fixed]`、
+#     `scatter-gather: off [fixed]`、`tcp-segmentation-offload: off`
+#     —— USB CDC-NCM 这条链路连基础 checksum/TSO 卸载都标了 [fixed]，
+#     PPE 就算接上也拿不到可卸载的包形态。这是比「拓扑不匹配」更靠前的一道墙。
 #   保留 on-hw 选项，待将来 WAN 改走有线 eth1 时可用。
 #   ⚠️ fw4 的 nft_try_hw_offload() 只做 `nft -c` 语法检查（无 PPE 时 flags offload
 #   同样 rc=0）⇒ 恒为假阳性，不会报 falling back。判真在用只能看 ppe0/entries、
