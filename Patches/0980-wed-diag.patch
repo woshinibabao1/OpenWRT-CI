@@ -1,0 +1,117 @@
+diff --git a/drivers/net/ethernet/mediatek/mtk_wed.c b/drivers/net/ethernet/mediatek/mtk_wed.c
+index 1ed1f88..6782219 100644
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -48,6 +48,18 @@
+ #define MTK_WED_TX_BM_DMA_SIZE		65536
+ #define MTK_WED_TX_BM_PKT_CNT		32768
+ 
++/* mtk5700-console: one-shot WED link diagnostics */
++bool wed_debug __read_mostly = true;
++module_param(wed_debug, bool, 0644);
++MODULE_PARM_DESC(wed_debug,
++		      "print one-shot WED link diagnostics (default on)");
++
++#define wed_diag(fmt, ...) \
++	do { \
++		if (wed_debug) \
++			pr_info("wed-diag: " fmt, ##__VA_ARGS__); \
++	} while (0)
++
+ static struct mtk_wed_hw *hw_list[3];
+ static DEFINE_MUTEX(hw_lock);
+ 
+@@ -2394,6 +2406,11 @@ mtk_wed_attach(struct mtk_wed_device *dev)
+ 	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
+ 			 "mtk_wed_attach without holding the RCU read lock");
+ 
++	wed_diag("attach enter bus_type=%u pci_domain=%d",
++		 dev->wlan.bus_type,
++		 dev->wlan.bus_type == MTK_WED_BUS_PCIE ?
++		 pci_domain_nr(dev->wlan.pci_dev->bus) : -1);
++
+ 	if ((dev->wlan.bus_type == MTK_WED_BUS_PCIE &&
+ 	     pci_domain_nr(dev->wlan.pci_dev->bus) > 1) ||
+ 	    !try_module_get(THIS_MODULE))
+@@ -2408,6 +2425,11 @@ mtk_wed_attach(struct mtk_wed_device *dev)
+ 
+ 	hw = mtk_wed_assign(dev);
+ 	if (!hw) {
++		int i;
++
++		wed_diag("assign FAILED, hw_list state:");
++		for (i = 0; i < ARRAY_SIZE(hw_list); i++)
++			wed_diag("  hw_list[%d]=%pK", i, hw_list[i]);
+ 		module_put(THIS_MODULE);
+ 		ret = -ENODEV;
+ 		goto unlock;
+@@ -2803,6 +2825,9 @@ void mtk_wed_add_hw(struct device_node *np, struct mtk_eth *eth,
+ 	if (!np)
+ 		return;
+ 
++	wed_diag("add_hw enter node=%s version=%u offload_version=%u",
++		 np->name, eth->soc->version, eth->soc->offload_version);
++
+ 	pdev = of_find_device_by_node(np);
+ 	if (!pdev)
+ 		goto err_of_node_put;
+@@ -2816,6 +2841,7 @@ void mtk_wed_add_hw(struct device_node *np, struct mtk_eth *eth,
+ 		goto err_put_device;
+ 
+ 	rcu_assign_pointer(mtk_soc_wed_ops, &wed_ops);
++	wed_diag("add_hw exported mtk_soc_wed_ops=%px", &wed_ops);
+ 
+ 	mutex_lock(&hw_lock);
+ 
+diff --git a/drivers/net/ethernet/mediatek/mtk_wed_ops.c b/drivers/net/ethernet/mediatek/mtk_wed_ops.c
+index a5d9d8a..0248102 100644
+--- a/drivers/net/ethernet/mediatek/mtk_wed_ops.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed_ops.c
+@@ -4,5 +4,12 @@
+ #include <linux/kernel.h>
+ #include <linux/soc/mediatek/mtk_wed.h>
+ 
+-const struct mtk_wed_ops __rcu *mtk_soc_wed_ops;
++/* mtk5700-console: keep this sole data symbol alive.
++ * This translation unit has no code -- its only product is the
++ * EXPORT_SYMBOL_GPL below -- so the linker is free to garbage
++ * collect it under --gc-sections, leaving mtk7996e.ko waiting on
++ * an undefined symbol that nothing in vmlinux defines.  __used
++ * pins the section; it does not add a reference to anything.
++ */
++const struct mtk_wed_ops __rcu __used *mtk_soc_wed_ops;
+ EXPORT_SYMBOL_GPL(mtk_soc_wed_ops);
+diff --git a/include/linux/soc/mediatek/mtk_wed.h b/include/linux/soc/mediatek/mtk_wed.h
+index 3fa93bd..6abae98 100644
+--- a/include/linux/soc/mediatek/mtk_wed.h
++++ b/include/linux/soc/mediatek/mtk_wed.h
+@@ -228,6 +228,8 @@ struct mtk_wed_ops {
+ };
+ 
+ extern const struct mtk_wed_ops __rcu *mtk_soc_wed_ops;
++/* mtk5700-console: defined in mtk_wed.c, read from this inline */
++extern bool wed_debug;
+ 
+ static inline int
+ mtk_wed_device_attach(struct mtk_wed_device *dev)
+@@ -237,10 +239,18 @@ mtk_wed_device_attach(struct mtk_wed_device *dev)
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	rcu_read_lock();
+ 	dev->ops = rcu_dereference(mtk_soc_wed_ops);
+-	if (dev->ops)
++	if (dev->ops) {
+ 		ret = dev->ops->attach(dev);
+-	else
++		if (wed_debug)
++			pr_info("wed-diag: attach done ret=%d ops=%px\n",
++				ret, dev->ops);
++	} else {
++		if (wed_debug)
++			pr_info("wed-diag: attach ABORTED -- "
++				"mtk_soc_wed_ops is NULL, i.e. mtk_wed_ops.o is not "
++				"linked into vmlinux\n");
+ 		rcu_read_unlock();
++	}
+ 
+ 	if (ret)
+ 		dev->ops = NULL;

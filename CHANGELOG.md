@@ -1,6 +1,102 @@
 # 更新日志
 
-## [2026-10-06 晚] WED 断因 v3：撤回上一轮「缺内核 CONFIG」的错误结论
+## [2026-10-07 凌晨] 把 WED 补丁正式入库：修掉一个会让编译失败的错误改法
+
+用户刷了新固件后我上机验收，四条判据（`wed-diag` 日志 / `mtk_soc_wed_ops` 符号 /
+WED 中断 / `attaching wed device`）全部与刷机前一致 —— 无线硬件加速没变化。
+追查发现：**补丁此前只躺在本地 `.workbuddy/tmp/`，从未进过仓库**，
+所以「本仓 CI 编出的固件」在定义上就不可能包含它。
+（本轮顺带更正我自己上一次的措辞：说它是「上游原版」是不准确的 ——
+固件确实是最新的、含本仓全部改动，缺的只是这个从未提交的补丁。）
+
+### ★ 一、上一版补丁是**错的**，会直接让编译失败
+
+v1 版补丁改了 `drivers/net/ethernet/mediatek/Makefile`：
+
+```diff
+ obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o     ← 第 12 行，原本就有
++mtk_eth-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o ← 我加的
+```
+
+两行并存 ⇒ 同一个 `mtk_wed_ops.o` 同时进 `vmlinux` 与 `mtk_eth.ko`
+⇒ `EXPORT_SYMBOL_GPL(mtk_soc_wed_ops)` 被定义两次
+⇒ 链接期 **multiple definition** ⇒ **内核阶段编译直接失败**，
+且失败点离根因很远（已烧掉几十分钟）。
+
+**正确做法**：不碰 Makefile 的 `obj-y` / `mtk_eth-y` 关系，
+只给那个唯一的数据符号加 `__used`。对照真实源码确认：
+
+```
+mtk_wed_ops.c 全文只有 5 行（v6.18.54）：
+    const struct mtk_wed_ops __rcu *mtk_soc_wed_ops;
+    EXPORT_SYMBOL_GPL(mtk_soc_wed_ops);
+```
+
+整个单元**没有任何代码**，只有一个数据符号 —— 这正是
+`--gc-sections` 会把它丢掉的形态，也印证了「WED 断因是链接期丢失」这个工作假设的合理性。
+（`__used` = `__attribute__((__used__))`，定义在 `include/linux/compiler_attributes.h:349`。）
+
+### 二、本仓从来没有打补丁的能力，本次新增
+
+CI（`WRT-CORE.yml`）此前**只有** `cat >> .config`，没有任何拷贝/打补丁动作，
+仓库里也没有补丁目录 —— 补丁文件放进仓库也不会生效。
+本次新增：
+
+| 新增 | 作用 |
+| :-- | :-- |
+| `Patches/0980-wed-diag.patch` | 强制 `__used` + `wed_debug` 诊断日志 |
+| `Scripts/ApplyPatches.sh` | 把 `Patches/*.patch` 注入 openwrt 内核补丁队列 |
+| CI 步骤 `Apply Kernel Patches` | 在 `Custom Settings` 之后、`Compile Firmware` 之前调用它 |
+
+`ApplyPatches.sh` 沿用本仓纪律：找不到 `Patches/` 或内核 `patches-*` 目录**直接 `exit 1`**，
+不静默跳过（静默跳过 = CI 全绿但固件里没补丁）。提供 `WRT_PATCHES=off` 一键关。
+
+### ★ 三、诊断补丁要一次编译给出答案
+
+`wed_debug` 默认开（`echo 0 > /sys/module/mtk_eth/parameters/wed_debug` 可关）。
+三种日志对应三种结论：
+
+| 日志表现 | 含义 | 下一步 |
+| :-- | :-- | :-- |
+| 一条都没有 | CONFIG 没生效 | Makefile 改动无用，要去改 config |
+| 有 `add_hw`、无 `attach` | `.o` 确实被 `--gc-sections` 丢掉 | 假设成立，转做真修复 |
+| 有 `add_hw`+`attach`、无 `attaching wed device` | `mtk_wed_assign()` 拒绝 | 新日志会打出 `hw_list[]` 与 version |
+
+### 四、验收清单（刷机后按顺序看，第 1 条最关键）
+
+```sh
+dmesg | grep -i 'wed-diag'                  # 看是上面哪一种
+cat /sys/module/mtk_eth/parameters/wed_debug   # 期望存在（= 补丁确实编进来了）
+grep -c mtk_soc_wed_ops /proc/kallsyms     # 期望 >= 1
+grep -i wed /proc/interrupts               # 期望有条目
+dmesg | grep 'attaching wed device'        # 期望: version 3
+```
+
+★ 第 2 条是「补丁有没有进固件」的**唯一可靠判据**。
+上一轮我曾拿 `uname -a` 的内核构建时间当判据 —— 方向对但理由错
+（内核没重编是因为补丁没改配置，与固件新旧无关）；
+`/etc/openwrt_release` 的 mtime 更不能用，它是 buildroot 基础镜像时间戳。
+
+### 五、变更清单与闸门
+
+- `Patches/`（新）、`Scripts/ApplyPatches.sh`（新）、CI 步骤（新）
+- `Scripts/SelfCheck.sh` 新增 **C22 / C23**：
+  - **C22** 补丁必须用 `__used` 而非重复链接（+ 必须 LF + 必须像内核 diff）
+  - **C23** 注入链完整（`ApplyPatches.sh` 在册 + CI 在 defconfig 后/编译前调用）
+- README 结构树补 `Patches/` 与 `ApplyPatches.sh`（C9 抓到的）；`C1~C10`/`C1~C7` 过期描述更正为 `C1~C21`
+- `.gitattributes` 增 `Patches/** text eol=lf`
+
+⚠️ **风险**：WED 走网卡 DMA 通路，配错会表现为 Wi-Fi 收发异常、掉流甚至看门狗重启。
+务必**保留有线回退路径**，先在有线连接下验证再回归 Wi-Fi。
+
+### 六、本轮两次「自己写错、自己抓出」的记录
+
+1. **补丁会让编译失败**（Makefile 重复链接）—— 提交前对着真实 v6.18.54 源码才发现。
+2. **新闸门 `pass` 永不触发** —— 我把本仓约定的 `N=$FAIL` 写成 `N=$((N + 1))`，
+   于是 `[ "$FAIL" -eq "$N" ]` 恒假，闸门**只会判红、永不显示绿**。
+   若只看「RC=0 全部通过」会被完全骗过 ⇒ 闸门必须用 `set -x` 或直接看输出确认它真在跑。
+
+
 
 上一轮（`27df209` / `2495016`）把 WED 断因写成「内核缺 `CONFIG_NET_MEDIATEK_SOC_WED`」。
 **这条结论本身是错的，本条撤回。** 本轮改用固件的精确上游基底

@@ -19,7 +19,7 @@
 
 | 工作流 | 触发方式 | 作用 |
 | :--- | :--- | :--- |
-| **Guard-Check** | push / PR / 手动 | **编译前的静态自检闸门**（跑 `Scripts/SelfCheck.sh` 的 C1~C10）。秒级反馈，且不占编译的 concurrency 组 |
+| **Guard-Check** | push / PR / 手动 | **编译前的静态自检闸门**（跑 `Scripts/SelfCheck.sh` 的 C1~C21）。秒级反馈，且不占编译的 concurrency 组 |
 | **WRT-BUILD** | 手动 `workflow_dispatch` | 手动编译 / 预览配置。机型与源码已收敛为单一选项，仅 **MT 模式**可选（`MT5700`，唯一在用的模式），默认完整编译并发布固件（`TEST=false`） |
 | **H5000M-MT-AUTO** | 每天随 `Auto-Clean` 完成后自动触发，亦可手动 | 自动并行编译 H5000M 的 **MT5700** 单配置并发布 |
 | **Auto-Clean** | 每天定时 + 手动 | 清理 Release 与 Workflow 运行记录。Release **默认全部清空**；手动触发时勾选 `keep_latest_per_device` 才改为「每个机型保留最新一个」。运行记录保留 30 天 |
@@ -85,8 +85,11 @@ OpenWRT-CI/
 │   ├── ApplyFlowOffload.sh   # flow offload 选型写入固件覆盖层
 │   ├── VerifyNoSingBox.sh    # 编译前后双断言 sing-box / homeproxy 未编入
 │   ├── Handles.sh            # feeds 源码修补（主题配色 / 组件冲突 / 软件页安装行为）
-│   └── Settings.sh           # 默认 IP / 主机名 / Wi-Fi / 主题
-│   └── SelfCheck.sh          # 编译前静态自检（C1~C14，见 CHANGELOG 顶部清单）
+│   ├── Settings.sh           # 默认 IP / 主机名 / Wi-Fi / 主题
+│   ├── SelfCheck.sh          # 编译前静态自检（C1~C21，见 CHANGELOG 顶部清单）
+│   └── ApplyPatches.sh       # 把 Patches/*.patch 注入 openwrt 内核补丁队列（WRT_PATCHES=off 可跳过）
+├── Patches/                  # 内核补丁（★ 必须 LF；行尾错了会在内核阶段才炸）
+│   └── 0980-wed-diag.patch   # WED 诊断 + 强制链接 mtk_wed_ops.o（见 CHANGELOG 顶部）
 ├── LICENSE
 └── README.md
 ```
@@ -267,6 +270,25 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 ---
 
 ## 🛠️ 三、 固件底层组件与扩展支持
+
+> ### 🔧 内核补丁机制（2026-10-07 新增）
+>
+> 本仓是**配置定制仓**，历史上 CI 只做 `cat >> .config`，**没有任何打补丁能力**。
+> 现新增一条完整链路，加补丁要三处齐全：
+>
+> | 位置 | 作用 |
+> | :-- | :-- |
+> | `Patches/*.patch` | 补丁本体（**必须 LF 行尾**，CRLF 会让内核阶段的 patch 匹配失败） |
+> | `Scripts/ApplyPatches.sh` | 把补丁拷进 `target/linux/mediatek/patches-6.18/` |
+> | CI 步骤 `Apply Kernel Patches` | 在 `Custom Settings` 之后、`Compile Firmware` 之前调用它 |
+>
+> ⚠️ **只加文件不改 CI = 补丁是死文件**：固件照编、CI 全绿、刷完机才发现没生效。
+> 这正是 `SelfCheck.sh` 的 **C23** 闸门在守的事。
+> 临时关掉：`WRT_PATCHES=off`（CI 输入里加同名变量即可，不必回滚提交）。
+>
+> 当前在册：`0980-wed-diag.patch` —— 给 WED 的 `mtk_soc_wed_ops` 加 `__used`
+> 防止它被 `--gc-sections` 丢弃，并附 `wed_debug` 诊断日志。
+> 详见 CHANGELOG 顶部那一节。
 
 得益于 ImmortalWrt 优秀的底包基础，Hiveton H5000M 不仅具备卓越的基础路由性能，还将扩展性推向极致：
 

@@ -26,6 +26,8 @@
 #   C15 flow offload 默认值四处一致且为 on（该默认值两个月内反转过两次，auto 不得有 TTL 阻断）
 #   C19 软件卸载生效判据必须组合式（flowtable + 至少一条 [OFFLOAD] + 出口计数器上涨）
 #   C20 WED 断因是内核未链接 mtk_wed_ops.o；不许写成「缺 SoC 表」或「缺内核 CONFIG」
+#   C22 内核补丁必须用 __used 固定符号，绝不在 Makefile 里把 mtk_wed_ops.o 重复链接
+#   C23 补丁注入链完整：ApplyPatches.sh 在册 + CI 在 defconfig 之后、编译之前调用它
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -1057,6 +1059,96 @@ if [ "$C20_WED0_C" -lt 1 ]; then
 fi
 
 [ "$FAIL" -eq "$N" ] && pass "WED 断因未写成「缺 SoC 表」或「缺内核 CONFIG」，四项自证判据均留档"
+
+# ---------- C22：内核补丁必须用 __used，绝不在 Makefile 里重复链接 ----------
+# ★ 这道闸门守的是一个**已经真实踩到过**的坑，不是假想风险。
+#   v1 版补丁在 Makefile 里追加了一行
+#       mtk_eth-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o
+#   而该文件原本已有 obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o（第 12 行）。
+#   两行并存 ⇒ 同一个 .o 同时进 vmlinux 与 mtk_eth.ko ⇒ EXPORT_SYMBOL_GPL 的符号
+#   被定义两次 ⇒ 链接期 multiple definition ⇒ **编译直接失败**，
+#   而且失败在内核编译阶段（已烧掉几十分钟），不是一眼能看出原因的报错。
+#   正确做法：只给那唯一的数据符号加 __used（见 Patches/0980-wed-diag.patch），
+#   不碰 Makefile 的 obj-y / mtk_eth-y 关系。
+# ★ N=$FAIL 是本仓约定（19 处既有闸门全用它）：本闸门开跑前的失败数快照，
+#   末尾 [ "$FAIL" -eq "$N" ] 即「本闸门没有引入新失败」。
+#   我第一版写成了 N=$((N + 1))，结果 pass 永不触发（C22 末尾拿 0 与 1 比），
+#   而 fail 分支仍会写 FAIL —— 于是这道闸门**只会判红、永远不会显示绿**，
+#   差点被我当成"跑过了"。断言必须先验证两个分支都能观察到。
+N=$FAIL
+
+C22_PATCHES="$(ls Patches/*.patch 2>/dev/null || true)"
+if [ -n "$C22_PATCHES" ]; then
+	# C22-a 补丁里不得出现 mtk_eth-$(...)+= mtk_wed_ops.o 这类重复链接
+	C22_DUP="$(grep -lE '^\+.*mtk_eth-\$\(CONFIG_NET_MEDIATEK_SOC_WED\)[[:space:]]*\+=[[:space:]]*mtk_wed_ops\.o' Patches/*.patch 2>/dev/null || true)"
+	if [ -n "$C22_DUP" ]; then
+		fail "C22 $(echo "$C22_DUP" | tr '\n' ' ')里把 mtk_wed_ops.o 又加进了 mtk_eth-y。该文件在 Makefile 第 12 行已由 obj-\$(CONFIG_NET_MEDIATEK_SOC_WED) 编入，再加一次会让 EXPORT_SYMBOL_GPL 的符号被链接两次 ⇒ multiple definition ⇒ 内核阶段编译失败。要强制保留那个符号请用 __used，别动 Makefile"
+	fi
+
+	# C22-b 修复手段必须是 __used，不能只是"动了这行"。
+	#   ★ 反向变异 M2 暴露的弱断言：原来只查 `^\+.*mtk_soc_wed_ops`，
+	#     于是把 __used 去掉、声明还原成原样，仍然算"有改动" ⇒ 判绿。
+	#     守卫必须盯住**手段**（__used），不是"这行被碰过"。
+	if ! grep -qE '^\+const struct mtk_wed_ops __rcu __used \*mtk_soc_wed_ops;' Patches/0980-wed-diag.patch 2>/dev/null; then
+		fail "C22 Patches/0980-wed-diag.patch 里找不到「__used *mtk_soc_wed_ops」这个关键改动。★ 反向变异 M2 证明：只断言「这行被改过」是弱断言 —— 去掉 __used、把声明还原成原样照样判绿。本补丁的全部作用就是用 __used 钉住这个符号以防被 --gc-sections 丢弃，手段变了就等于没修"
+	fi
+
+	# C22-c 补丁必须是 LF。CRLF 会让 patch 阶段的上下文匹配失败，
+	# 而报错出现在内核编译阶段，离根因（行尾）非常远。
+	for P in Patches/*.patch; do
+		[ -e "$P" ] || continue
+		if grep -qU $'\r' "$P"; then
+			fail "C22 $P 含 CRLF 行尾。内核补丁必须是 LF：CRLF 会在 OpenWrt 的 patch 阶段匹配失败，而报错出现在内核编译阶段、离根因很远（.gitattributes 已有 Patches/** text eol=lf，这里是第二道）"
+		fi
+	done
+
+	# C22-d 补丁必须能对上真实内核版本：头几行应含 drivers/ 或 include/ 路径，
+	#   防止把别处的 diff 误放进内核补丁队列。
+	for P in Patches/*.patch; do
+		[ -e "$P" ] || continue
+		grep -qE '^--- a/(drivers|include)/' "$P" || fail "C22 $P 看起来不像内核补丁（没有 --- a/drivers/ 或 --- a/include/ 行）。内核补丁队列里的文件必须能对到内核源码树"
+	done
+
+	[ "$FAIL" -eq "$N" ] && pass "内核补丁用 __used 而非重复链接（无 multiple definition 风险），且为 LF 行尾"
+else
+	echo "  --  C22 跳过：Patches/ 下没有 .patch"
+fi
+
+# ---------- C23：补丁注入链完整（补丁在仓库里 ≠ CI 会用它） ----------
+# ★ 守的是一个真实的结构性缺口：本仓是配置定制仓，历史上 CI **只有** cat >> .config，
+#   没有任何打补丁动作（见 Scripts/ApplyPatches.sh 顶部注释）。
+#   所以「补丁文件进了仓库」并不等于「固件里有补丁」——中间必须有一段注入。
+#   这两处任缺其一，补丁就是死文件：固件照编、CI 全绿、刷完机才发现没生效。
+N=$FAIL
+
+if [ -z "$C22_PATCHES" ]; then
+	echo "  --  C23 跳过：Patches/ 为空，无补丁可注入"
+else
+	[ -f Scripts/ApplyPatches.sh ] || fail "C23 Patches/ 里有补丁，但缺少 Scripts/ApplyPatches.sh。补丁不会被自动注入内核补丁队列（见该脚本顶部：本仓 CI 历史上只做 cat >> .config）"
+
+	C23_WF="$(grep -cF 'Scripts/ApplyPatches.sh' .github/workflows/WRT-CORE.yml 2>/dev/null || true)"
+	if [ "${C23_WF:-0}" -lt 1 ]; then
+		fail "C23 WRT-CORE.yml 里没有调用 Scripts/ApplyPatches.sh。补丁文件因此不会进入内核构建 —— 固件照编、CI 全绿、刷完机才发现补丁根本没生效"
+	fi
+
+	# 注入必须在 defconfig 之后、编译之前
+	C23_POS="$(grep -nE '^\s*- name:' .github/workflows/WRT-CORE.yml 2>/dev/null | grep -nE 'Custom Settings|Apply Kernel Patches|Compile Firmware' || true)"
+	C23_ORDER="$(printf '%s\n' "$C23_POS" | sed -E 's/.*- name:[[:space:]]*//')"
+	C23_CUSTOM="$(printf '%s\n' "$C23_ORDER" | grep -n '^Custom Settings$' | cut -d: -f1 || true)"
+	C23_APPLY="$(printf '%s\n' "$C23_ORDER" | grep -n '^Apply Kernel Patches$' | cut -d: -f1 || true)"
+	C23_COMPILE="$(printf '%s\n' "$C23_ORDER" | grep -n '^Compile Firmware$' | cut -d: -f1 || true)"
+	if [ -z "$C23_APPLY" ]; then
+		fail "C23 WRT-CORE.yml 里找不到名为「Apply Kernel Patches」的步骤"
+	elif [ -z "$C23_CUSTOM" ] || [ -z "$C23_COMPILE" ]; then
+		fail "C23 无法在 WRT-CORE.yml 里定位 Custom Settings / Compile Firmware 两个步骤，注入位置断言失效（步骤被改名？）"
+	elif [ "$C23_APPLY" -le "$C23_CUSTOM" ]; then
+		fail "C23 补丁注入（位置 $C23_APPLY）必须排在 Custom Settings（位置 $C23_CUSTOM）之后 —— target/linux/mediatek 的补丁目录是内核包 prepare 阶段展开的，过早复制会被 prepare 清掉"
+	elif [ "$C23_APPLY" -ge "$C23_COMPILE" ]; then
+		fail "C23 补丁注入（位置 $C23_APPLY）必须排在 Compile Firmware（位置 $C23_COMPILE）之前 —— 否则补丁注入晚于编译，内核里不会有它"
+	fi
+
+	[ "$FAIL" -eq "$N" ] && pass "补丁注入链完整（ApplyPatches.sh 在册 + CI 在 defconfig 之后、编译之前调用）"
+fi
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then

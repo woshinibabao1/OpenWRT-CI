@@ -3,6 +3,12 @@
 
 *.patch text eol=lf
 
+# 内核补丁目录（2026-10-07）：上面的 *.patch 已覆盖，这里再按目录整片声明一次。
+# 理由与 Files/** 那条同源，但危害更隐蔽：CRLF 的补丁进 OpenWrt 的 patch 阶段后，
+# 行尾多一个 \r 会让上下文匹配失败，报错出现在内核编译阶段（离根因很远），
+# 而固件已经编了半小时。按目录声明，将来新增 .patch 自动纳入，不会漏。
+Patches/** text eol=lf
+
 # 固件覆盖层（Files/）：里面既有 .conf / .nft，也有**无扩展名**的 init.d、
 # uci-defaults、hotplug.d 脚本。它们最终在设备上以 shell 执行，一旦是 CRLF，
 # `#!/bin/sh` 会变成 `#!/bin/sh\r` —— 轻则找不到解释器，重则被

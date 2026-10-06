@@ -8,7 +8,7 @@
 #   而下面这些检查全是**仓库本地就能做**的静态检查，独立成 workflow 能秒级反馈，
 #   也不占用编译的 concurrency 组（编译有 345 分钟的超时预算，不该浪费在低级错误上）。
 #
-# 检查项（C1~C7）的说明与出处见 Scripts/SelfCheck.sh，本文件只负责把它跑起来。
+# 检查项（C1~C21）的说明与出处见 Scripts/SelfCheck.sh，本文件只负责把它跑起来。
 #
 # ⚠️ 覆盖边界：本闸门只在 push / PR / 手动时跑。定时链（Auto-Clean → H5000M-MT-AUTO）
 #    触发的编译用的是**已经合入 main** 的配置，那时 push 闸门早已跑过；
@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   selfcheck:
-    name: Static Contracts (C1-C7)
+    name: Static Contracts (C1-C21)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -470,6 +470,18 @@ jobs:
             echo "::warning::CONFIG_TARGET_ALL_PROFILES=y，将编译该平台下全部设备的镜像（与单产物目标不符）"
           fi
 
+      # 内核补丁注入：把本仓 Patches/*.patch 拷进 openwrt 的内核补丁队列。
+      # ★ 本仓历史上没有任何打补丁动作（Custom Settings 只做 cat >> .config），
+      #   所以这一段是新增能力。位置要求：
+      #   - 必须在 make defconfig 之后：target/linux/mediatek 的补丁目录是内核包
+      #     prepare 阶段展开的，过早复制会被 prepare 清掉；
+      #   - 必须在 Compile Firmware 之前。
+      # 出问题时可用 WRT_PATCHES=off 一键跳过，不必回滚提交。
+      - name: Apply Kernel Patches
+        run: |
+          cd ./wrt/
+          bash $GITHUB_WORKSPACE/Scripts/ApplyPatches.sh
+
       # 配置生成后、编译前：验证 MT 模式包选择互斥（双重验证之一）
       - name: Verify MT Mode
         run: |
