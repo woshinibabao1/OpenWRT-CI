@@ -305,6 +305,50 @@ CONFIG_PACKAGE_kmod-nft-xfrm=y
 #
 # ★ 为什么这类包必须随镜像编入，而不能等缺了再 apk add：
 #   kmod-* 的依赖串里带**内核指纹**（形如 `kernel=6.18.52~<build-hash>`）。
+
+# 2026-10-06 晚 ｜ WED（WiFi 硬件转发）断点归因更正 —— 前一版「MT7987 缺 SoC 表」是错的
+#   错因：只 grep 了 mtk_wed_soc_data 的变量名定义（只有 mt7622/7986/7988 三张），
+#         没查 mtk_wed_add_hw() 里 hw->version = eth->soc->version 这个分派依据。
+#   实情：OpenWrt 补丁 750 里 mt7987_data 是 `.version = 3` ⇒ 走 `case 3: hw->soc = &mt7988_data`
+#         ⇒ 寄存器表有，而且 MT7987 落在最完整的 v3 分支上。
+#   旁证：mtk_wed_hw_add_debugfs() 在 switch 之后无条件调用，真机 wed0 debugfs 有 7 个文件
+#         ⇒ add_hw 完整走完、probe 成功，这本身就否掉了「表不存在所以挂不上」。
+#
+#   ★ 真正的断点（符号表级，SelfCheck C20 钉住）：
+#     mtk_soc_wed_ops 是 mt76 拿到 WED 硬件的**唯一**跨模块入口
+#     （mt7996/mmio.c 的 mt7996_mmio_wed_init 里 rcu_dereference 它）。
+#     mtk_wed_ops.c 全文 10 行，职责就是 EXPORT_SYMBOL_GPL(mtk_soc_wed_ops)，
+#     由 Makefile 第 12 行 `obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o` 决定。
+#     真机四项实测：mtk_soc_wed_ops 在 kallsyms 里 0 命中；
+#     mtk_wed_attach 是小写 t（未 EXPORT），对照组 mtk_wed_wo_init 是大写 T（已 EXPORT）；
+#     系统无 mtk_wed.ko（mtk_wed 全内建于 vmlinux）。
+#     ⇒ 单独掉的是 mtk_wed_ops.o，不是「MT7987 没 WED 实现」。
+#     Kconfig 里 CONFIG_NET_MEDIATEK_SOC_WED 是 `def_bool NET_MEDIATEK_SOC != n`
+#     —— 自动派生、不可手动赋值；而本机 NET_MEDIATEK_SOC=y（内建），
+#     于是出现「mtk_wed.o 在、mtk_wed_ops.o 不在」的组合。
+#
+#   wed_enable 是**主线内核自带**的 module_param（mt7996/mmio.c 第 17-18 行，
+#   不是 OpenWrt 补丁），它门控 mt7996_mmio_wed_init()，而该函数第一步就
+#   rcu_dereference(mtk_soc_wed_ops) ⇒ 接口缺失时直接失败返回，参数写 Y 也无用。
+#   实测三处：sysfs 直写可写；改 /etc/modules.d/mt7996e 带参数 modprobe 仍读回 N
+#   （procd 按 modules.d 重载覆盖）；dmesg | grep -ic wed = 0（一次 attach 都没试）。
+#
+#   修复需两处同时成立：① 内核 config 显式 CONFIG_NET_MEDIATEK_SOC_WED=y 后重编固件
+#   ② /etc/modules.d/mt7996e 写 `mt7996e wed_enable=1`。
+#   验收三项缺一不可：kallsyms 有 mtk_soc_wed_ops；dmesg 有 "attaching wed device"；
+#   /sys/kernel/debug/wed0/rxinfo 的字节数不再是 0。
+#
+#   ★ 同时撤掉旧结论「MT7992 的 WED 必绑 PPE」：mtk_wed_wo.c 全文零 PPE 引用，
+#     mtk_wed_wo_init() 只做 wo_hardware_init + mcu_init + exception_init；
+#     mtk_wed.c 里唯一碰 PPE 的是 mtk_wed_ppe_check() —— void 返回的数据面回调
+#     （仅当 PPE 报 HIT_UNBIND_RATE_REACHED 时把包还给软件栈），attach 路径根本不调它。
+#     ⇒ PPE 有无不影响 WED attach 成功。
+#
+#   与硬件 NAT（flow_offloading_hw）的关系：WED 修好也**不等于** PPE 硬件 NAT 可用。
+#   5G 出口是 USB CDC-NCM 的 eth2，其 hw-tc-offload 为 `off [fixed]`（内核写死），
+#   mtk_flow_set_output_device() 拿不到 mtk_soc_eth 或 WED 产生的 DEV_PATH_MTK_WDMA
+#   ⇒ 仍返回 -EOPNOTSUPP。WED 的收益是 WiFi↔以太网的 DMA 直通，不是 NAT 硬件化。
+
 #   本固件是自编译内核（`cat /proc/version` 里带我们自己 runner 的 build 号），
 #   在线仓库里的同名 kmod 是给官方内核编的 —— 装上去要么被 apk 直接拒绝，
 #   要么装上因 vermagic 不一致而 modprobe 失败（症状：包在、功能没有）。

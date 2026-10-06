@@ -25,6 +25,7 @@
 #   C14 uci-defaults 幂等性守卫（保留配置升级会重放它们 → 会覆盖用户设置的键必须有标记）
 #   C15 flow offload 默认值四处一致且为 on（该默认值两个月内反转过两次，auto 不得有 TTL 阻断）
 #   C19 软件卸载生效判据必须组合式（flowtable + 至少一条 [OFFLOAD] + 出口计数器上涨）
+#   C20 WED 断点归因必须写成「内核缺 CONFIG」，不许再写成「MT7987 缺 SoC 表」
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -744,20 +745,41 @@ fi
 
 [ "$FAIL" -eq "$N" ] && pass "TTL 归一链是独立的 postrouting base chain 且用 \$wan_devices"
 
-# ---------- C18：WiFi 硬件转发加速「不可用」这个结论不许被静默推翻 ----------
+# ---------- C18：WiFi 硬件转发加速「当前不可用」这个结论不许被静默推翻 ----------
+# 注意：结论是「当前固件下不可用」，原因 2026-10-06 已从「缺 SoC 表」更正为「缺内核 CONFIG」。
+#       若日后重编固件开了 CONFIG_NET_MEDIATEK_SOC_WED 并实测 attach 成功，**可以**推翻本结论，
+#       但必须同时给出 kallsyms 里有 mtk_soc_wed_ops 且 dmesg 有 attaching wed device 两项证据。
 # 2026-10-06 真机取证结论（每一层都有代码/命令级证据，见 CHANGELOG 同日章节）：
 #
 # 【层一】WED（WiFi DMA ↔ 以太网 MAC 直通，绕过 CPU）
 #   硬件节点齐（/sys/kernel/debug/wed0 有 7 个文件）、平台设备 15010000.wed probe 成功
 #   （uevent 里 OF_COMPATIBLE_0=mediatek,mt7987-wed）、驱动符号 130 个且地址非零
 #   （mt7996_mmio_wed_init / mt7996_wed_init_buf / mt76_wed_dma_setup …）
-#   ⇒ **看起来全都在，只差没开**。但上游 torvalds/linux 的 mtk_wed.c 里
-#      `mtk_wed_soc_data` 只有 mt7622_data / mt7986_data / mt7988_data 三张，
-#      `grep -c "7987"` = **0** —— MT7987 没有 SoC 寄存器表，
-#      mtk_wed_device_attach() 无从挂载。
-#   ★ 实测 `echo 1 > /sys/module/mt7996e/parameters/wed_enable` 写入成功、读回 Y，
-#     但 wed0 下 rxinfo/txinfo/amsdu 仍全 0 字节、dmesg 无 attach 日志。
-#     ⇒ 「参数能写」不等于「生效」，何况它只在 probe 时读一次。
+#   ⇒ 硬件层完好。**但 2026-10-06 晚间更正了本门早先的归因**（见下）：
+#     先前写「MT7987 缺 SoC 寄存器表（grep 7987 = 0）」是**错的**。
+#     真机证据：`mtk_wed_add_hw()` 的 switch 取 `hw->version = eth->soc->version`，
+#     而 OpenWrt 补丁 750-net-ethernet-mtk_eth_soc-add-mt7987-support.patch 里
+#     mt7987_data 明确是 `.version = 3` ⇒ 走 `case 3: hw->soc = &mt7988_data`，
+#     寄存器表**有**，且 MT7987 在 v3 分支上比 v1/v2 路径更完整。
+#     probe 成功也印证了这点：mtk_wed_hw_add_debugfs() 在 switch 之后无条件调用，
+#     wed0 debugfs 存在即证明 add_hw 走完了全程。
+#
+#   ★ 真正的断点（2026-10-06 21:3x 符号表级取证）：
+#     mt76 侧拿到 WED 硬件的**唯一**入口是全局指针 `mtk_soc_wed_ops`
+#     （mt7996/mmio.c 的 mt7996_mmio_wed_init 里 `rcu_dereference(mtk_soc_wed_ops)`）。
+#     而该符号的唯一定义点 drivers/net/ethernet/mediatek/mtk_wed_ops.c
+#     **全文 10 行**，唯一职责是 EXPORT_SYMBOL_GPL(mtk_soc_wed_ops)；
+#     Makefile 第 12 行 `obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o`
+#     决定它是否被编入。
+#     真机实测：`grep mtk_soc_wed_ops /proc/kallsyms` = **0 命中（符号不存在）**，
+#     且 `mtk_wed_attach` 在 kallsyms 里是**小写 t**（未 EXPORT），
+#     而 `mtk_wed_wo_init` 是大写 T（已 EXPORT）——对比即证明
+#     mtk_wed_ops.o 单独掉了，而 mtk_wed.o 仍在。
+#     ⇒ 断点是**内核编译配置**，不是硬件不支持、不是 SoC 表缺失、不是开关没翻。
+#       修复方向：内核 config 显式 CONFIG_NET_MEDIATEK_SOC_WED=y 重编固件，
+#       再让 /etc/modules.d/mt7996e 带上 wed_enable=1（两处缺一不可）。
+#     ★ 但本仓不写这个开关：C18 守的是「翻开关≠能加速」，
+#       而在缺 CONFIG 之前翻了也无效（参数能写、读回 Y，attach 仍不发生）。
 #
 # 【层二】PPE 硬件 NAT
 #   mtk_ppe_offload.c 的 mtk_flow_set_output_device() 确实**预留了** WiFi 分支
@@ -806,7 +828,7 @@ BAD_WED=$(
 )
 if [ -n "$BAD_WED" ]; then
 	echo "$BAD_WED"
-	fail "C18 有脚本/配置在动 wed_enable。上游 mtk_wed.c 的 mtk_wed_soc_data 只有 mt7622/mt7986/mt7988 三张，grep '7987' = 0 —— MT7987 无 SoC 寄存器表，mtk_wed_device_attach() 挂不上。实测把 wed_enable 写成 Y 之后 wed0 下 rxinfo/txinfo/amsdu 仍全 0 字节、dmesg 无任何 attach 日志。真要启用必须先给内核加 mt7987_data（并同步 mt76 侧，见 CHANGELOG 2026-10-06 章节），不是翻一个开关"
+	fail "C18 有脚本/配置在动 wed_enable。归因已更正（2026-10-06 晚间）：MT7987 **不缺** SoC 寄存器表 —— 补丁 750 里 mt7987_data 是 .version=3，走 case 3 拿 mt7988_data，probe 也成功了（wed0 debugfs 即证据）。真正断点是内核未编入 mtk_wed_ops.o：mt76 唯一入口 mtk_soc_wed_ops 在 /proc/kallsyms 里 0 命中，mtk_wed_attach 是小写 t（未 EXPORT）而 mtk_wed_wo_init 是大写 T。先开 CONFIG_NET_MEDIATEK_SOC_WED=y 重编固件，才轮到 wed_enable=1；在此之前翻开关无效（实测能写能读回 Y，attach 仍不发生）"
 fi
 
 # ② 不得声称 flowtable 里的 WiFi 接口代表硬件卸载真的在跑
@@ -824,10 +846,10 @@ fi
 # ③ 硬件卸载开关必须仍是 0（本机 5G 出口是 USB CDC-NCM，PPE 接不到）
 if [ -f Files/etc/mt5700/flow-offload ]; then
 	grep -qx 'MODE=on' Files/etc/mt5700/flow-offload \
-		|| fail "C18 Files/etc/mt5700/flow-offload 的默认值变了。必须是 \`MODE=on\`（纯软件卸载）；**不要**改成 on-hw 或引入硬件卸载开关 —— 本机 5G 出口是 USB CDC-NCM（eth2），WiFi 侧又因 MT7987 缺 WED soc_data 进不了 PPE，两个方向都没有硬件卸载可用（2026-10-06 取证）"
+		|| fail "C18 Files/etc/mt5700/flow-offload 的默认值变了。必须是 \`MODE=on\`（纯软件卸载）；**不要**改成 on-hw 或引入硬件卸载开关 —— 本机 5G 出口是 USB CDC-NCM（eth2，ethtool -k 的 hw-tc-offload 是 off [fixed]），WiFi 侧则因内核缺 CONFIG_NET_MEDIATEK_SOC_WED（mtk_soc_wed_ops 符号不存在）进不了 PPE，两个方向都没有硬件卸载可用（2026-10-06 取证）"
 fi
 
-[ "$FAIL" -eq "$N" ] && pass "未声称 WiFi 有硬件转发加速（WED/PPE 在 MT7987 上均不可用）"
+[ "$FAIL" -eq "$N" ] && pass "未声称 WiFi 有硬件转发加速（断点是内核缺 CONFIG_NET_MEDIATEK_SOC_WED，非 SoC 表缺失）"
 
 # ---------- C19：SFO 生效判据必须是组合式，不许拿 conntrack 计数当命中量 ----------
 # 2026-10-06 真机复测发现一个会误导人的判据（详见 CHANGELOG 同日章节）：
@@ -898,6 +920,83 @@ if [ -z "$NEED_RXB" ]; then
 fi
 
 [ "$FAIL" -eq "$N" ] && pass "SFO 判据是组合式（flowtable 存在 + 至少一条 [OFFLOAD] + 出口计数器上涨）"
+
+
+# ---------- C20：WED 断点归因必须是「内核缺 CONFIG」，不是「MT7987 缺 SoC 表」 ----------
+# 2026-10-06 21:3x 符号表级取证后的更正。C18 的立论前提（「MT7987 没有 SoC 寄存器表，
+# 因为 upstream mtk_wed.c 里 grep 7987 = 0」）是错的，若不钉死会让人继续往「给内核加
+# mt7987_data 表」这个方向钻 —— 而那张表本来就有（mt7987_data，version=3）。
+#
+# 正确断点（三项都要成立，缺一不可）：
+#   ① CONFIG_NET_MEDIATEK_SOC_WED 未生效 ⇒ mtk_wed_ops.o 没编入
+#      （Makefile 第 12 行 obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o）
+#   ② mtk_soc_wed_ops 符号不存在（真机 kallsyms 0 命中）
+#      —— 这是 mt76 唯一的跨模块入口（mt7996_mmio_wed_init 里 rcu_dereference 它）
+#   ③ mtk_wed_attach 是小写 t（未 EXPORT），对照组 mtk_wed_wo_init 是大写 T（已 EXPORT）
+#      ⇒ 单独掉的是 ops 单元，不是整个 WED（mtk_wed.o 仍在，硬件层正常）
+#
+# 本门的作用：防止把更正前的错误归因重新写回文档/注释，并强制留存
+# 「怎么自证」的判据（不能只写一句「不可用」）。
+echo "-- C20 WED 断点归因是内核缺 CONFIG，不是缺 SoC 表；自证判据在册"
+N=$FAIL
+
+# ① 不得把断因写成「缺 SoC 寄存器表 / 缺 mt7987_data 表」
+#    放行：留档段落（删除线 / 「已被推翻」 / 「是错的」 / 「不是」 /
+#          「禁止把断因」……）、Markdown 引述行（> 开头）。
+#
+#    ★ 必须分两组扫（合并扫 + 排除 # 开头行会漏掉最要守的地方）：
+#      - 文档/配置类（md/txt/yml）：Config/GENERAL.txt **整个文件都是 # 注释**，
+#        一旦排除 # 开头行，等于把该文件整片放行。
+#        （反向验证的变异 1 就是这么漏的。）
+#      - 脚本类（sh/uc/99-*）：# 开头的确实是代码注释且很多，才排除。
+PAT_CAUSE='(缺|没有|无)[[:space:]]*(MT7987|mt7987)?[[:space:]]*(的)?[[:space:]]*(SoC|soc)[[:space:]]*(寄存器)?[[:space:]]*表'
+ALLOW_CAUSE='~~|已被推翻|是错的|错在|重新查了一遍|结论：那条归因|以前|原本|当时|错因|前版|禁止把断因|不声称|那条归因是错|不是'
+	DOC_CAUSE=$(
+		grep -rnE "$PAT_CAUSE" --include='*.md' --include='*.txt' --include='*.yml' Config/ .github/ CHANGELOG.md README.md 2>/dev/null | \
+		sed 's/^[^:]*:[0-9]*:[[:space:]]*//' | \
+		grep -vE '^[[:space:]]*>' | \
+		grep -vE "$ALLOW_CAUSE" || true
+	)
+	# ①b 脚本类：# 开头的确实是代码注释且很多，才排除
+	SH_CAUSE=$(
+		grep -rnE "$PAT_CAUSE" --include='*.sh' --include='*.uc' --include='99-*' Files/ Scripts/ 2>/dev/null | \
+		grep -v '^Scripts/SelfCheck\.sh:' | \
+		sed 's/^[^:]*:[0-9]*:[[:space:]]*//' | \
+		grep -vE '^[[:space:]]*#' | \
+		grep -vE '^[[:space:]]*>' | \
+		grep -vE "$ALLOW_CAUSE" || true
+	)
+	WRONG_CAUSE=$(printf '%s\n%s\n' "$DOC_CAUSE" "$SH_CAUSE")
+if [ -n "$WRONG_CAUSE" ]; then
+	echo "$WRONG_CAUSE"
+	fail "C20 有文本把 WED 断因写成「MT7987 缺 SoC 寄存器表」。这是 2026-10-06 已被推翻的归因：mt7987_data 存在于补丁 750 且 .version=3，走 case 3 拿 mt7988_data，probe 也成功（wed0 debugfs 即证）。正确断点是内核未编入 mtk_wed_ops.o ⇒ 唯一跨模块入口 mtk_soc_wed_ops 在 kallsyms 里 0 命中"
+fi
+
+# ② 断因判据必须在册：三项自证要素**各至少有一处**留痕
+#    ① mtk_soc_wed_ops（mt76 唯一跨模块入口）② CONFIG_NET_MEDIATEK_SOC_WED
+#    ③ mtk_wed_ops.o（未编入的唯一 EXPORT 单元）
+#
+#    ★ 每条 grep 都写成**单行**（不用续行符）：续行与 | 混用时容易把
+#      路径列表变成管道右侧的待执行命令，而报错被 2>/dev/null 吞掉 →
+#      变量恒空 → 本项永远不触发（空转）。include 必须含 '*.txt'
+#      （Config/GENERAL.txt 才是记这些结论的地方）。
+
+C20_HIT_mtk_soc_wed_ops=$(grep -rlF 'mtk_soc_wed_ops' --include='*.sh' --include='*.md' --include='*.uc' --include='*.txt' --include='*.yml' --include='99-*' Files/ Scripts/ Config/ .github/ CHANGELOG.md README.md 2>/dev/null | grep -v '^Scripts/SelfCheck\.sh$')
+if [ -z "$C20_HIT_mtk_soc_wed_ops" ]; then
+	fail "C20 本仓已无处记录自证判据「mtk_soc_wed_ops」。WED 不可用的正确断因是内核未编入 mtk_wed_ops.o ⇒ CONFIG_NET_MEDIATEK_SOC_WED 未生效 ⇒ 唯一跨模块入口 mtk_soc_wed_ops 在 kallsyms 里 0 命中。这三项必须留在文档/脚本里，否则下一个人又会重复「给 MT7987 加 SoC 表」的错误方向"
+fi
+
+C20_HIT_CONFIG_NET_MEDIATEK_SOC_WED=$(grep -rlF 'CONFIG_NET_MEDIATEK_SOC_WED' --include='*.sh' --include='*.md' --include='*.uc' --include='*.txt' --include='*.yml' --include='99-*' Files/ Scripts/ Config/ .github/ CHANGELOG.md README.md 2>/dev/null | grep -v '^Scripts/SelfCheck\.sh$')
+if [ -z "$C20_HIT_CONFIG_NET_MEDIATEK_SOC_WED" ]; then
+	fail "C20 本仓已无处记录自证判据「CONFIG_NET_MEDIATEK_SOC_WED」。WED 不可用的正确断因是内核未编入 mtk_wed_ops.o ⇒ CONFIG_NET_MEDIATEK_SOC_WED 未生效 ⇒ 唯一跨模块入口 mtk_soc_wed_ops 在 kallsyms 里 0 命中。这三项必须留在文档/脚本里，否则下一个人又会重复「给 MT7987 加 SoC 表」的错误方向"
+fi
+
+C20_HIT_mtk_wed_ops=$(grep -rlF 'mtk_wed_ops' --include='*.sh' --include='*.md' --include='*.uc' --include='*.txt' --include='*.yml' --include='99-*' Files/ Scripts/ Config/ .github/ CHANGELOG.md README.md 2>/dev/null | grep -v '^Scripts/SelfCheck\.sh$')
+if [ -z "$C20_HIT_mtk_wed_ops" ]; then
+	fail "C20 本仓已无处记录自证判据「mtk_wed_ops」。WED 不可用的正确断因是内核未编入 mtk_wed_ops.o ⇒ CONFIG_NET_MEDIATEK_SOC_WED 未生效 ⇒ 唯一跨模块入口 mtk_soc_wed_ops 在 kallsyms 里 0 命中。这三项必须留在文档/脚本里，否则下一个人又会重复「给 MT7987 加 SoC 表」的错误方向"
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "WED 断因归到内核缺 CONFIG_NET_MEDIATEK_SOC_WED，且自证判据（mtk_soc_wed_ops）留档"
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then

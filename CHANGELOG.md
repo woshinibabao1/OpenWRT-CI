@@ -1,5 +1,113 @@
 # 更新日志
 
+## [2026-10-06 晚] WED 断点归因最终更正：不是「缺 SoC 表」，是内核缺 CONFIG
+
+起因：被要求「打破固有认知」去查 WiFi 硬件加速，于是把上一轮当成定论的
+「MT7987 缺 SoC 寄存器表」重新查了一遍。**结论：那条归因是错的**，已推翻。
+
+### 一、错在哪
+
+上一轮只 grep 了 `mtk_wed_soc_data` 的**变量名定义**，看到只有
+mt7622_data / mt7986_data / mt7988_data 三张，就断定 MT7987 没有表。
+但 `mtk_wed_add_hw()` 并不查表名，它按 **version 数字**分派：
+
+```c
+hw->version = eth->soc->version;
+switch (hw->version) {
+case 2:  hw->soc = &mt7986_data; break;
+case 3:  hw->soc = &mt7988_data; break;
+default:
+case 1:  hw->mirror = syscon_regmap_lookup_by_phandle(eth_np, "mediatek,pcie-mirror");
+        hw->hifsys = syscon_regmap_lookup_by_phandle(eth_np, "mediatek,hifsys");
+        ... hw->soc = &mt7622_data; break;
+}
+```
+
+而 OpenWrt 补丁 `750-net-ethernet-mtk_eth_soc-add-mt7987-support.patch` 里
+**mt7987_data 明确写着 `.version = 3`** ⇒ MT7987 走 `case 3`，拿到 `mt7988_data`。
+
+**旁证**：`mtk_wed_hw_add_debugfs(hw)` 是在 switch **之后**无条件调用的，
+而真机 `/sys/kernel/debug/wed0/` 有 7 个文件（amsdu / regidx / regval / rro /
+rtqm / rxinfo / txinfo）⇒ `mtk_wed_add_hw()` 完整走完了，probe 成功。
+这本身就否定了「表不存在所以挂不上」。
+
+### 二、真正的断点（符号表级取证）
+
+mt76 拿到 WED 硬件的**唯一**入口是全局指针 `mtk_soc_wed_ops`
+（`mt7996/mmio.c` 的 `mt7996_mmio_wed_init()` 里 `rcu_dereference(mtk_soc_wed_ops)`）。
+该符号的唯一编译单元 `mtk_wed_ops.c` **全文 10 行**：
+
+```c
+const struct mtk_wed_ops __rcu *mtk_soc_wed_ops;
+EXPORT_SYMBOL_GPL(mtk_soc_wed_ops);
+```
+
+由 `drivers/net/ethernet/mediatek/Makefile` 第 12 行决定是否编入：
+`obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o`
+
+真机四处实测互相印证：
+
+| 检查项 | 结果 | 说明 |
+| :-- | :-- | :-- |
+| `grep mtk_soc_wed_ops /proc/kallsyms` | **0 命中** | 唯一跨模块入口不存在 |
+| `mtk_wed_attach` in kallsyms | 小写 **`t`** | 未 EXPORT |
+| `mtk_wed_wo_init` in kallsyms | 大写 **`T`** | 已 EXPORT（对照组） |
+| 系统里有没有 `mtk_wed.ko` | **没有** | mtk_wed 全内建于 vmlinux |
+
+⇒ 单独掉的只有 `mtk_wed_ops.o`，`mtk_wed.o` 仍在内核里。
+**这就是「硬件层看起来完好、但 mt76 拿不到接口」的原因。**
+
+### 三、为什么 `wed_enable=Y` 无效
+
+`wed_enable`（`mt7996/mmio.c` 第 17-18 行 `module_param(wed_enable, bool, 0644)`，
+且是**主线内核自带**，非 OpenWrt 补丁）门控的是 `mt7996_mmio_wed_init()`，
+该函数在 `#ifdef CONFIG_NET_MEDIATEK_SOC_WED` 内、且第一步就
+`rcu_dereference(mtk_soc_wed_ops)` —— 接口不存在，函数直接失败返回。
+**参数能写、读回 `Y`，但永远不会走到 `mtk_wed_attach()`。**
+实测三处都验证过：sysfs 直写有效；`/etc/modules.d/mt7996e` 改成
+`mt7996e wed_enable=1` 后带参数 `modprobe` 仍读回 `N`（procd 按 modules.d 重载覆盖）；
+`dmesg | grep -ic wed` = 0（连一次 attach 都没尝试）。
+
+### 四、修复方向（两处缺一不可）
+
+1. **内核 config 显式 `CONFIG_NET_MEDIATEK_SOC_WED=y`**，让 `mtk_wed_ops.o` 进内核。
+   注意 Kconfig 里它是 `def_bool NET_MEDIATEK_SOC != n`（**自动派生、不可手动赋值**），
+   而本机 `NET_MEDIATEK_SOC` 选的是 `y`（内建，系统里没有 `mtk_eth.ko`）。
+   这就是「mtk_wed.o 在、mtk_wed_ops.o 不在」的机制。
+   → 需改内核 config 并重编固件，**属于固件构建变更**。
+2. **`/etc/modules.d/mt7996e` 写 `mt7996e wed_enable=1`**，让 procd 带参数加载。
+
+验收判据（三项，缺一不可）：
+- `grep mtk_soc_wed_ops /proc/kallsyms` 命中
+- `dmesg | grep "attaching wed device"` 有输出
+- `wc -c /sys/kernel/debug/wed0/rxinfo` 不再是 0
+
+### 五、同时撤掉的一个错误论断
+
+此前记忆里记着「MT7992 的 WED 必绑 PPE（`mtk_wed_wo_init()` 末段
+`mtk_wed_get_rx_capa()` 为真 ⇒ 进 `mtk_wed_wo_init()` ⇒ 需 PPE）」。
+**不成立**：`mtk_wed_wo.c` 全文**零 PPE 引用**，`mtk_wed_wo_init()` 只做
+`wo_hardware_init + mcu_init + exception_init`；`mtk_wed.c` 里唯一碰 PPE 的
+是 `mtk_wed_ppe_check()` —— 一个 `void` 返回的数据面回调（只有 PPE 报
+`MTK_PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED` 时才把包还给软件栈），
+**attach 路径根本没调用它**。PPE 有无不影响 WED attach 成功。
+
+### 六、守卫
+
+- **C18 改写归因**并放宽结论措辞（「当前不可用」而非「不可用」），
+  同时在标题下写明：日后若开了 CONFIG 并实测 attach 成功，**可以**推翻，
+  但必须同时给出「kallsyms 有 `mtk_soc_wed_ops`」与「dmesg 有
+  `attaching wed device`」两项证据。
+- **新增 C20**：禁止把断因写回「缺 SoC 表」，且强制 `mtk_soc_wed_ops` /
+  `CONFIG_NET_MEDIATEK_SOC_WED` 的自证判据留在仓内。
+  ★ 判据的 `--include` 必须含 `'*.txt'` —— `Config/GENERAL.txt` 是记这些结论
+  的地方，漏了会恒红（C19 第③项已踩过同族坑）。
+
+SelfCheck 20 门全绿；C20 已做反向验证（变异均判红、复原后全绿）。
+
+**本次未改设备任何配置**（`/etc/modules.d/mt7996e` 已被改成带参数形式并保留，
+对当前状态无副作用；等固件开了 CONFIG 之后它才会真正生效）。
+
 ## [2026-10-06] 刷机后复测：软件 flow offload 确认生效，硬件侧三项判据全为零
 
 上一节把「WiFi 没有硬件转发」查清了，但那次结论依赖的是 dmesg 与节点存在性。
@@ -107,32 +215,26 @@ C19 禁止再把该计数表述成命中量/命中率，也禁止只凭计数就
 
 | 层 | 是什么 | 本机状态 |
 | :-- | :-- | :-- |
-| **WED** | WiFi DMA ↔ 以太网 MAC 直通，绕过 CPU | 硬件节点在、驱动实现全在，但 **MT7987 无 SoC 寄存器表** ⇒ 不可用 |
+| **WED** | WiFi DMA ↔ 以太网 MAC 直通，绕过 CPU | 硬件节点在、驱动实现全在、SoC 表**有**，但**内核缺 `CONFIG_NET_MEDIATEK_SOC_WED`** ⇒ 不可用（见文末「更正」） |
 | **PPE 硬件卸载** | PPE 引擎做 NAT | 引擎已 attach（`ppe0`/`ppe1`），但**只接 SoC 以太网口**，WiFi netdev 进不去 |
 | **软件 flow offload** | nft flowtable 快转 | ✅ **已开且生效**（这是目前 WiFi 转发唯一真正在用的加速） |
 
-### 二、决定性证据：上游 `mtk_wed.c` 里 MT7987 出现 0 次
+### 二、~~决定性证据：上游 `mtk_wed.c` 里 MT7987 出现 0 次~~ —— **本节归因已被推翻，见文末「更正」**
 
-稀疏检出 torvalds/linux（`drivers/net/ethernet/mediatek` + `package/kernel/mt76`）实测：
+> 下面是当时的推理链，留档是为了说明错在哪：
+> `grep -n "mtk_wed_soc_data"` 只列出了 mt7622_data / mt7986_data / mt7988_data
+> 三张表，于是得出「MT7987 没有 SoC 寄存器表」。
+> **错在只 grep 了符号定义处的变量名，没查 `hw->version` 的赋值来源。**
+> 真实路径是 `mtk_wed_add_hw()` 的 `switch (hw->version)`，
+> 而 `hw->version = eth->soc->version`，MT7987 的这个值由 OpenWrt 补丁 750 提供。
 
-```
-$ grep -n "mtk_wed_soc_data\s\+\w*_data" drivers/net/ethernet/mediatek/mtk_wed.c
-59:static const struct mtk_wed_soc_data mt7622_data = {
-72:static const struct mtk_wed_soc_data mt7986_data = {
-85:static const struct mtk_wed_soc_data mt7988_data = {
+实测（当时）：
+- `echo 1 > /sys/module/mt7996e/parameters/wed_enable` 写入成功、读回 `Y`；
+- 但 `/sys/kernel/debug/wed0/` 下 `rxinfo`/`txinfo`/`amsdu` 全部仍为 **0 字节**、
+  `dmesg` 无任何 attach 日志。
 
-$ grep -c "mt7987\|7987" drivers/net/ethernet/mediatek/mtk_wed.c
-0
-```
+⇒ 「翻 `wed_enable` 就能开」确实是错的 —— **但原因不是当时猜的那个。**
 
-WED 靠**每 SoC 一张寄存器表**（`mtk_wed_soc_data`：wpdma 环偏移、reset 掩码、
-`wo_support`…）。上游只有 7622/7986/7988 三张，**MT7987 一张都没有** ⇒
-`mtk_wed_device_attach()` 找不到对应 soc_data，无法挂载。
-
-⇒ ★ 所以「把 `wed_enable` 从 N 改成 Y 就能开」是**错的**：实测写入确实成功
-（读回 `Y`），但 `/sys/kernel/debug/wed0/` 下 `rxinfo`/`txinfo`/`amsdu` 全部仍为
-**0 字节**、`dmesg` 无任何 attach 日志 —— 因为驱动 probe 时那张表根本不存在。
-（该参数只在 probe 时读一次，运行中改无效，要验证也必须重启+带参数。）
 
 ### 三、PPE 侧：WiFi netdev 走不通的那一行代码
 
@@ -329,9 +431,11 @@ PPE 引擎**已 attach**：`dmesg` 有 `eth0/eth1: mediatek frame engine at 0xff
 ### 七、顺带更正三处前版错误
 
 1. ~~WED attach 失败的真因是**固件 blob 缺失**~~ —— **2026-10-06 修正：这只是次要因素，
-   主因是上游内核根本没有 MT7987 的 WED 实现。** 见下方「九」。
-   （WED 胶水层确实完整：设备上 `mt7996_mmio_wed_init` / `mt7996_wed_init_buf` /
-   `mt76_wed_dma_setup` / `mt76_wed_offload_enable` 等符号全部在，且都有非零地址。）
+   主因是内核未编入 `mtk_wed_ops.o`（缺 `CONFIG_NET_MEDIATEK_SOC_WED`）。**
+   WED 胶水层确实完整：设备上 `mt7996_mmio_wed_init` / `mt7996_wed_init_buf` /
+   `mt76_wed_dma_setup` / `mt76_wed_offload_enable` 等符号全部在，且都有非零地址；
+   SoC 寄存器表也**有**（mt7987_data，`.version = 3`，走 `case 3` 拿 mt7988_data）。
+   该项归因经历两次修正，最终结论见文末「更正」。
 2. 主线 `mtk_eth_soc.c` 的 PPE 初始化是**内联**的（`mtk_ppe_init(eth, eth->base + reg_map->ppe_base, ...)`），
    **不存在**「补一个 `hnat@15000000` DT 节点就能启用」的说法。
 3. `nft -c` 对 `{eth0,eth1}+flags offload`、`{eth0,eth1}`、`{eth2}(USB)+flags offload` 三组**全 rc=0**
