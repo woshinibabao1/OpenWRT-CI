@@ -25,9 +25,13 @@
 #   C14 uci-defaults 幂等性守卫（保留配置升级会重放它们 → 会覆盖用户设置的键必须有标记）
 #   C15 flow offload 默认值四处一致且为 on（该默认值两个月内反转过两次，auto 不得有 TTL 阻断）
 #   C19 软件卸载生效判据必须组合式（flowtable + 至少一条 [OFFLOAD] + 出口计数器上涨）
-#   C20 WED 断因是内核未链接 mtk_wed_ops.o；不许写成「缺 SoC 表」或「缺内核 CONFIG」
+#   C18 WiFi 硬件转发断因=v4：mt76 侧 wed_enable 默认 N（mmio.c:490）；
+#       wed_enable=1 只许出现在 Files/etc/uci-defaults/99-mt5700-wed 里
+#   C20 WED 断因不许写成「缺 SoC 表」「缺内核 CONFIG」或「mtk_wed_ops.o 被链接器 GC」
+#      （v1/v2/v3 三代归因均已证伪；现行 v4 = wed_enable 默认 N）
 #   C22 内核补丁必须用 __used 固定符号，绝不在 Makefile 里把 mtk_wed_ops.o 重复链接
 #   C23 补丁注入链完整：ApplyPatches.sh 在册 + CI 在 defconfig 之后、编译之前调用它
+#   C24 WED 开关必须由 uci-defaults 写入 /etc/modules.d，且断因归因不回退到已证伪版本
 #
 # 退出码：0 = 通过；1 = 有违规（每条以 ::error:: 上报，在 Actions 里直接标红）
 #
@@ -747,10 +751,14 @@ fi
 
 [ "$FAIL" -eq "$N" ] && pass "TTL 归一链是独立的 postrouting base chain 且用 \$wan_devices"
 
-# ---------- C18：WiFi 硬件转发加速「当前不可用」这个结论不许被静默推翻 ----------
-# 注意：结论是「当前固件下不可用」，原因 2026-10-06 已从「缺 SoC 表」更正为「缺内核 CONFIG」。
-#       若日后重编固件开了 CONFIG_NET_MEDIATEK_SOC_WED 并实测 attach 成功，**可以**推翻本结论，
-#       但必须同时给出 kallsyms 里有 mtk_soc_wed_ops 且 dmesg 有 attaching wed device 两项证据。
+# ---------- C18：WiFi 硬件转发的断因表述不许被静默推翻 ----------
+# ★★ 2026-10-07 更新：本门立论前提已从 v3 换成 v4，下面【层一】的 v3 段落是**历史归档**。
+#   v3「内核未编入 mtk_wed_ops.o」已被实测推翻（打了 __used 后符号成功导出，
+#   指针 ffffffc080a4b038 非 NULL）。保留原文是为了记录误判过程，不是当前结论。
+#   当前结论：内核侧完全就绪，断点在 mt76 侧的 wed_enable 模块参数默认值。
+#   校验标准不变：若日后要推翻，**必须给出 dmesg 里 attach 成功的日志** +
+#   /proc/interrupts 里的 WED IRQ 两项证据，不能只凭配置文件推断。
+#
 # 2026-10-06 真机取证结论（每一层都有代码/命令级证据，见 CHANGELOG 同日章节）：
 #
 # 【层一】WED（WiFi DMA ↔ 以太网 MAC 直通，绕过 CPU）
@@ -766,22 +774,16 @@ fi
 #     probe 成功也印证了这点：mtk_wed_hw_add_debugfs() 在 switch 之后无条件调用，
 #     wed0 debugfs 存在即证明 add_hw 走完了全程。
 #
-#   ★ 真正的断点（2026-10-06 21:3x 符号表级取证）：
-#     mt76 侧拿到 WED 硬件的**唯一**入口是全局指针 `mtk_soc_wed_ops`
-#     （mt7996/mmio.c 的 mt7996_mmio_wed_init 里 `rcu_dereference(mtk_soc_wed_ops)`）。
-#     而该符号的唯一定义点 drivers/net/ethernet/mediatek/mtk_wed_ops.c
-#     **全文 10 行**，唯一职责是 EXPORT_SYMBOL_GPL(mtk_soc_wed_ops)；
-#     Makefile 第 12 行 `obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o`
-#     决定它是否被编入。
-#     真机实测：`grep mtk_soc_wed_ops /proc/kallsyms` = **0 命中（符号不存在）**，
-#     且 `mtk_wed_attach` 在 kallsyms 里是**小写 t**（未 EXPORT），
-#     而 `mtk_wed_wo_init` 是大写 T（已 EXPORT）——对比即证明
-#     mtk_wed_ops.o 单独掉了，而 mtk_wed.o 仍在。
-#     ⇒ 断点是**内核编译配置**，不是硬件不支持、不是 SoC 表缺失、不是开关没翻。
-#       修复方向：内核 config 显式 CONFIG_NET_MEDIATEK_SOC_WED=y 重编固件，
-#       再让 /etc/modules.d/mt7996e 带上 wed_enable=1（两处缺一不可）。
-#     ★ 但本仓不写这个开关：C18 守的是「翻开关≠能加速」，
-#       而在缺 CONFIG 之前翻了也无效（参数能写、读回 Y，attach 仍不发生）。
+#   ★ 断点在 mt76 侧的模块参数（2026-10-07 实测，下面这段是**当时的错误推断，已作废**）：
+#     当时（2026-10-06 21:3x 符号表级取证）认为断点是内核未编入 mtk_wed_ops.o，
+#     依据是「grep mtk_soc_wed_ops /proc/kallsyms = 0 命中」。
+#     ★★ 该依据本身是**假信号**：/proc/kallsyms 里数据符号本就常查不到
+#       （实测对照：kallsyms 共 47648 行、含 [module] 标记 10818 行、导出符号 19125 个，
+#       grep mtk_eth_soc_read32 同样 0 命中）—— 拿它判「符号不存在」必然误判。
+#     真正的证据是wed-diag 日志打印的**指针值**（add_hw exported mtk_soc_wed_ops=...）。
+#     加了 __used 后该指针非 NULL ⇒ 符号活着⇒ v3 不成立。
+#   ★ 当前断因（v4，见上方注释与 99-mt5700-wed）：wed_enable 默认 false，
+#     mmio.c:490 提前返回 ⇒ attach 永不被调用。
 #
 # 【层二】PPE 硬件 NAT
 #   mtk_ppe_offload.c 的 mtk_flow_set_output_device() 确实**预留了** WiFi 分支
@@ -799,24 +801,42 @@ fi
 #   （它对 WiFi 转发同样有效，省的是 CPU 遍历协议栈，不是硬件 NAT）。
 #
 # 本门的作用不是判代码对错，而是**挡住那些会让人重新下结论的表述**：
-# 将来若有人写「打开 wed_enable 即可加速」「WiFi 走 PPE 的 WDMA 端口」之类的注释或文档，
+# 将来若有人写「WiFi 走 PPE 的 WDMA 端口」之类的注释或文档，
 # 那是在重复已被证伪的说法 —— 除非同时给出 MT7987 的 soc_data 已被合入的证据。
-echo "-- C18 不声称 WiFi 有硬件转发加速（WED/PPE 在 MT7987 上均不可用）"
+#
+# ★★ 2026-10-07 实质更新：v3 断因（内核未编入 mtk_wed_ops.o）已被真机**推翻**。
+#   实测（刷了带 Patches/0980-wed-diag.patch 的固件）：
+#     · cat /sys/module/mtk_eth/parameters/wed_debug → Y        ⇒ 补丁确已进固件
+#     · dmesg: wed-diag: add_hw exported mtk_soc_wed_ops=ffffc080a4b038
+#       ⇒ 打了 __used 后符号**成功导出、指针非 NULL** ⇒ v3「被 GC」不成立
+#     · 而 attach 从未发生（无任何 attach 开头的日志、/proc/interrupts 无 WED IRQ）
+#   真正断点在 mt76 侧（v6.18.54 真实代码 mt7996/mmio.c）：
+#     :17 static bool wed_enable;  :18 module_param(wed_enable, bool, 0644);  ← 默认 false
+#     :490    if (!wed_enable) return 0;        ← mt7996_mmio_wed_init 在此提前返回
+#     :642    if (mtk_wed_device_attach(wed))   ← 因此永远到不了
+#   真机：/sys/module/mt7996e/parameters/wed_enable = N，且 cmdline 不存在。
+#   ⇒ 本门从「禁止翻 wed_enable」改为「**必须翻，但只许在唯一正确的位置**」。
+echo "-- C18 WiFi 硬件转发断因=v4：mt76 侧 wed_enable 模块参数默认 N（mmio.c:490）；PPE 侧仍不可用"
 N=$FAIL
 
-# ① 不得声称打开 wed_enable 就能用（缺 MT7987 SoC 寄存器表）
-#    判据按**赋值语义**，两种写法都要抓（实测逐条验证过）：
-#      · `wed_enable=1|Y|yes|true|on`      —— 赋值形式
-#      · `echo Y > .../wed_enable`          —— 重定向形式（值在参数名**之前**）
-#    放行：`wed_enable=N|0`、以及仅出现在注释里的任何写法。
+# ① wed_enable=1 只允许出现在 Files/etc/uci-defaults/99-mt5700-wed 里。
+#    理由（★ 三条缺一不可，任意一条不满足都会静默失效）：
+#      · 必须**带参数 modprobe**，因为 wed_enable 只在 probe 路径被读一次
+#        （mmio.c:490），运行时写 sysfs 完全无效 —— 这条曾被实测证伪：
+#        「能写能读回 Y，attach 仍不发生」。
+#      · 必须写进 /etc/modules.d/mt7996e，而不能放 files 覆盖层直接下发：
+#        sysupgrade 的 keep.d 保留清单**不含** /etc/modules.d（只有 /etc/config/ 整棵），
+#        刷机后会被丢弃 ⇒ 这正是 2026-10-07 实测到的「wed_enable 又变回 N」。
+#      · 必须由 uci-defaults 每次刷机执行时现写（本机走 emmc_copy_config，
+#        /etc/uci-defaults/* 来自新 rootfs 但每次都跑）。
 #
-#    ★ 本条判据被返工过两轮，两个错都记在这儿：
-#      ① 第一版用 `wed_enable[^0-9A-Za-z]*(1|[Yy]es|true|on)\b`，实测**什么都不匹配** ——
+#    ★ 本条判据被返工过三轮，三个错都记在这儿，别重犯：
+#      ① 第一版用 `wed_enable[^0-9A-Za-z]*(1|[Yy]es|true|on)\b`，实测什么都不匹配 ——
 #         Git-Bash 的 grep -E **不支持 `\b`**（也不支持 `\<` `\>`），而 `[[:space:]]` 支持。
-#         记忆红线里已有「Windows Git-Bash 对字符类匹配恒失败」这条，此处是同族坑。
 #      ② 第二版试图 `sed 's/.*wed_enable.*//'` 取「参数名之后」的部分 —— 方向错了：
-#         `echo 1 > .../wed_enable` 里参数名在**行尾**，后面什么都没有，整行被删空 ⇒ 恒不匹配。
-#         重定向写法的值在参数名**之前**，赋值写法的值在**之后**，两者要分别判。
+#         `echo 1 > .../wed_enable` 里参数名在行尾，后面什么都没有，整行被删空 ⇒ 恒不匹配。
+#      ③ 第三版直接禁止任何文件出现 `wed_enable=1`，把正确的固化脚本也判红了
+#         —— 门禁的作用是「挡住错误做法」，不是「挡住唯一正确做法」。
 #    ★ 排除注释行必须先剥行首空白：grep -v '^\S*:[0-9]*: *#' 只认「行首 #」，
 #      而本仓脚本大量 tab 缩进（注释是 "\t\t# ..."），会漏掉 ⇒ 恒红。
 BAD_WED=$(
@@ -824,13 +844,14 @@ BAD_WED=$(
 		--include='*.sh' --include='*.uc' --include='99-*' --include='*.nft' --include='*.yml' \
 		Files/ Scripts/ .github/ 2>/dev/null \
 		| grep -v '^Scripts/SelfCheck\.sh:' \
+		| grep -v '^Files/etc/uci-defaults/99-mt5700-wed:' \
 		| sed 's/^[^:]*:[0-9]*:[[:space:]]*//' \
 		| grep -v '^[[:space:]]*#' \
 		| grep -iE '(wed_enable[[:space:]]*=[[:space:]]*[Yy1]|(echo|printf)[[:space:]]+[Yy1][^[:space:]]*.*>[[:space:]]*[^[:space:]]*wed_enable)'
 )
 if [ -n "$BAD_WED" ]; then
 	echo "$BAD_WED"
-	fail "C18 有脚本/配置在动 wed_enable。归因已更正（2026-10-06 晚间）：MT7987 **不缺** SoC 寄存器表 —— 补丁 750 里 mt7987_data 是 .version=3，走 case 3 拿 mt7988_data，probe 也成功了（wed0 debugfs 即证据）。真正断点是内核未编入 mtk_wed_ops.o：mt76 唯一入口 mtk_soc_wed_ops 在 /proc/kallsyms 里 0 命中，mtk_wed_attach 是小写 t（未 EXPORT）而 mtk_wed_wo_init 是大写 T。先开 CONFIG_NET_MEDIATEK_SOC_WED=y 重编固件，才轮到 wed_enable=1；在此之前翻开关无效（实测能写能读回 Y，attach 仍不发生）"
+	fail "C18 wed_enable=1 出现在 99-mt5700-wed 之外的文件里。断因已定位为 v4：mt76 侧 mt7996/mmio.c:490 的 if (!wed_enable) return 0 —— 生效途径**只有**带参数 modprobe，写 sysfs 无效（实测能写能读回 Y，attach 仍不发生）。且必须由 uci-defaults 现写 /etc/modules.d/mt7996e，因为 sysupgrade 的 keep.d 不含该目录，放 files 覆盖层会在刷机后丢失（2026-10-07 实测刷机后 wed_enable 回到 N）"
 fi
 
 # ② 不得声称 flowtable 里的 WiFi 接口代表硬件卸载真的在跑
@@ -924,22 +945,18 @@ fi
 [ "$FAIL" -eq "$N" ] && pass "SFO 判据是组合式（flowtable 存在 + 至少一条 [OFFLOAD] + 出口计数器上涨）"
 
 
-# ---------- C20：WED 断点归因必须是「内核缺 CONFIG」，不是「MT7987 缺 SoC 表」 ----------
-# 2026-10-06 21:3x 符号表级取证后的更正。C18 的立论前提（「MT7987 没有 SoC 寄存器表，
-# 因为 upstream mtk_wed.c 里 grep 7987 = 0」）是错的，若不钉死会让人继续往「给内核加
-# mt7987_data 表」这个方向钻 —— 而那张表本来就有（mt7987_data，version=3）。
-#
-# 正确断点（三项都要成立，缺一不可）：
-#   ① CONFIG_NET_MEDIATEK_SOC_WED 未生效 ⇒ mtk_wed_ops.o 没编入
-#      （Makefile 第 12 行 obj-$(CONFIG_NET_MEDIATEK_SOC_WED) += mtk_wed_ops.o）
-#   ② mtk_soc_wed_ops 符号不存在（真机 kallsyms 0 命中）
-#      —— 这是 mt76 唯一的跨模块入口（mt7996_mmio_wed_init 里 rcu_dereference 它）
-#   ③ mtk_wed_attach 是小写 t（未 EXPORT），对照组 mtk_wed_wo_init 是大写 T（已 EXPORT）
-#      ⇒ 单独掉的是 ops 单元，不是整个 WED（mtk_wed.o 仍在，硬件层正常）
-#
-# 本门的作用：防止把更正前的错误归因重新写回文档/注释，并强制留存
+# ---------- C20：WED 断点归因表述守卫（三代旧归因 + 现行的v4 都得钉住） ----------
+# ★★ 2026-10-07 更新：v3 归因（内核未链接 mtk_wed_ops.o）**也已被真机推翻** ——
+#   刷了带 Patches/0980-wed-diag.patch（给符号加 __used）的固件后，
+#   dmesg 打出 `add_hw exported mtk_soc_wed_ops=ffffffc080a4b038` ⇒ 符号活着、指针非 NULL。
+#   现行断因 v4：mt76 侧 `wed_enable` 模块参数默认 false，
+#   mt7996_mmio_wed_init 在 mmio.c:490 提前 return 0 ⇒ attach 永不被调用。
+#   ★ v3 当初的依据「kallsyms 里 grep 不到 mtk_soc_wed_ops」是**假信号**：
+#     数据符号在 kallsyms 里本就常查不到（对照：mtk_eth_soc_read32 同样 0 命中，
+#     而 kallsyms 本身完全正常 —— 47648 行、19125 个导出符号）。
+# 本门的作用：防止把任何一代已证伪的归因重新写回文档/注释，并强制留存
 # 「怎么自证」的判据（不能只写一句「不可用」）。
-echo "-- C20 WED 断因是内核未链接 mtk_wed_ops.o；四项自证判据在册"
+echo "-- C20 WED 断因三代旧归因（缺 SoC 表 / 缺 CONFIG / 被 GC）均已证伪；现行 v4 = wed_enable 默认 N"
 N=$FAIL
 
 #   C20 WED 断因不得写成「MT7987 缺 SoC 寄存器表」，也不得写成「缺内核 CONFIG」
@@ -978,10 +995,19 @@ N=$FAIL
 PAT_CAUSE='(缺|没有|无)[[:space:]]*(MT7987|mt7987)?[[:space:]]*(的)?[[:space:]]*(SoC|soc)[[:space:]]*(寄存器)?[[:space:]]*表'
 PAT_CFG_OFF='CONFIG_NET_MEDIATEK_SOC_WED[[:space:]]*(未生效|没开|未开|关闭|n|=n|为 *n)|(没|未|不)[[:space:]]*(有)?[[:space:]]*开[[:space:]]*CONFIG_NET_MEDIATEK_SOC_WED|CONFIG_NET_MEDIATEK_SOC_WED[[:space:]]*(是|为)[[:space:]]*关'
 ALLOW_CAUSE='~~|已.{0,2}推翻|是错的|错在|重新查了一遍|结论：那条归因|以前|原本|当时|错因|前版|禁止把断因|不声称|那条归因是错|不是|历史上|v1「|v2「|断因是内核缺'
+# ★★ 归因断言的"语义钉"（2026-10-07 补，理由同 C24）：
+#   只靠 ALLOW_CAUSE 这种**行级排除**名单天生脆弱 —— 变异的措辞只要碰巧
+#   落在放行名单里（历史归因/以前/原本…），守卫就失效。
+#   这里额外要求：命中旧归因的同一行还必须**把它断言为当前结论**
+#   （真正原因/断因是/根因是…），归档陈述则放行。
+ASSERT_CAUSE='(真正原因|断因是|根因是|原因是|故判为|结论是|因此判定)'
+	# ①a 文档类：`>` 前缀是引用块标记（Config/GENERAL.txt 整篇是 # 注释，
+	#      排除 # 开头行等于把该文件整片放行 —— 反向变异 1 就是这么漏的）。
 	DOC_CAUSE=$(
 		grep -rnE "$PAT_CAUSE" --include='*.md' --include='*.txt' --include='*.yml' Config/ .github/ CHANGELOG.md README.md 2>/dev/null | \
 		sed 's/^[^:]*:[0-9]*:[[:space:]]*//' | \
 		grep -vE '^[[:space:]]*>' | \
+		grep -E "$ASSERT_CAUSE" | \
 		grep -vE "$ALLOW_CAUSE" || true
 	)
 	# ①b 脚本类：# 开头的确实是代码注释且很多，才排除
@@ -991,12 +1017,13 @@ ALLOW_CAUSE='~~|已.{0,2}推翻|是错的|错在|重新查了一遍|结论：那
 		sed 's/^[^:]*:[0-9]*:[[:space:]]*//' | \
 		grep -vE '^[[:space:]]*#' | \
 		grep -vE '^[[:space:]]*>' | \
+		grep -E "$ASSERT_CAUSE" | \
 		grep -vE "$ALLOW_CAUSE" || true
 	)
 	WRONG_CAUSE=$(printf '%s\n%s\n' "$DOC_CAUSE" "$SH_CAUSE")
 if [ -n "$WRONG_CAUSE" ]; then
 	echo "$WRONG_CAUSE"
-	fail "C20 有文本把 WED 断因写成「MT7987 缺 SoC 寄存器表」。这是 v1 归因，已被推翻：mt7987_data 存在于补丁 750 且 .version=3，走 case 3 拿 mt7988_data，probe 也成功（wed0 debugfs 即证）。正确断因见本段注释的 v3：内核未链接 mtk_wed_ops.o"
+	fail "C20 有文本把 WED 断因写成「MT7987 缺 SoC 寄存器表」。这是 v1 归因，已被推翻：mt7987_data 存在于补丁 750 且 .version=3，走 case 3 拿 mt7988_data，probe 也成功（wed0 debugfs 即证）。正确断因见本段注释的 v4：mt76 侧 wed_enable 模块参数默认 N（mmio.c:490 提前 return 0）"
 fi
 
 # ①c 断因不得写成「CONFIG 未开」——这条同样已被推翻
@@ -1017,7 +1044,7 @@ fi
 	WRONG_CFG=$(printf '%s\n%s\n' "$DOC_CFG_OFF" "$SH_CFG_OFF")
 if [ -n "$WRONG_CFG" ]; then
 	echo "$WRONG_CFG"
-	fail "C20 有文本把 WED 断因写成「CONFIG_NET_MEDIATEK_SOC_WED 未生效/关闭」。这是 v2 归因，同样已被推翻：上游 filogic/config-6.18 明写 CONFIG_NET_MEDIATEK_SOC_WED=y，真机 mtk_wed.o 的 60 个符号全在、wed0 debugfs 已建 ⇒ config 生效且 add_hw 已跑通。正确断因是 mtk_wed_ops.o 未被链接"
+	fail "C20 有文本把 WED 断因写成「CONFIG_NET_MEDIATEK_SOC_WED 未生效/关闭」。这是 v2 归因，同样已被推翻：上游 filogic/config-6.18 明写 CONFIG_NET_MEDIATEK_SOC_WED=y，真机 mtk_wed.o 的 60 个符号全在、wed0 debugfs 已建 ⇒ config 生效且 add_hw 已跑通。正确断因是 mt76 侧 wed_enable 默认 N —— 打 __used 后符号已确认导出（add_hw exported mtk_soc_wed_ops=非NULL指针）"
 fi
 
 # ② 断因判据必须在册：四项自证要素**各至少有一处**留痕
@@ -1175,6 +1202,78 @@ else
 
 	[ "$FAIL" -eq "$N" ] && pass "补丁注入链完整（ApplyPatches.sh 在册 + CI 在 defconfig 之后、编译之前调用）"
 fi
+
+# ---------- C24：WED 开关必须真正能在刷机后存活 ----------
+# ★ 守的是一个**已经真实发生**的交付缺陷（2026-10-07 真机取证）：
+#   开发期曾在 /etc/modules.d/mt7996e 手工写 wed_enable=1，读回确认「已生效」，
+#   于是当成「硬件加速可用」写进文档。但 sysupgrade 的 keep.d 保留清单里
+#   **不含 /etc/modules.d**（只有 /etc/config/ 整棵），刷机后该文件为空，
+#   mt7996e 用默认值加载 ⇒ wed_enable 又变回 N ⇒ 硬件加速静默失效。
+#   ⇒ 「实验环境的手工状态」不等于「交付状态」。凡是要在刷机后存活的东西，
+#     必须有一条在**每次刷机时都会执行**的路径去重建它。
+# 正确做法：放进 Files/etc/uci-defaults/，由该机制每次刷机执行并现写 /etc/modules.d。
+#   （本机走 emmc_copy_config，/etc/uci-defaults/* 来自新 rootfs 但每次都执行。）
+N=$FAIL
+
+C24_WED="Files/etc/uci-defaults/99-mt5700-wed"
+if [ ! -f "$C24_WED" ]; then
+	fail "C24 缺少 Files/etc/uci-defaults/99-mt5700-wed。WED 的 wed_enable=1 必须由 uci-defaults 在每次刷机时写入 /etc/modules.d/mt7996e —— 直接放 files 覆盖层会在 sysupgrade 时被丢弃（keep.d 不含 /etc/modules.d），刷完机硬件加速静默失效（2026-10-07 实测：/sys/module/mt7996e/parameters/wed_enable = N，/sys/module/mt7996e/cmdline 不存在）"
+else
+	# 必须真的写出**模块加载行**，而不只是某处提到 wed_enable=1。
+	#
+	# ★★ 这条断言被返工过一次（反向变异 M22 抓出来的真缺陷）：
+	#   初版是`grep -E 'wed_enable=1' | grep -E 'printf|echo'`——
+	#   只要**任何一行**同时含 wed_enable=1 和 printf/echo 就算过。
+	#   于是把真正写出加载行的两处 printf 换成
+	#     echo '# 备注：将来需要时手工写入 wed_enable=1 即可'
+	#   之后，**注释里那一行照样命中断言**，守卫完全放行（RC=0）。
+	#   ⇒ 弱断言只要还能被"注释里提到"满足，就等于没有断言。
+	# 正解：盯住**加载行的完整形态** —— 必须出现字面量
+	#   `mt7996e wed_enable=1`（模块名与参数名成对），
+	#   且这一行本身是 printf/echo，而不是被注释掉的说明文字。
+	C24_MOD="$(grep -E 'printf|echo' "$C24_WED" 2>/dev/null \
+		| grep -E "mt7996e[[:space:]]+wed_enable=1" \
+		| grep -vE "^[[:space:]]*#" || true)"
+	if [ -z "$C24_MOD" ]; then
+		fail "C24 $C24_WED 里没有真正写出「mt7996e wed_enable=1」这条模块加载行。★ 断言必须盯住加载行的完整形态：只在注释里提到 wed_enable=1 不算（反向变异实测：把 printf 换成 echo 注释行后，弱断言照样放行）。必须有一条 printf/echo 把 mt7996e wed_enable=1 写进 /etc/modules.d/mt7996e，kmodloader 才会带参数加载模块"
+	fi
+	# 必须写到 /etc/modules.d —— 写别处（运行时 sysfs /etc/sysctl）都不生效
+	#
+	# ★ 这条同样被加固过（M21）：初版是`grep -qF '/etc/modules.d/mt7996e' <全文件>`，
+	# 而该字符串**本来就出现在本脚本自己的验收说明注释里** ⇒
+	# 把真正的 `MODD=` 赋值改成别处（= 死代码），断言照样通过。
+	# 正解：只看**真正生效的那一行**（以 MODD= 开头的赋值），
+	# 而不是全文子串。
+	C24_MODD="$(grep -E '^[[:space:]]*MODD=' "$C24_WED" 2>/dev/null | head -1 || true)"
+	if ! printf '%s\n' "$C24_MODD" | grep -qF '/etc/modules.d/mt7996e'; then
+		fail "C24 $C24_WED 没有把参数写到 /etc/modules.d/mt7996e（真正生效的 MODD= 赋值行是「${C24_MODD:-（未找到 MODD= 赋值行）}」）。★ wed_enable 只在 probe 路径被读一次（mt76/mt7996/mmio.c:490），运行时写 sysfs 完全无效 —— 唯一途径是带参数 modprobe，也就是 /etc/modules.d。★ 注意本判据只认 MODD= 赋值行：全文里出现该路径不算（验收说明的注释里本来就有这个字符串）"
+	fi
+	# 断因归因不许回退到已被证伪的版本（v1/v2/v3 全部推翻）
+	#
+	# ★★ 这条断言被返工过一次，教训很典型：
+	#   初版做法是「先 grep 出可疑行，再用 grep -vE 排除掉归档行」
+	#   （排除词含 `证伪|推翻|✗|v1|v2|v3`）。反向变异 M24 把某行改成
+	#     `#   真正原因是 mtk_wed_ops.o 被链接器 GC 掉，加 __used 才能导出`
+	#   —— 变异**确实生效**（行里确有「被链接器 GC」），
+	#   但那一行不带任何「证伪/推翻」标记，于是本该判红却**放行了**。
+	#   ⇒ **行级排除规则天生脆弱**：只要变异的措辞碰巧像归档行，守卫就失效。
+	# 正解：判**语义**而不是判长相 ——
+	#   · 放行 = 明确标注了它已被推翻（`✗` / `证伪` / `已推翻` / `勿再当`）
+	#   · 判红 = 把旧归因**断言为结论**（`真正原因` / `断因是` / `根因是` 等）
+	# 这样"归档旧结论"与"重新下错结论"在语义上就是可区分的。
+	C24_ASSERT='(真正原因|断因是|根因是|原因是|故判为|结论是)'
+	C24_DENY='(缺.{0,6}(SoC|soc_data|内核 CONFIG|CONFIG_NET_MEDIATEK_SOC_WED)|被链接器.?GC|被.?GC.?掉|gc-sections)'
+	C24_BAD="$(
+		grep -nE "$C24_DENY" "$C24_WED" 2>/dev/null \
+		| grep -E "$C24_ASSERT" \
+		| grep -vE '(✗|证伪|已推翻|勿再当|历史归因)' || true
+	)"
+	if [ -n "$C24_BAD" ]; then
+		fail "C24 $C24_WED 里把已被证伪的 WED 断因**断言为结论**。★ v1「缺 MT7987SoC 表」、v2「缺内核 CONFIG」、v3「mtk_wed_ops.o 被链接器 GC」全部已被真机推翻：打上 __used 后 mtk_soc_wed_ops 成功导出且指针非 NULL（add_hw exported mtk_soc_wed_ops=ffff...）。现行断因 v4 = mt76 侧 wed_enable 模块参数默认 N，mmio.c:490 提前 return 0。改注释前先读真机日志与 mmio.c:490"
+	fi
+fi
+
+[ "$FAIL" -eq "$N" ] && pass "WED 的 wed_enable=1 由 uci-defaults 写入 /etc/modules.d（刷机后能存活），且断因归因未回退到已证伪的 v1/v2/v3"
 
 echo "===== SelfCheck 结束 ====="
 if [ "$FAIL" -ne 0 ]; then

@@ -414,6 +414,73 @@ CONFIG_PACKAGE_kmod-nft-xfrm=y
 #   （直��� `modprobe mt7996e wed_enable=1` 会被 procd 按 modules.d 重载覆盖掉，
 #     这是 OpenWrt 用 procd 管 /etc/modules.d 的正常行为，不是 bug。）
 
+# ─────────────────────────────────────────────────────────────────
+# 2026-10-07 ｜ ★ WED 断因 v4（现行最终结论，v1/v2/v3 全部已被推翻）
+#
+# 上面整段 v3 归因**作废**，保留原文仅作误判记录。推翻它的是本次真机取证。
+#
+# ── 一、补丁确实进了固件，且 __used 修复真的生效 ─────────────
+#   固件：刷了带 Patches/0980-wed-diag.patch 的新固件（内核仍是 6.18.54）。
+#     cat /sys/module/mtk_eth/parameters/wed_debug  →  Y（存在 ⇒ 补丁在）
+#     dmesg | grep wed-diag  →  恰好 2 行：
+#       wed-diag: add_hw enter node=wed version=3 offload_version=2
+#       wed-diag: add_hw exported mtk_soc_wed_ops=ffffffc080a4b038
+#   ⇒ 符号**活着**、指针非 NULL ⇒ v3「mtk_wed_ops.o 被链接器 GC 掉」不成立。
+#   ⇒ attach 相关日志 **0 行**；/proc/interrupts 里**无 WED IRQ**。
+#
+# ── 二、★ v3 当初的依据本身是假信号（这是最值得记的一条）─────
+#   v3 建立在「grep mtk_soc_wed_ops /proc/kallsyms = 0 命中」上。
+#   但 **kallsyms 里数据符号本就常查不到**。实测对照：
+#       /proc/kallsyms 共 47648 行、含 [module] 标记 10818 行、导出符号 19125 个
+#       ⇒ kallsyms 本身完全正常
+#       而 mtk_eth_soc_read32（mtk_eth.ko 的导出函数）同样 0 命中
+#   ⇒ 拿「kallsyms 里 grep 不到某符号」判「符号不存在」必然误判。
+#   ★ 判符号是否活着，只看补丁日志打印的**指针值**。
+#
+# ── 三、真正的断因：mt76 侧 wed_enable 模块参数默认为 N ──────
+#   源码基底 linux 6.18.54（stable 树 gregkh/linux 的 v6.18.54 tag），
+#   drivers/net/wireless/mediatek/mt76/mt7996/mmio.c：
+#       :17   static bool wed_enable;
+#       :18   module_param(wed_enable, bool, 0644);    ← 默认 false
+#       :482  int mt7996_mmio_wed_init(...)            ← 由 pci.c:143 在 probe 调用
+#       :490      if (!wed_enable) return 0;           ← ★ 断在这里
+#       :642      if (mtk_wed_device_attach(wed)) {...} ← 因此永远到不了
+#   真机实测：
+#       /sys/module/mt7996e/parameters/wed_enable = N
+#       /sys/module/mt7996e/cmdline  **不存在**  ⇒ 从没传过参数，用默认值加载
+#   ⇒ attach 从未被调用，与内核链接行为**毫无关系**。
+#   ⇒ 上文 v3 段里「a/c 均已排除、因内核侧无 ops 符号根本走不到 a/b/c」的
+#     推理链虽然自洽，但前提（内核侧无符号）是错的。
+#
+# ── 四、为什么「手工验证过」不等于「刷机后还在」 ──────────────
+#   早前一轮曾读回 wed_enable=Y 并当成有效证据写进文档 —— 那是**手工**在
+#   /etc/modules.d/mt7996e 传参测的。刷机后该文件是**空的**：
+#   sysupgrade 的 keep.d 保留清单**不含 /etc/modules.d**（只有 /etc/config/ 整棵），
+#   参数随之丢失、wed_enable 回到 N，硬件加速静默失效。
+#   ⇒ 固化方式：Files/etc/uci-defaults/99-mt5700-wed（每次刷机都执行），
+#     由它现写 /etc/modules.d/mt7996e。★ 见 C24 闸门。
+#
+# ── 五、为什么必须走带参数 modprobe（改 sysfs 无效）────────────
+#   wed_enable 只在 probe 路径被读一次（mmio.c:490），运行期
+#   `echo 1 > /sys/module/mt7996e/parameters/wed_enable` **完全无效**。
+#   这一点早前已被实测证伪过：能写、能读回 Y，attach 仍不发生。
+#
+# ── 六、刷机后验收（照着念，第二条是决定性的）───────────────
+#   ① cat /etc/modules.d/mt7996e            期望含 mt7996e wed_enable=1
+#   ② dmesg | grep -i wed-diag | grep -i attach
+#        ★ 只有 attach SUCCEEDED 才代表硬件通路在跑（来自 0980-wed-diag.patch）
+#          只有 add_hw 两行= 固化没起作用
+#          attach FAILED / attach REJECTED  = 失败，原因在同几行里
+#          一条都没有                = 补丁没进固件
+#   ③ grep -i wed /proc/interrupts          期望有 WED IRQ 行（attach 成功的必要结果）
+#
+# ── 七、安全前提 ────────────────────────────────────────────
+#   WED 走网卡 DMA 通路，配错的表现是 WiFi 收发异常、掉流甚至看门狗重启。
+#   实测本机 eth0/eth1 全 DOWN、客户端 192.168.10.202 只经 phy0.1-ap0 连入
+#   ⇒ 远程连接全程只走 WiFi，重载 mt7996e 会立刻切断连接。
+#   ★ 首次启用务必插有线，别在只有 WiFi 时启用。回滚：删掉
+#     /etc/modules.d/mt7996e 里的 wed_enable=1 后重启。
+
 #   本固件是自编译内核（`cat /proc/version` 里带我们自己 runner 的 build 号），
 #   在线仓库里的同名 kmod 是给官方内核编的 —— 装上去要么被 apk 直接拒绝，
 #   要么装上因 vermagic 不一致而 modprobe 失败（症状：包在、功能没有）。

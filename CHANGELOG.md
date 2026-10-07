@@ -1,6 +1,90 @@
 # 更新日志
 
-## [2026-10-07 凌晨 2] WED 补丁 v2：修掉 CI 实测炸掉的 modpost 失败
+## [2026-10-07 上午] WED 断因 v4：真正的原因是 mt76 的 wed_enable 默认 N（前三代归因全被推翻）
+
+刷了带内核补丁的固件后首次取到决定性证据，**WiFi 硬件加速仍未启用**，
+但断因被彻底改写 —— 前面三代归因全部作废。
+
+### 一、补丁确实进固件了，且 __used 修复生效
+
+```
+cat /sys/module/mtk_eth/parameters/wed_debug   →  Y
+dmesg | grep wed-diag
+  wed-diag: add_hw enter node=wed version=3 offload_version=2
+  wed-diag: add_hw exported mtk_soc_wed_ops=ffffffc080a4b038   ← 指针非 NULL
+```
+⇒ `mtk_soc_wed_ops` 活着，**v3「这个 .o 被链接器 GC 掉」不成立**。
+attach 相关日志 **0 条**，`/proc/interrupts` 里**无 WED IRQ**。
+
+### 二、真正断点在 mt76 侧，v6.18.54 真实代码
+
+```c
+// drivers/net/wireless/mediatek/mt76/mt7996/mmio.c
+static bool wed_enable;                            // :17
+module_param(wed_enable, bool, 0644);              // :18  默认 false
+int mt7996_mmio_wed_init(...)                      // :482  由 pci.c:143 在 probe 调用
+        if (!wed_enable) return 0;                 // :490  ★ 断在这里
+        ...
+        if (mtk_wed_device_attach(wed)) {...}      // :642  因此永远到不了
+```
+真机：`/sys/module/mt7996e/parameters/wed_enable` = **N**，
+`/sys/module/mt7996e/cmdline` **不存在** ⇒ 从没传过 `wed_enable=1`，用的是默认值。
+
+三代旧归因的处置：v1「MT7987 缺 SoC 寄存器表」✗、v2「缺内核 CONFIG」✗、
+v3「mtk_wed_ops.o 被链接器 GC」✗ —— 三条都已在 C18/C20 里改成禁止回退。
+
+### 三、交付缺陷：手工验证过 ≠ 刷机后还在
+
+更早一轮我曾「读回 `wed_enable=Y`」并当成有效证据写进文档。那是我**手工**在
+`/etc/modules.d/mt7996e` 传参测的。刷机后那个文件是空的 ——
+因为 **sysupgrade 的 `keep.d` 保留清单不含 `/etc/modules.d`**（只有 `/etc/config/` 整棵），
+所以参数丢失、`wed_enable` 回到 N，硬件加速静默失效。
+⇒ 新增 `Files/etc/uci-defaults/99-mt5700-wed`，由每次刷机都会执行的 uci-defaults
+现写该文件。这是本项目「实验环境的手工状态 ≠ 交付状态」的又一次复发。
+
+### 四、改动清单
+
+| 文件 | 作用 |
+| :-- | :-- |
+| `Files/etc/uci-defaults/99-mt5700-wed`（新） | 写 `/etc/modules.d/mt7996e` 带 `wed_enable=1`，附完整断因与验收步骤 |
+| `Files/etc/uci-defaults/99-mt5700-net` | 删除已证伪的 WED 归因段落，改为指向新脚本 |
+| `Scripts/SelfCheck.sh` | C18 由「禁止翻开关」改为「只许在唯一正确位置翻」；C20/C21 文案更正为 v4；**新增 C24** |
+
+**为什么必须走 `/etc/modules.d` 而不能写 sysfs**：`wed_enable` 只在 probe 路径被读一次
+（`mmio.c:490`），运行时 `echo 1 > /sys/.../wed_enable` 完全无效 ——
+这一点早前已被实测证伪过（能写、能读回 Y，attach 仍不发生）。
+
+**C24 守什么**（按已真实发生的故障立，不凭想象）：
+① 固化脚本必须在册；② 必须真写出「`mt7996e wed_enable=1`」这一行；
+③ 必须写进 `/etc/modules.d/mt7996e`；④ 断因归因不得回退到 v1/v2/v3。
+
+### 五、⚠️ 安全前提（本次未动设备的理由）
+
+实测 `eth0`/`eth1` 全DOWN、开发机是 `192.168.10.202` 且**只经 `phy0.1-ap0` 连入**
+⇒ SSH 全程只走 WiFi。重载 `mt7996e` 会立刻切断连接，故本次只做只读取证。
+**WED 走网卡 DMA 通路，配错的表现是 WiFi 收发异常、掉流甚至看门狗重启；
+首次启用务必插有线连接**，别在只有 WiFi 时启用。
+
+### 六、刷机后验收（照着念）
+
+```sh
+cat /etc/modules.d/mt7996e                        # 期望含 wed_enable=1
+dmesg | grep -i wed-diag | grep -i attach         # ★ 决定性判据
+grep -i wed /proc/interrupts                      # 期望有 WED IRQ 行
+```
+第二条只看有没有 `attach SUCCEEDED`（来自本仓 `0980-wed-diag.patch`）。
+只有 `add_hw` 两行 = 固化没起作用；`attach FAILED`/`attach REJECTED` = 失败，原因在同几行里。
+
+回滚：删掉 `/etc/modules.d/mt7996e` 里的 `wed_enable=1` 后重启。
+
+### 七、判据再修正（第三次，避免后人重蹈）
+
+`grep mtk_soc_wed_ops /proc/kallsyms` = 0 **不能**判「符号不存在」。
+实测对照：kallsyms 共 47648 行、含 `[module]` 标记 10818 行、导出符号 19125 个，
+完全正常，而 `mtk_eth_soc_read32` 同样 0 命中 —— 数据符号本就查不到。
+★v3 归因就是建立在这条假信号上的。要判符号是否活着，看 `wed-diag` 的**指针值**。
+
+## [2026-10-07凌晨 2] WED 补丁 v2：修掉 CI 实测炸掉的 modpost 失败
 
 上一条提交（`eb294c0`）的补丁**经 CI 实测编译失败**（run `37503259547`，
 在 `Compile Firmware` 阶段，烧了 24 分钟）。守卫 C1~C23 全绿却没拦住 ——

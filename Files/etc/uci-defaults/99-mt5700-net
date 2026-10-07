@@ -71,12 +71,14 @@
 #     fw4 的 `nft_try_hw_offload()` 只用 `nft -c` 做**语法检查**，
 #     而 `flags offload` 在本机（无 PPE）同样 rc=0 ⇒ 恒为假阳性。
 #     真在用只能看三条同时成立：ppe0/entries 计数涨 + ppe0/bind 非空 + CPU 下降。
-#   · WED（WiFi 侧硬件转发）：胶水层完整（30 个 mtk_wed_* 符号），
-#     但缺 MT7987 的 SoC 寄存器表（上游 mtk_wed.c 的 mtk_wed_soc_data 只有
-#     mt7622/mt7986/mt7988 三张，grep '7987' = 0）⇒ 开不了。
-#     ★ 2026-10-06 复测：wed_enable = N 且 dmesg 中 'wed' 出现 0 次（从未 attach）。
-#     ★ 注意本条**不是**「缺固件 blob」（那条已被证伪，见 CHANGELOG 2026-10-06
-#       WiFi 硬件转发取证章节）—— 根因是内核侧没有 MT7987 的 soc_data。
+#   · WED（WiFi 侧硬件转发）：**断因已于 2026-10-07 定位，改动见 99-mt5700-wed**。
+#     ★ 本节原先写的归因（缺 SoC 表/ 缺内核 CONFIG）**均已被真机证伪**，不要照着排查。
+#     最终结论：WED 侧完全就绪（mtk_wed.o 已 attach、wed0 debugfs 在、
+#     CONFIG 已开、打了 __used 后 mtk_soc_wed_ops 成功导出且指针非 NULL），
+#     唯独 mt76 侧的 `wed_enable` **模块参数默认为 N**，
+#     导致 `mt7996_mmio_wed_init()` 在 `mmio.c:490` 直接 return 0，
+#     `mtk_wed_device_attach()` 永远不被调用。
+#     本文件不再负责该项 —— 固化到 99-mt5700-wed。
 #
 # ⇒ on-hw 在本机**与 on 实际效果相同**（多写一个 flags offload 而已），
 #   保留该选项仅为将来硬件拓扑变化（WAN 改走有线 eth1）时可用，默认不选。

@@ -63,6 +63,7 @@ OpenWRT-CI/
 ├── Files/                    # 固件 files 覆盖层（随固件打包，首次开机生效）
 │   ├── etc/
 │   │   ├── uci-defaults/99-mt5700-net   # 网络调优（flow offload / TCP / 中断均衡 / 5G 无线）
+│   │   ├── uci-defaults/99-mt5700-wed   # ★ WED（WiFi 硬件转发）开关固化，见第四节的断因与验收
 │   │   ├── uci-defaults/99-mt5700-wan   # 补齐 MT5700M 接口、防火墙 wan 区、关 USB autosuspend
 │   │   ├── uci-defaults/99-mt5700-sys   # zram 512M / 无线 isolate=0 / 国内 NTP
 │   │   ├── uci-defaults/99-mt5700-stability  # 可用性兜底（rpcd 自愈等，不动网络策略）
@@ -289,6 +290,28 @@ MT5700 是本台 CPE 的数据吞吐核心，由 `luci-app-mt5700`（方案 B，
 > 当前在册：`0980-wed-diag.patch` —— 给 WED 的 `mtk_soc_wed_ops` 加 `__used`
 > 防止它被 `--gc-sections` 丢弃，并附 `wed_debug` 诊断日志。
 > 详见 CHANGELOG 顶部那一节。
+>
+> ★★ **刷机后第一步看什么**（这是判定「补丁有没有进固件」的唯一可靠判据）：
+>
+> ```sh
+> cat /sys/module/mtk_eth/parameters/wed_debug   # 存在 = 补丁进去了
+> dmesg | grep -i wed-diag
+> ```
+>
+> 拿到 `add_hw exported mtk_soc_wed_ops=ffff...` 说明符号活着、`__used` 生效。
+> 但**这不代表硬件加速已启用** —— 还要看有没有 `attach SUCCEEDED`：
+>
+> | `wed-diag` 日志 | 结论 |
+> | :-- | :-- |
+> | 只有 `add_hw` 两行 | WED 侧就绪，**mt76 没来 attach** ⇒ 查 `wed_enable`（见 C18/C24） |
+> | `attach SUCCEEDED: DMA rings + RRO ...` | 硬件通路真的在跑 |
+> | `attach FAILED` / `attach REJECTED` | 失败，原因在同几行里 |
+> | 一条都没有 | 补丁没进固件（`wed_debug` 也会不存在） |
+>
+> ⚠️ 顺带一条判据修正：`grep mtk_soc_wed_ops /proc/kallsyms` **查不到不代表符号不存在**。
+> 数据符号在 kallsyms 里本就常查不到（实测对照：`mtk_eth_soc_read32` 同样 0 命中，
+> 而 kallsyms 本身完全正常）。★ 别用这条判「符号被丢」——本仓曾据此得出错误归因。
+> 要判符号是否活着，看 `wed-diag` 打印的**指针值**。
 >
 > ⛔ **写内核补丁的两条铁律**（都是本仓实际踩过的，代价各20+ 分钟 CI 时间）：
 >

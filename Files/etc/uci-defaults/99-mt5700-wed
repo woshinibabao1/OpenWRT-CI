@@ -1,0 +1,84 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# H5000M 5G CPE —— WED（WiFi 硬件转发）开关固化 —— 首次开机由 uci-defaults 执行一次
+#
+# ---------- 这个文件存在的原因（2026-10-07 真机取证）----------
+#
+# WED = Wireless Ethernet Dispatch，是 MTK 给 WiFi 收发的硬件 DMA 直通通路。
+# 开启后 WiFi 流量不再经CPU 软转，交由 WED + PPE 硬件处理。
+#
+# ★★ 断因链（前三代归因均已被推翻，这里只留最终结论）：
+#   v1「MT7987 缺 SoC 寄存器表」      ✗ 证伪：mt7987_data 存在，version=3 offload_version=2
+#   v2「缺内核 CONFIG_NET_MEDIATEK_SOC_WED」 ✗ 证伪：配置已开，wed0 debugfs 在，IRQ 也能注册
+#   v3「mtk_wed_ops.o 被链接器 GC 掉」   ✗ 证伪：打了 __used 后符号成功导出，
+#                                        指针非NULL（ffffc080a4b038）
+#   v4「mt7996e 的 wed_enable 模块参数默认 N」✓ **这才是真正原因**
+#
+# 断点在 mt76 侧，不在内核侧（v6.18.54 真实代码）：
+#   drivers/net/wireless/mediatek/mt76/mt7996/mmio.c
+#     :17  static bool wed_enable;
+#     :18  module_param(wed_enable, bool, 0644);      ← 默认 false
+#     :482 int mt7996_mmio_wed_init(...)               ← 由 pci.c:143 在 probe 调用
+#     :490     if (!wed_enable) return 0;              ← ★ 断在这里
+#     :642     if (mtk_wed_device_attach(wed)) {...}   ← 因此永远到不了
+#
+# 真机实测：/sys/module/mt7996e/parameters/wed_enable = N
+#          /sys/module/mt7996e/cmdline 不存在 ⇒ 用默认值加载，从没传过 wed_enable=1
+#
+# ---------- 为什么不能只改运行期 ----------
+#
+# ★ 写 `echo 1 > /sys/module/mt7996e/parameters/wed_enable` 只能改**已加载**的模块，
+#   且本参数只在 probe 路径被读一次（mmio.c:490），改 sysfs 不会有任何效果。
+#   真正生效的唯一途径是**带参数加载模块**：
+#       /etc/modules.d/mt7996e  内容写：mt7996e wed_enable=1
+#   由 kmodloader 在开机时执行。
+#
+# ★ 为什么不随固件直接放 /etc/modules.d/mt7996e：
+#   sysupgrade 的 keep.d 保留清单里**不含** /etc/modules.d（只有 /etc/config/ 整棵）。
+#   放在 files 覆盖层里，重刷/保留配置升级都会丢 —— 正是本文件存在的理由：
+#   uci-defaults 每次刷机都会执行（本机走 emmc_copy_config，/etc/uci-defaults/*
+#   来自新 rootfs 但每次都跑），在这里现写 /etc/modules.d 才可靠。
+#   ⚠️ 首次执行后本文件会被 uci-defaults 机制删除，但 /etc/modules.d/mt7996e
+#      已经写进 rootfs 的 overlay，同一次开机就会生效，且此后一直有效。
+#      只有「刷机」才会回到N（因为那时本文件会重新执行一次）。
+
+MODD=/etc/modules.d/mt7996e
+
+# 只在文件缺失时创建，不覆盖用户手工改过的值。
+# 若文件已存在但缺 wed_enable=1，则补参数（保留其余内容）。
+if [ ! -f "$MODD" ]; then
+	printf 'mt7996e wed_enable=1\n' > "$MODD"
+	logger -t mt5700-wed "已写入 $MODD（mt7996e wed_enable=1），WiFi 硬件转发将在下次开机启用"
+else
+	# 已有文件：仅当既没有启用也没有显式禁用时才补
+	grep -q 'wed_enable=' "$MODD" 2>/dev/null || {
+		printf 'mt7996e wed_enable=1\n' >> "$MODD"
+		logger -t mt5700-wed "已在 $MODD 追加 wed_enable=1（原有内容保留）"
+	}
+fi
+
+# ---------- 验收方法（刷机后照着念）----------
+#
+# ① 确认参数已写入（本次开机就能看）
+#      cat /etc/modules.d/mt7996e          → 期望含 wed_enable=1
+#
+# ② 确认**本次开机**是否已生效（决定性判据，两条都要）
+#      cat /proc/kallsyms | grep -c mtk_soc_wed_ops  → 注意：数据符号常不在 kallsyms 里，
+#        查不到**不能**判失败
+#      dmesg | grep -i wed
+#        ★ 判attach 成功只看有没有这一条：
+#             wed-diag: attach SUCCEEDED: DMA rings + RRO + WED hardware path is now in use
+#        出现它 = 硬件通路真的在跑（该日志来自本仓 Patches/0980-wed-diag.patch）
+#        出现 attach FAILED / attach REJECTED = 失败，原因在同几行里
+#        完全没有 attach 开头的行 = wed_enable 没生效，回查 ①
+#        只有 add_hw 两行 = 老症状，WED 侧就绪但 mt76 没来 attach
+#
+# ③ 确认中断已注册（attach 成功的必要结果）
+#      grep -i wed /proc/interrupts        → 期望有WED 的 IRQ 行
+#      ★ 对照：未加速时这里是空的（attach 从未成功）
+#
+# ④ 回滚：删掉 /etc/modules.d/mt7996e 里的 wed_enable=1（或整个文件）后重启。
+#   WED 走网卡 DMA 通路，配错的表现是 WiFi 收发异常、掉流甚至看门狗重启；
+#   所以**首次启用务必插有线连接**，别在只有 WiFi 时启用 —— 硬件挂了就远程救不回来。
+
+exit 0
